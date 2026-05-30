@@ -1,0 +1,21 @@
+[package]
+name = "travsr-lang-python"
+description = "Travsr Phase B — Python semantic analysis via scip-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "travsr-lang-python"
+path = "src/main.rs"
+
+[dependencies]
+travsr-plugin-sdk = { workspace = true }
+travsr-core       = { workspace = true }
+travsr-lsif       = { path = "../lsif" }
+anyhow            = { workspace = true }
+tracing           = { workspace = true }
+tracing-subscriber = { workspace = true }

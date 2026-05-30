@@ -13,6 +13,9 @@ rust-version = "1.75"
 [workspace.dependencies]
 # Switch branch to "master" once the P5 feature branch merges.
 travsr-plugin-sdk = { git = "https://github.com/Travsr-com/travsr", branch = "feature/travsr-plugin-host-254-255-p5-s1" }
+travsr-core = { git = "https://github.com/Travsr-com/travsr", branch = "feature/travsr-plugin-host-254-255-p5-s1" }
 anyhow = "1"
+serde_json = "1"
+tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

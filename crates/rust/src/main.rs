@@ -8,9 +8,11 @@
 
 use std::path::Path;
 use anyhow::Context as _;
+use travsr_core::Language;
 use travsr_plugin_sdk::{
-    InvokeRequest, InvokeResponse, Language, ParseRequest, ParseResponse, Plugin, run_plugin,
+    InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin, run_plugin,
 };
+use travsr_lsif;
 
 const TIMEOUT_SECS: u64 = 300;
 
@@ -94,10 +96,11 @@ fn run_ra_lsif(root: &Path) -> anyhow::Result<InvokeResponse> {
     let line_count = lsif.lines().count();
     tracing::info!("rust-analyzer produced {line_count} LSIF records");
 
-    // TODO: parse LSIF JSON-Lines and return actual nodes/edges.
-    // Tracked: publish travsr-lsif as a standalone crate and depend on it here.
-    // The protocol infrastructure is fully wired — ingestion is the remaining step.
-    Ok(InvokeResponse::default())
+    Ok(travsr_lsif::ingest(&lsif, "", Language::Rust)
+        .unwrap_or_else(|e| {
+            tracing::warn!("LSIF ingest error: {e}");
+            InvokeResponse::default()
+        }))
 }
 
 fn main() {
