@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Travsr Contributors"]
+repository = "https://github.com/Travsr-com/travsr-lang"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Switch branch to "master" once the P5 feature branch merges.
+travsr-plugin-sdk = { git = "https://github.com/Travsr-com/travsr", branch = "feature/travsr-plugin-host-254-255-p5-s1" }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
