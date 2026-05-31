@@ -98,7 +98,9 @@ fn run_scip_ruby(root: &Path) -> anyhow::Result<InvokeResponse> {
         "scip-ruby exited with {status}: {stderr_out}"
     );
 
-    let output_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+    let output_size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
     tracing::info!("scip-ruby produced {output_size} bytes of SCIP output");
 
     travsr_lang_scip_reader::ingest(&output_path, "", Language::Ruby)
