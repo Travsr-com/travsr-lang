@@ -38,7 +38,11 @@ const MAX_REF_EDGES_PER_DOC: usize = 5_000;
 ///
 /// `corpus` should be the canonical corpus string (e.g. `github.com/org/repo`).
 /// Pass `""` when corpus is not known at plugin invocation time.
-pub fn ingest(scip_path: &Path, corpus: &str, language: Language) -> anyhow::Result<InvokeResponse> {
+pub fn ingest(
+    scip_path: &Path,
+    corpus: &str,
+    language: Language,
+) -> anyhow::Result<InvokeResponse> {
     let bytes = std::fs::read(scip_path)
         .with_context(|| format!("failed to read SCIP file: {}", scip_path.display()))?;
     if bytes.is_empty() {
@@ -208,11 +212,9 @@ fn kind_from_scip_kind(
         | Kind::EnumMember
         | Kind::Parameter => "variable",
 
-        Kind::Module
-        | Kind::Namespace
-        | Kind::Package
-        | Kind::PackageObject
-        | Kind::File => "module",
+        Kind::Module | Kind::Namespace | Kind::Package | Kind::PackageObject | Kind::File => {
+            "module"
+        }
 
         Kind::Type
         | Kind::TypeAlias
@@ -289,30 +291,45 @@ mod tests {
 
     #[test]
     fn kind_from_symbol_string_infers_suffix() {
-        assert_eq!(kind_from_symbol_string("npm . foo 1.0.0 SomeClass#"), "class");
+        assert_eq!(
+            kind_from_symbol_string("npm . foo 1.0.0 SomeClass#"),
+            "class"
+        );
         assert_eq!(kind_from_symbol_string("go mod SomePkg/"), "module");
-        assert_eq!(kind_from_symbol_string("go mod SomePkg/method."), "function");
-        assert_eq!(kind_from_symbol_string("go mod SomePkg/unknown"), "definition");
+        assert_eq!(
+            kind_from_symbol_string("go mod SomePkg/method."),
+            "function"
+        );
+        assert_eq!(
+            kind_from_symbol_string("go mod SomePkg/unknown"),
+            "definition"
+        );
     }
 
     #[test]
     fn definition_node_extracted_from_index() {
-        let mut occ = scip::types::Occurrence::default();
-        occ.symbol = "go mod example.com 1.0.0 SomeFunc.".into();
-        occ.symbol_roles = 1; // Definition
-        occ.range = vec![5, 0, 5, 10]; // line 5 (0-indexed)
-
-        let mut sym_info = scip::types::SymbolInformation::default();
-        sym_info.symbol = occ.symbol.clone();
-        sym_info.kind = scip::types::symbol_information::Kind::Function.into();
-
-        let mut doc = scip::types::Document::default();
-        doc.relative_path = "main.go".into();
-        doc.occurrences = vec![occ];
-        doc.symbols = vec![sym_info];
-
-        let mut index = scip::types::Index::default();
-        index.documents = vec![doc];
+        let sym: String = "go mod example.com 1.0.0 SomeFunc.".into();
+        let occ = scip::types::Occurrence {
+            symbol: sym.clone(),
+            symbol_roles: 1, // Definition
+            range: vec![5, 0, 5, 10],
+            ..Default::default()
+        };
+        let sym_info = scip::types::SymbolInformation {
+            symbol: sym,
+            kind: scip::types::symbol_information::Kind::Function.into(),
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "main.go".into(),
+            occurrences: vec![occ],
+            symbols: vec![sym_info],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
 
         let resp = ingest_index(&index, "github.com/example/repo", Language::Go).unwrap();
         assert_eq!(resp.nodes.len(), 1);
@@ -325,26 +342,32 @@ mod tests {
         // Definition in doc A, reference in doc B
         let def_sym = "go mod example.com 1.0.0 MyFunc.".to_string();
 
-        let mut def_occ = scip::types::Occurrence::default();
-        def_occ.symbol = def_sym.clone();
-        def_occ.symbol_roles = 1;
-        def_occ.range = vec![0, 0];
-
-        let mut doc_a = scip::types::Document::default();
-        doc_a.relative_path = "pkg/foo.go".into();
-        doc_a.occurrences = vec![def_occ];
-
-        let mut ref_occ = scip::types::Occurrence::default();
-        ref_occ.symbol = def_sym.clone();
-        ref_occ.symbol_roles = 0; // Reference
-        ref_occ.range = vec![3, 4];
-
-        let mut doc_b = scip::types::Document::default();
-        doc_b.relative_path = "cmd/main.go".into();
-        doc_b.occurrences = vec![ref_occ];
-
-        let mut index = scip::types::Index::default();
-        index.documents = vec![doc_a, doc_b];
+        let def_occ = scip::types::Occurrence {
+            symbol: def_sym.clone(),
+            symbol_roles: 1,
+            range: vec![0, 0],
+            ..Default::default()
+        };
+        let doc_a = scip::types::Document {
+            relative_path: "pkg/foo.go".into(),
+            occurrences: vec![def_occ],
+            ..Default::default()
+        };
+        let ref_occ = scip::types::Occurrence {
+            symbol: def_sym.clone(),
+            symbol_roles: 0, // Reference
+            range: vec![3, 4],
+            ..Default::default()
+        };
+        let doc_b = scip::types::Document {
+            relative_path: "cmd/main.go".into(),
+            occurrences: vec![ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc_a, doc_b],
+            ..Default::default()
+        };
 
         let resp = ingest_index(&index, "github.com/example/repo", Language::Go).unwrap();
         assert_eq!(resp.nodes.len(), 1, "one definition node");
