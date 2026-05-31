@@ -9,7 +9,6 @@
 use anyhow::Context as _;
 use std::path::Path;
 use travsr_core::Language;
-use travsr_lsif;
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };

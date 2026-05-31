@@ -115,17 +115,15 @@ pub fn ingest(lsif: &str, corpus: &str, language: Language) -> anyhow::Result<In
                         result_set_to_def.insert(id_to_string(&out), id_to_string(&inv));
                     }
                 }
-                Some("item") => {
-                    if record.property.as_deref() == Some("definitions") {
-                        let def_id = record.out_v.map(|v| id_to_string(&v)).unwrap_or_default();
-                        let range_ids: Vec<String> = record
-                            .in_vs
-                            .unwrap_or_default()
-                            .iter()
-                            .map(id_to_string)
-                            .collect();
-                        def_results.entry(def_id).or_default().extend(range_ids);
-                    }
+                Some("item") if record.property.as_deref() == Some("definitions") => {
+                    let def_id = record.out_v.map(|v| id_to_string(&v)).unwrap_or_default();
+                    let range_ids: Vec<String> = record
+                        .in_vs
+                        .unwrap_or_default()
+                        .iter()
+                        .map(id_to_string)
+                        .collect();
+                    def_results.entry(def_id).or_default().extend(range_ids);
                 }
                 _ => {}
             },
