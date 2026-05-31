@@ -49,7 +49,7 @@ impl Plugin for CPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_clang(&req.root) {
+        match run_scip_clang(&req.root, req.corpus.as_str()) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("scip-clang failed for {}: {e}", req.root.display());
@@ -59,16 +59,20 @@ impl Plugin for CPhaseB {
     }
 }
 
+static SCIP_CLANG_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn scip_clang_available() -> bool {
-    std::process::Command::new("scip-clang")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    *SCIP_CLANG_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("scip-clang")
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
 }
 
-fn run_scip_clang(root: &Path) -> anyhow::Result<InvokeResponse> {
+fn run_scip_clang(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     anyhow::ensure!(
         scip_clang_available(),
         "scip-clang not found on PATH — see https://github.com/sourcegraph/scip-clang"
@@ -126,7 +130,7 @@ fn run_scip_clang(root: &Path) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-clang produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, "", Language::C)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::C)
 }
 
 fn main() {

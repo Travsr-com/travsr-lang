@@ -518,8 +518,6 @@ dependencies = [
 [[package]]
 name = "travsr-core"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "263dc65accbb671489c7edb856bd138934da9f043a42220d84dc08066dc0b54e"
 dependencies = [
  "blake3",
  "serde",
@@ -528,8 +526,6 @@ dependencies = [
 [[package]]
 name = "travsr-error"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5ce9e6497c8c9b9d9c792852872fbd68ddce0f398ce107b4121780b7e8891495"
 dependencies = [
  "thiserror",
 ]
@@ -720,8 +716,6 @@ dependencies = [
 [[package]]
 name = "travsr-plugin-protocol"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa7c13ae2d42f5a65e121882468e728664cac0cbfd07f196258ea970adb2c8b2"
 dependencies = [
  "serde",
  "serde_json",
@@ -733,8 +727,6 @@ dependencies = [
 [[package]]
 name = "travsr-plugin-sdk"
 version = "0.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2fbdca790abc238224c07fede29ff6883bbedfd1197cf505c3bd49f624a3a490"
 dependencies = [
  "serde_json",
  "tracing",

@@ -50,7 +50,7 @@ impl Plugin for JavaPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_java(&req.root) {
+        match run_scip_java(&req.root, req.corpus.as_str()) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("scip-java failed for {}: {e}", req.root.display());
@@ -60,16 +60,20 @@ impl Plugin for JavaPhaseB {
     }
 }
 
+static SCIP_JAVA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn scip_java_available() -> bool {
-    std::process::Command::new("scip-java")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    *SCIP_JAVA_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("scip-java")
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
 }
 
-fn run_scip_java(root: &Path) -> anyhow::Result<InvokeResponse> {
+fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     anyhow::ensure!(
         scip_java_available(),
         "scip-java not found on PATH — download from https://github.com/sourcegraph/scip-java/releases"
@@ -118,7 +122,7 @@ fn run_scip_java(root: &Path) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-java produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, "", Language::Java)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Java)
 }
 
 fn main() {
