@@ -6,11 +6,11 @@
 //! Install:  See https://github.com/sourcegraph/scip-php
 //! Register: travsr lang add php
 
-use std::path::Path;
 use anyhow::Context as _;
+use std::path::Path;
 use travsr_core::Language;
 use travsr_plugin_sdk::{
-    InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin, run_plugin,
+    run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
 
 const TIMEOUT_SECS: u64 = 300;
@@ -18,9 +18,15 @@ const TIMEOUT_SECS: u64 = 300;
 struct PhpPhaseB;
 
 impl Plugin for PhpPhaseB {
-    fn language(&self) -> Language { Language::Php }
-    fn extensions(&self) -> &[&str] { &["php", "phtml"] }
-    fn supports_phase_b(&self) -> bool { scip_php_available() }
+    fn language(&self) -> Language {
+        Language::Php
+    }
+    fn extensions(&self) -> &[&str] {
+        &["php", "phtml"]
+    }
+    fn supports_phase_b(&self) -> bool {
+        scip_php_available()
+    }
 
     fn parse(&self, _req: &ParseRequest) -> ParseResponse {
         // Phase A (Tree-sitter structural parse) is handled by the built-in
@@ -88,7 +94,9 @@ fn run_scip_php(root: &Path) -> anyhow::Result<InvokeResponse> {
     );
 
     // Check for output in scratch dir or current dir
-    let output_size = scratch.path().read_dir()
+    let output_size = scratch
+        .path()
+        .read_dir()
         .map(|mut d| d.next().is_some())
         .unwrap_or(false);
     tracing::info!("scip-php completed (output present: {output_size})");

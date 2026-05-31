@@ -1,0 +1,10 @@
+/Users/ak/Desktop/Proj/travsr-lang/target/debug/deps/travsr_plugin_protocol-ab7a769f4688b8ac.d: /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/lib.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/codec.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/ffi_marker.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/language_map.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/plugin.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/types.rs
+
+/Users/ak/Desktop/Proj/travsr-lang/target/debug/deps/libtravsr_plugin_protocol-ab7a769f4688b8ac.rmeta: /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/lib.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/codec.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/ffi_marker.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/language_map.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/plugin.rs /Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/types.rs
+
+/Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/lib.rs:
+/Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/codec.rs:
+/Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/ffi_marker.rs:
+/Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/language_map.rs:
+/Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/plugin.rs:
+/Users/ak/.cargo/git/checkouts/travsr-5ea1078af098a0aa/9141cdd/crates/travsr-plugin-protocol/src/types.rs:

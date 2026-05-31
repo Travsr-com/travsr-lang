@@ -7,11 +7,11 @@
 //! Install:  go install github.com/sourcegraph/scip-go/cmd/scip-go@latest
 //! Register: travsr lang add go
 
-use std::path::Path;
 use anyhow::Context as _;
+use std::path::Path;
 use travsr_core::Language;
 use travsr_plugin_sdk::{
-    InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin, run_plugin,
+    run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
 
 const TIMEOUT_SECS: u64 = 300;
@@ -19,9 +19,15 @@ const TIMEOUT_SECS: u64 = 300;
 struct GoPhaseB;
 
 impl Plugin for GoPhaseB {
-    fn language(&self) -> Language { Language::Go }
-    fn extensions(&self) -> &[&str] { &["go"] }
-    fn supports_phase_b(&self) -> bool { scip_go_available() }
+    fn language(&self) -> Language {
+        Language::Go
+    }
+    fn extensions(&self) -> &[&str] {
+        &["go"]
+    }
+    fn supports_phase_b(&self) -> bool {
+        scip_go_available()
+    }
 
     fn parse(&self, _req: &ParseRequest) -> ParseResponse {
         // Phase A (Tree-sitter structural parse) is handled by the built-in

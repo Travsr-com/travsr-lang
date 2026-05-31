@@ -6,22 +6,28 @@
 //! Install:  npm install -g travsr-lsif-ts
 //! Register: travsr lang add typescript
 
-use std::path::Path;
 use anyhow::Context as _;
+use std::path::Path;
 use travsr_core::Language;
-use travsr_plugin_sdk::{
-    InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin, run_plugin,
-};
 use travsr_lsif;
+use travsr_plugin_sdk::{
+    run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
+};
 
 const TIMEOUT_SECS: u64 = 60;
 
 struct TypeScriptPhaseB;
 
 impl Plugin for TypeScriptPhaseB {
-    fn language(&self) -> Language { Language::TypeScript }
-    fn extensions(&self) -> &[&str] { &["ts", "tsx", "mts", "cts", "js", "mjs"] }
-    fn supports_phase_b(&self) -> bool { lsif_ts_available() }
+    fn language(&self) -> Language {
+        Language::TypeScript
+    }
+    fn extensions(&self) -> &[&str] {
+        &["ts", "tsx", "mts", "cts", "js", "mjs"]
+    }
+    fn supports_phase_b(&self) -> bool {
+        lsif_ts_available()
+    }
 
     fn parse(&self, _req: &ParseRequest) -> ParseResponse {
         // Phase A handled by the built-in TypeScript plugin in the core daemon.
@@ -102,11 +108,12 @@ fn run_lsif_ts(tsconfig: &Path) -> anyhow::Result<InvokeResponse> {
     let line_count = lsif.lines().count();
     tracing::info!("travsr-lsif-ts produced {line_count} LSIF records");
 
-    Ok(travsr_lsif::ingest(&lsif, "", Language::TypeScript)
-        .unwrap_or_else(|e| {
+    Ok(
+        travsr_lsif::ingest(&lsif, "", Language::TypeScript).unwrap_or_else(|e| {
             tracing::warn!("LSIF ingest error: {e}");
             InvokeResponse::default()
-        }))
+        }),
+    )
 }
 
 fn main() {

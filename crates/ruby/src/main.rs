@@ -8,11 +8,11 @@
 //! Install:  See https://github.com/sourcegraph/scip-ruby
 //! Register: travsr lang add ruby
 
-use std::path::Path;
 use anyhow::Context as _;
+use std::path::Path;
 use travsr_core::Language;
 use travsr_plugin_sdk::{
-    InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin, run_plugin,
+    run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
 
 const TIMEOUT_SECS: u64 = 300;
@@ -20,9 +20,15 @@ const TIMEOUT_SECS: u64 = 300;
 struct RubyPhaseB;
 
 impl Plugin for RubyPhaseB {
-    fn language(&self) -> Language { Language::Ruby }
-    fn extensions(&self) -> &[&str] { &["rb", "rake"] }
-    fn supports_phase_b(&self) -> bool { scip_ruby_available() }
+    fn language(&self) -> Language {
+        Language::Ruby
+    }
+    fn extensions(&self) -> &[&str] {
+        &["rb", "rake"]
+    }
+    fn supports_phase_b(&self) -> bool {
+        scip_ruby_available()
+    }
 
     fn parse(&self, _req: &ParseRequest) -> ParseResponse {
         // Phase A (Tree-sitter structural parse) is handled by the built-in

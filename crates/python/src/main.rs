@@ -7,11 +7,11 @@
 //! Install:  pip install scip-python
 //! Register: travsr lang add python
 
-use std::path::Path;
 use anyhow::Context as _;
+use std::path::Path;
 use travsr_core::Language;
 use travsr_plugin_sdk::{
-    InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin, run_plugin,
+    run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
 
 const TIMEOUT_SECS: u64 = 300;
@@ -19,9 +19,15 @@ const TIMEOUT_SECS: u64 = 300;
 struct PythonPhaseB;
 
 impl Plugin for PythonPhaseB {
-    fn language(&self) -> Language { Language::Python }
-    fn extensions(&self) -> &[&str] { &["py", "pyi"] }
-    fn supports_phase_b(&self) -> bool { scip_python_available() }
+    fn language(&self) -> Language {
+        Language::Python
+    }
+    fn extensions(&self) -> &[&str] {
+        &["py", "pyi"]
+    }
+    fn supports_phase_b(&self) -> bool {
+        scip_python_available()
+    }
 
     fn parse(&self, _req: &ParseRequest) -> ParseResponse {
         // Phase A (Tree-sitter structural parse) is handled by the built-in
@@ -60,8 +66,10 @@ fn run_scip_python(root: &Path) -> anyhow::Result<InvokeResponse> {
     let mut child = std::process::Command::new("scip-python")
         .args([
             "index",
-            "--project-name", "project",
-            "--project-version", "0.0.1",
+            "--project-name",
+            "project",
+            "--project-version",
+            "0.0.1",
         ])
         .arg(root)
         .current_dir(root)

@@ -7,9 +7,9 @@
 //! as nodes. Full call graph (reference/call edges) is a future enhancement
 //! tracked in travsr#254.
 
-use std::collections::HashMap;
 use anyhow::Context as _;
 use serde::Deserialize;
+use std::collections::HashMap;
 use travsr_core::{Language, Node, VName};
 use travsr_plugin_sdk::InvokeResponse;
 
@@ -56,7 +56,9 @@ pub fn ingest(lsif: &str, corpus: &str, language: Language) -> anyhow::Result<In
     // Parse all records
     for (lineno, line) in lsif.lines().enumerate() {
         let line = line.trim();
-        if line.is_empty() { continue; }
+        if line.is_empty() {
+            continue;
+        }
 
         let record: LsifRecord = serde_json::from_str(line)
             .with_context(|| format!("LSIF parse error at line {lineno}: {line}"))?;
@@ -72,7 +74,8 @@ pub fn ingest(lsif: &str, corpus: &str, language: Language) -> anyhow::Result<In
                 }
                 Some("range") => {
                     if let Some(start) = record.start {
-                        let doc_ref = record.document
+                        let doc_ref = record
+                            .document
                             .as_ref()
                             .map(id_to_string)
                             .unwrap_or_default();
@@ -86,14 +89,17 @@ pub fn ingest(lsif: &str, corpus: &str, language: Language) -> anyhow::Result<In
                 Some("contains") => {
                     // document → [ranges]
                     let doc_id = record.out_v.map(|v| id_to_string(&v)).unwrap_or_default();
-                    let range_ids: Vec<String> = record.in_vs
+                    let range_ids: Vec<String> = record
+                        .in_vs
                         .unwrap_or_default()
                         .iter()
                         .map(id_to_string)
                         .collect();
                     for rid in range_ids {
                         if let Some(r) = ranges.get_mut(&rid) {
-                            if r.0.is_empty() { r.0 = doc_id.clone(); }
+                            if r.0.is_empty() {
+                                r.0 = doc_id.clone();
+                            }
                         }
                     }
                 }
@@ -112,7 +118,8 @@ pub fn ingest(lsif: &str, corpus: &str, language: Language) -> anyhow::Result<In
                 Some("item") => {
                     if record.property.as_deref() == Some("definitions") {
                         let def_id = record.out_v.map(|v| id_to_string(&v)).unwrap_or_default();
-                        let range_ids: Vec<String> = record.in_vs
+                        let range_ids: Vec<String> = record
+                            .in_vs
                             .unwrap_or_default()
                             .iter()
                             .map(id_to_string)
@@ -142,11 +149,15 @@ pub fn ingest(lsif: &str, corpus: &str, language: Language) -> anyhow::Result<In
         // This range is a definition site if it appears in a definitionResult
         let is_def = def_results.values().any(|rs| rs.contains(range_id))
             || def_results.contains_key(def_result_id);
-        if !is_def { continue; }
+        if !is_def {
+            continue;
+        }
 
         let uri = documents.get(doc_id).cloned().unwrap_or_default();
         let vname_path = uri_to_vname_path(&uri);
-        if vname_path.is_empty() { continue; }
+        if vname_path.is_empty() {
+            continue;
+        }
 
         let sig = format!("lsif:def:{}:{}:{}", vname_path, start.line, start.character);
         let vname = VName::new(corpus, "", &vname_path, lang_str, &sig);
@@ -159,7 +170,10 @@ pub fn ingest(lsif: &str, corpus: &str, language: Language) -> anyhow::Result<In
         nodes.len()
     );
 
-    Ok(InvokeResponse { nodes, edges: vec![] })
+    Ok(InvokeResponse {
+        nodes,
+        edges: vec![],
+    })
 }
 
 fn id_to_string(v: &serde_json::Value) -> String {
