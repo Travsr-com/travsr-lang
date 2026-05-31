@@ -66,6 +66,8 @@ fn run_scip_php(root: &Path) -> anyhow::Result<InvokeResponse> {
 
     let mut child = std::process::Command::new("scip-php")
         .arg(root)
+        .arg("--output")
+        .arg(&output_path)
         .current_dir(scratch.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
