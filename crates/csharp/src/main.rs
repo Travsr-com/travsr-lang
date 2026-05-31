@@ -116,10 +116,7 @@ fn run_scip_dotnet(root: &Path) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-dotnet produced {output_size} bytes of SCIP output");
 
-    // SCIP binary-format ingestion is shared across all scip-* packages and is
-    // tracked separately (travsr-lang SCIP ingest). The tool runs successfully
-    // in the sandbox; once the SCIP reader lands this returns real nodes/edges.
-    Ok(InvokeResponse::default())
+    travsr_lang_scip_reader::ingest(&output_path, "", Language::CSharp)
 }
 
 fn main() {

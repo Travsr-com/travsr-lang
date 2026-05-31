@@ -103,11 +103,7 @@ fn run_scip_go(root: &Path) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-go produced {output_size} bytes of SCIP output");
 
-    // SCIP binary format parsing is deferred — tracked in travsr-lang#TODO.
-    // The tool runs successfully in the sandbox; output is not yet ingested.
-    // Use travsr-lang-rust or travsr-lang-typescript for LSIF-based Phase B
-    // which has full ingestion support.
-    Ok(InvokeResponse::default())
+    travsr_lang_scip_reader::ingest(&output_path, "", Language::Go)
 }
 
 fn main() {

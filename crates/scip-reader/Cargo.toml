@@ -1,0 +1,25 @@
+[package]
+name = "travsr-lang-scip-reader"
+description = "Shared SCIP binary-format ingestion for travsr Phase B language packages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+# scip 0.7.x requires Rust 1.81; override workspace minimum for this crate only.
+rust-version = "1.81"
+
+[lib]
+name = "travsr_lang_scip_reader"
+path = "src/lib.rs"
+
+[dependencies]
+scip              = "0.7"
+protobuf          = "3"
+travsr-plugin-sdk = { workspace = true }
+travsr-core       = { workspace = true }
+anyhow            = { workspace = true }
+tracing           = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -61,6 +61,10 @@ fn run_scip_python(root: &Path) -> anyhow::Result<InvokeResponse> {
         "scip-python not found on PATH — install with: pip install scip-python"
     );
 
+    // Use a temp dir as CWD so scip-python's default output (index.scip) lands
+    // there rather than in the repo root, keeping the workspace clean.
+    let scratch = tempfile::tempdir().context("failed to create temp dir")?;
+    let output_path = scratch.path().join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
     let mut child = std::process::Command::new("scip-python")
@@ -72,7 +76,7 @@ fn run_scip_python(root: &Path) -> anyhow::Result<InvokeResponse> {
             "0.0.1",
         ])
         .arg(root)
-        .current_dir(root)
+        .current_dir(scratch.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -100,13 +104,10 @@ fn run_scip_python(root: &Path) -> anyhow::Result<InvokeResponse> {
         "scip-python exited with {status}: {stderr_out}"
     );
 
-    tracing::info!("scip-python completed successfully");
+    let output_size = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+    tracing::info!("scip-python produced {output_size} bytes of SCIP output");
 
-    // SCIP binary format parsing is deferred — tracked in travsr-lang#TODO.
-    // The tool runs successfully in the sandbox; output is not yet ingested.
-    // Use travsr-lang-rust or travsr-lang-typescript for LSIF-based Phase B
-    // which has full ingestion support.
-    Ok(InvokeResponse::default())
+    travsr_lang_scip_reader::ingest(&output_path, "", Language::Python)
 }
 
 fn main() {
