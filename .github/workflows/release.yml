@@ -13,8 +13,19 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  create-release:
+    name: create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release (no assets yet)
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
   build:
     name: build (${{ matrix.target }})
+    needs: create-release
     strategy:
       fail-fast: false
       matrix:
@@ -89,8 +100,8 @@ jobs:
           mkdir -p dist
           for bin in "${BINS[@]}"; do
             src="target/${TARGET}/release/${bin}"
-            # strip reduces binary size; ignore failures for cross-compiled targets
-            # where the host strip is the wrong architecture
+            # strip reduces binary size; skip silently on cross-compiled targets
+            # where the host strip does not understand the target arch
             strip "$src" 2>/dev/null || true
             dst="dist/${bin}-${TARGET}"
             cp "$src" "$dst"
@@ -102,12 +113,11 @@ jobs:
             fi
           done
 
-      - name: Upload to GitHub Release
+      - name: Upload binaries to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
           fail_on_unmatched_files: true
-          generate_release_notes: true
 
   publish-npm:
     name: publish npm packages
@@ -130,6 +140,9 @@ jobs:
           LANGS=(c cpp csharp go java kotlin php python ruby scala)
           for lang in "${LANGS[@]}"; do
             echo "Publishing @travsr-plugin/${lang} @ ${VERSION} …"
+            # postinstall.js lives at npm/postinstall.js (shared source of truth).
+            # Copy it into the package dir so it is included in the npm tarball.
+            cp npm/postinstall.js "npm/${lang}/postinstall.js"
             (
               cd "npm/${lang}"
               npm version "$VERSION" --no-git-tag-version --allow-same-version

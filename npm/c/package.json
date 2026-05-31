@@ -8,7 +8,7 @@
     "url": "https://github.com/Travsr-com/travsr-lang"
   },
   "scripts": {
-    "postinstall": "node ../postinstall.js"
+    "postinstall": "node postinstall.js"
   },
   "bin": {
     "travsr-lang-c": "./bin/travsr-lang-c"
