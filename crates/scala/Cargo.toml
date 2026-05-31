@@ -1,0 +1,21 @@
+[package]
+name = "travsr-lang-scala"
+description = "Travsr Phase B — Scala semantic analysis via scip-scala"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "travsr-lang-scala"
+path = "src/main.rs"
+
+[dependencies]
+travsr-plugin-sdk  = { workspace = true }
+travsr-core        = { workspace = true }
+anyhow             = { workspace = true }
+tempfile           = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

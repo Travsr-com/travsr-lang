@@ -268,13 +268,31 @@ travsr-lang/
 ├── Cargo.toml                ← workspace root
 ├── README.md
 └── crates/
-    ├── rust/                 ← Phase B for Rust (rust-analyzer LSIF)
-    │   ├── Cargo.toml
-    │   └── src/main.rs
-    └── typescript/           ← Phase B for TypeScript/JS (travsr-lsif-ts LSIF)
-        ├── Cargo.toml
-        └── src/main.rs
+    ├── lsif/                 ← shared LSIF JSON-Lines ingestion library
+    ├── rust/                 ← Rust    (rust-analyzer LSIF) · Standard
+    ├── typescript/           ← TS/JS   (travsr-lsif-ts LSIF) · Standard
+    ├── go/                   ← Go      (scip-go)            · Standard
+    ├── python/               ← Python  (scip-python)        · Standard
+    ├── php/                  ← PHP     (scip-php)           · Standard
+    ├── ruby/                 ← Ruby    (scip-ruby)          · Standard
+    ├── java/                 ← Java    (scip-java)          · RequiresElevated
+    ├── kotlin/               ← Kotlin  (scip-java)          · RequiresElevated
+    ├── csharp/               ← C#      (scip-dotnet)        · RequiresElevated
+    ├── scala/                ← Scala   (scip-scala)         · RequiresElevated
+    ├── cpp/                  ← C++     (scip-clang)         · Standard
+    └── c/                    ← C       (scip-clang)         · Standard
 ```
+
+> **LSIF vs SCIP:** `rust` and `typescript` emit LSIF, fully ingested by the
+> shared `lsif` crate. The `scip-*` packages run their tool under the sandbox
+> today; SCIP binary-format ingestion is shared work tracked separately and
+> lands once the SCIP reader is in place — until then they return an empty
+> `InvokeResponse`.
+>
+> **Version requirement:** Scala / C / C++ declare `Language::{Scala,Cpp,C}`,
+> added to `travsr-core` in `0.6.1`. These packages therefore require
+> `travsr-core`/`travsr-plugin-sdk` **≥ 0.6.1** (Phase A grammars for the same
+> three languages also ship in core `0.6.1`).
 
 ---
 

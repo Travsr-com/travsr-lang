@@ -11,8 +11,8 @@ repository = "https://github.com/Travsr-com/travsr-lang"
 rust-version = "1.75"
 
 [workspace.dependencies]
-travsr-plugin-sdk = "0.6.0"
-travsr-core       = "0.6.0"
+travsr-plugin-sdk = "0.6.1"
+travsr-core       = "0.6.1"
 anyhow = "1"
 serde_json = "1"
 tempfile = "3"
