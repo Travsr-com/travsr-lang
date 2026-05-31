@@ -1,0 +1,22 @@
+{
+  "name": "@travsr-plugin/ruby",
+  "version": "0.1.0",
+  "description": "Travsr Phase B — Ruby semantic analysis (travsr-lang-ruby binary)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Travsr-com/travsr-lang"
+  },
+  "scripts": {
+    "postinstall": "node ../postinstall.js"
+  },
+  "bin": {
+    "travsr-lang-ruby": "./bin/travsr-lang-ruby"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

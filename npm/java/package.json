@@ -1,0 +1,22 @@
+{
+  "name": "@travsr-plugin/java",
+  "version": "0.1.0",
+  "description": "Travsr Phase B — Java semantic analysis (travsr-lang-java binary, requires PSE approval)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Travsr-com/travsr-lang"
+  },
+  "scripts": {
+    "postinstall": "node ../postinstall.js"
+  },
+  "bin": {
+    "travsr-lang-java": "./bin/travsr-lang-java"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}
