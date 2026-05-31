@@ -1,6 +1,6 @@
 [package]
-name = "travsr-lang-ruby"
-description = "Travsr Phase B — Ruby semantic analysis via scip-ruby"
+name = "travsr-lang-java"
+description = "Travsr Phase B — Java semantic analysis via scip-java"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "travsr-lang-ruby"
+name = "travsr-lang-java"
 path = "src/main.rs"
 
 [dependencies]

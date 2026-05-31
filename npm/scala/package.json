@@ -1,0 +1,22 @@
+{
+  "name": "@travsr-plugin/scala",
+  "version": "0.1.0",
+  "description": "Travsr Phase B — Scala semantic analysis (travsr-lang-scala binary, requires PSE approval)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Travsr-com/travsr-lang"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "bin": {
+    "travsr-lang-scala": "./bin/travsr-lang-scala"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

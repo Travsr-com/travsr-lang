@@ -1,0 +1,22 @@
+{
+  "name": "@travsr-plugin/cpp",
+  "version": "0.1.0",
+  "description": "Travsr Phase B — C++ semantic analysis (travsr-lang-cpp binary)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Travsr-com/travsr-lang"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "bin": {
+    "travsr-lang-cpp": "./bin/travsr-lang-cpp"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

@@ -36,7 +36,7 @@ impl Plugin for GoPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_go(&req.root) {
+        match run_scip_go(&req.root, req.corpus.as_str()) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("scip-go failed for {}: {e}", req.root.display());
@@ -46,16 +46,20 @@ impl Plugin for GoPhaseB {
     }
 }
 
+static SCIP_GO_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn scip_go_available() -> bool {
-    std::process::Command::new("scip-go")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    *SCIP_GO_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("scip-go")
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
 }
 
-fn run_scip_go(root: &Path) -> anyhow::Result<InvokeResponse> {
+fn run_scip_go(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     anyhow::ensure!(
         scip_go_available(),
         "scip-go not found on PATH — install with: go install github.com/sourcegraph/scip-go/cmd/scip-go@latest"
@@ -103,11 +107,7 @@ fn run_scip_go(root: &Path) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-go produced {output_size} bytes of SCIP output");
 
-    // SCIP binary format parsing is deferred — tracked in travsr-lang#TODO.
-    // The tool runs successfully in the sandbox; output is not yet ingested.
-    // Use travsr-lang-rust or travsr-lang-typescript for LSIF-based Phase B
-    // which has full ingestion support.
-    Ok(InvokeResponse::default())
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Go)
 }
 
 fn main() {

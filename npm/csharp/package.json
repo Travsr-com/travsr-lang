@@ -1,0 +1,22 @@
+{
+  "name": "@travsr-plugin/csharp",
+  "version": "0.1.0",
+  "description": "Travsr Phase B — C# semantic analysis (travsr-lang-csharp binary, requires PSE approval)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Travsr-com/travsr-lang"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "bin": {
+    "travsr-lang-csharp": "./bin/travsr-lang-csharp"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

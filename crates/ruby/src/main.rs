@@ -37,7 +37,7 @@ impl Plugin for RubyPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_ruby(&req.root) {
+        match run_scip_ruby(&req.root, req.corpus.as_str()) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("scip-ruby failed for {}: {e}", req.root.display());
@@ -47,26 +47,34 @@ impl Plugin for RubyPhaseB {
     }
 }
 
+static SCIP_RUBY_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn scip_ruby_available() -> bool {
-    std::process::Command::new("scip-ruby")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    *SCIP_RUBY_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("scip-ruby")
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
 }
 
-fn run_scip_ruby(root: &Path) -> anyhow::Result<InvokeResponse> {
+fn run_scip_ruby(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     anyhow::ensure!(
         scip_ruby_available(),
         "scip-ruby not found on PATH — see https://github.com/sourcegraph/scip-ruby"
     );
 
+    // Use a temp dir as CWD so scip-ruby's default output (index.scip) goes
+    // there instead of the repo root.
+    let scratch = tempfile::tempdir().context("failed to create temp dir")?;
+    let output_path = scratch.path().join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
     let mut child = std::process::Command::new("scip-ruby")
         .arg(root)
-        .current_dir(root)
+        .current_dir(scratch.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -94,13 +102,12 @@ fn run_scip_ruby(root: &Path) -> anyhow::Result<InvokeResponse> {
         "scip-ruby exited with {status}: {stderr_out}"
     );
 
-    tracing::info!("scip-ruby completed successfully");
+    let output_size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    tracing::info!("scip-ruby produced {output_size} bytes of SCIP output");
 
-    // SCIP binary format parsing is deferred — tracked in travsr-lang#TODO.
-    // The tool runs successfully in the sandbox; output is not yet ingested.
-    // Use travsr-lang-rust or travsr-lang-typescript for LSIF-based Phase B
-    // which has full ingestion support.
-    Ok(InvokeResponse::default())
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Ruby)
 }
 
 fn main() {

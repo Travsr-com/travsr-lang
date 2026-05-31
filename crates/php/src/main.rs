@@ -35,7 +35,7 @@ impl Plugin for PhpPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_php(&req.root) {
+        match run_scip_php(&req.root, req.corpus.as_str()) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("scip-php failed for {}: {e}", req.root.display());
@@ -45,27 +45,34 @@ impl Plugin for PhpPhaseB {
     }
 }
 
+static SCIP_PHP_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
 fn scip_php_available() -> bool {
-    std::process::Command::new("scip-php")
-        .arg("--help")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok()
+    *SCIP_PHP_AVAILABLE.get_or_init(|| {
+        std::process::Command::new("scip-php")
+            .arg("--help")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok()
+    })
 }
 
-fn run_scip_php(root: &Path) -> anyhow::Result<InvokeResponse> {
+fn run_scip_php(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     anyhow::ensure!(
         scip_php_available(),
         "scip-php not found on PATH — see https://github.com/sourcegraph/scip-php"
     );
 
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
+    let output_path = scratch.path().join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
     let mut child = std::process::Command::new("scip-php")
         .arg(root)
-        .current_dir(root)
+        .arg("--output")
+        .arg(&output_path)
+        .current_dir(scratch.path())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -93,19 +100,12 @@ fn run_scip_php(root: &Path) -> anyhow::Result<InvokeResponse> {
         "scip-php exited with {status}: {stderr_out}"
     );
 
-    // Check for output in scratch dir or current dir
-    let output_size = scratch
-        .path()
-        .read_dir()
-        .map(|mut d| d.next().is_some())
-        .unwrap_or(false);
-    tracing::info!("scip-php completed (output present: {output_size})");
+    let output_size = std::fs::metadata(&output_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    tracing::info!("scip-php produced {output_size} bytes of SCIP output");
 
-    // SCIP binary format parsing is deferred — tracked in travsr-lang#TODO.
-    // The tool runs successfully in the sandbox; output is not yet ingested.
-    // Use travsr-lang-rust or travsr-lang-typescript for LSIF-based Phase B
-    // which has full ingestion support.
-    Ok(InvokeResponse::default())
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Php)
 }
 
 fn main() {

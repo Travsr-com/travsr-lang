@@ -258,6 +258,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "protobuf"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
+dependencies = [
+ "once_cell",
+ "protobuf-support",
+ "thiserror",
+]
+
+[[package]]
+name = "protobuf-support"
+version = "3.7.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -300,6 +320,15 @@ dependencies = [
  "libc",
  "linux-raw-sys",
  "windows-sys",
+]
+
+[[package]]
+name = "scip"
+version = "0.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4d0e81b39f590b2edbe2369760641511898ed34062aed2e18e6d05eead3d6b7"
+dependencies = [
+ "protobuf",
 ]
 
 [[package]]
@@ -488,9 +517,9 @@ dependencies = [
 
 [[package]]
 name = "travsr-core"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce1caaf4050e36e18e99c9e1e9e0fb52622368dd7881ecde4e911ac237de1f43"
+checksum = "859ed2dd8ddd84311fdf852d9ef0f43424676fcc2f9090504dea2440b387e064"
 dependencies = [
  "blake3",
  "serde",
@@ -498,11 +527,50 @@ dependencies = [
 
 [[package]]
 name = "travsr-error"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "334c9a0afd0b11f168cb15b82e75dfa342c1f6543aa124eb903a7911e44a6359"
+checksum = "edf67de7812fe99924f864a3ca7d4207a8b37ff093ffab1acaa43ba9c31a6dd9"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "travsr-lang-c"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "travsr-core",
+ "travsr-lang-scip-reader",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-cpp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "travsr-core",
+ "travsr-lang-scip-reader",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-csharp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "travsr-core",
+ "travsr-lang-scip-reader",
+ "travsr-plugin-sdk",
 ]
 
 [[package]]
@@ -514,7 +582,33 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "travsr-core",
- "travsr-lsif",
+ "travsr-lang-scip-reader",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-java"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "travsr-core",
+ "travsr-lang-scip-reader",
+ "travsr-plugin-sdk",
+]
+
+[[package]]
+name = "travsr-lang-kotlin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "travsr-core",
+ "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 
@@ -527,7 +621,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "travsr-core",
- "travsr-lsif",
+ "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 
@@ -536,10 +630,11 @@ name = "travsr-lang-python"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "travsr-core",
- "travsr-lsif",
+ "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 
@@ -548,44 +643,35 @@ name = "travsr-lang-ruby"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "travsr-core",
- "travsr-lsif",
+ "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 
 [[package]]
-name = "travsr-lang-rust"
+name = "travsr-lang-scala"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "travsr-core",
- "travsr-lsif",
+ "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 
 [[package]]
-name = "travsr-lang-typescript"
+name = "travsr-lang-scip-reader"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "tracing",
- "tracing-subscriber",
- "travsr-core",
- "travsr-lsif",
- "travsr-plugin-sdk",
-]
-
-[[package]]
-name = "travsr-lsif"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "serde",
- "serde_json",
+ "protobuf",
+ "scip",
+ "tempfile",
  "tracing",
  "travsr-core",
  "travsr-plugin-sdk",
@@ -593,9 +679,9 @@ dependencies = [
 
 [[package]]
 name = "travsr-plugin-protocol"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "160df9ba40742be5a90dccb339976c55e1dc9a5599c5038d4229977ff0fc995b"
+checksum = "eac8c007af4a20f7cfc3d2dc5a857328115801b5aff8ce9b08163b137aee9f64"
 dependencies = [
  "serde",
  "serde_json",
@@ -606,9 +692,9 @@ dependencies = [
 
 [[package]]
 name = "travsr-plugin-sdk"
-version = "0.6.0"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fa426ed4d469af02a2d7ba2c138f295ee2886fdcf1cb91148a6ca01f9ff7e99e"
+checksum = "d06290606f24453fcf9fe690a2cebab7c2c704accc6e4c9c88da7b431e767e90"
 dependencies = [
  "serde_json",
  "tracing",

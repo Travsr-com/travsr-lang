@@ -1,0 +1,153 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  create-release:
+    name: create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release (no assets yet)
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+  build:
+    name: build (${{ matrix.target }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            target: x86_64-apple-darwin
+            tool: cargo
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            tool: cargo
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            tool: cargo
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            tool: cross
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (aarch64-linux only)
+        if: matrix.tool == 'cross'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build all language binaries
+        shell: bash
+        run: |
+          BINS=(
+            travsr-lang-c
+            travsr-lang-cpp
+            travsr-lang-csharp
+            travsr-lang-go
+            travsr-lang-java
+            travsr-lang-kotlin
+            travsr-lang-php
+            travsr-lang-python
+            travsr-lang-ruby
+            travsr-lang-scala
+          )
+          for bin in "${BINS[@]}"; do
+            ${{ matrix.tool }} build --release --bin "$bin" --target ${{ matrix.target }}
+          done
+
+      - name: Package binaries and compute SHA256
+        shell: bash
+        run: |
+          TARGET=${{ matrix.target }}
+          BINS=(
+            travsr-lang-c
+            travsr-lang-cpp
+            travsr-lang-csharp
+            travsr-lang-go
+            travsr-lang-java
+            travsr-lang-kotlin
+            travsr-lang-php
+            travsr-lang-python
+            travsr-lang-ruby
+            travsr-lang-scala
+          )
+          mkdir -p dist
+          for bin in "${BINS[@]}"; do
+            src="target/${TARGET}/release/${bin}"
+            # strip reduces binary size; skip silently on cross-compiled targets
+            # where the host strip does not understand the target arch
+            strip "$src" 2>/dev/null || true
+            dst="dist/${bin}-${TARGET}"
+            cp "$src" "$dst"
+            # SHA256: sha256sum on Linux, shasum on macOS
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$dst" | awk '{print $1}' > "${dst}.sha256"
+            else
+              shasum -a 256 "$dst" | awk '{print $1}' > "${dst}.sha256"
+            fi
+          done
+
+      - name: Upload binaries to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+
+  publish-npm:
+    name: publish npm packages
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish all language packages
+        shell: bash
+        run: |
+          # Strip leading "v" from tag: "v0.1.0" -> "0.1.0"
+          VERSION="${GITHUB_REF_NAME#v}"
+          LANGS=(c cpp csharp go java kotlin php python ruby scala)
+          for lang in "${LANGS[@]}"; do
+            echo "Publishing @travsr-plugin/${lang} @ ${VERSION} …"
+            # postinstall.js lives at npm/postinstall.js (shared source of truth).
+            # Copy it into the package dir so it is included in the npm tarball.
+            cp npm/postinstall.js "npm/${lang}/postinstall.js"
+            (
+              cd "npm/${lang}"
+              npm version "$VERSION" --no-git-tag-version --allow-same-version
+              npm publish --access public
+            )
+          done
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

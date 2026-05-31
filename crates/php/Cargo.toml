@@ -13,10 +13,10 @@ name = "travsr-lang-php"
 path = "src/main.rs"
 
 [dependencies]
-travsr-plugin-sdk  = { workspace = true }
-travsr-core        = { workspace = true }
-travsr-lsif        = { path = "../lsif" }
-anyhow             = { workspace = true }
-tempfile           = { workspace = true }
-tracing            = { workspace = true }
-tracing-subscriber = { workspace = true }
+travsr-plugin-sdk       = { workspace = true }
+travsr-core             = { workspace = true }
+travsr-lang-scip-reader = { workspace = true }
+anyhow                  = { workspace = true }
+tempfile                = { workspace = true }
+tracing                 = { workspace = true }
+tracing-subscriber      = { workspace = true }
