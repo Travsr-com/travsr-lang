@@ -10,14 +10,9 @@ authors = ["Travsr Contributors"]
 repository = "https://github.com/Travsr-com/travsr-lang"
 rust-version = "1.75"
 
-[patch.crates-io]
-travsr-plugin-protocol = { path = "../travsr/crates/travsr-plugin-protocol" }
-travsr-plugin-sdk      = { path = "../travsr/crates/travsr-plugin-sdk" }
-travsr-core            = { path = "../travsr/crates/travsr-core" }
-
 [workspace.dependencies]
-travsr-plugin-sdk        = "0.6.1"
-travsr-core              = "0.6.1"
+travsr-plugin-sdk        = "0.7.0"
+travsr-core              = "0.7.0"
 travsr-lang-scip-reader  = { path = "crates/scip-reader" }
 anyhow = "1"
 serde_json = "1"

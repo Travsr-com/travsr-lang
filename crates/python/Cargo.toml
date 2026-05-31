@@ -16,7 +16,6 @@ path = "src/main.rs"
 travsr-plugin-sdk       = { workspace = true }
 travsr-core             = { workspace = true }
 travsr-lang-scip-reader = { workspace = true }
-travsr-lsif             = { path = "../lsif" }
 anyhow                  = { workspace = true }
 tempfile                = { workspace = true }
 tracing                 = { workspace = true }
