@@ -110,6 +110,7 @@ fn run_scip_php(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
 fn main() {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("travsr_lang_php=info".parse().unwrap()),
