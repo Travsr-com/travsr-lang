@@ -1,2 +1,11 @@
 /target/
 Cargo.lock
+
+# Travsr graph index
+.travsr/
+
+# Swift Package Manager build artifacts
+packages/**/.build/
+
+# Dart tool cache
+packages/**/.dart_tool/

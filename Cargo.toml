@@ -19,3 +19,6 @@ serde_json = "1"
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[patch.crates-io]
+travsr-core = { path = "../travsr/crates/travsr-core" }
