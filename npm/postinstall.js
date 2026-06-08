@@ -5,10 +5,17 @@
 // Reads the package name from package.json in the caller's directory,
 // derives the binary name, downloads from the tagged GitHub Release,
 // verifies SHA256, and writes the binary to ./bin/<name>.
+//
+// Optional: if the package bundles a share/<binaryName>/ directory, it is
+// also copied to ~/.travsr/share/<binaryName>/ so that sidecar binaries
+// placed directly in ~/.travsr/bin/ (by `travsr lang install`) can resolve
+// their emitter-path via the path-3 heuristic in emitter_path().
+// Languages that ship no share/ dir (go, java, …) are unaffected.
 
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 
 // When npm runs a postinstall script it sets cwd to the package directory,
@@ -81,6 +88,27 @@ async function main() {
   const dest = path.join(binDir, binaryName);
   fs.writeFileSync(dest, binary, { mode: 0o755 });
   console.log(`travsr-plugin: ${binaryName} installed`);
+
+  // Install bundled share/<binaryName>/ to ~/.travsr/share/<binaryName>/ so
+  // that sidecar binaries in ~/.travsr/bin/ resolve emitter_path() correctly.
+  // This only applies to languages that bundle a share/ dir (e.g. dart, swift).
+  const bundledShare = path.join(process.cwd(), 'share', binaryName);
+  if (fs.existsSync(bundledShare)) {
+    const travrsHome = process.env.TRAVSR_HOME || path.join(os.homedir(), '.travsr');
+    const shareTarget = path.join(travrsHome, 'share', binaryName);
+    copyDir(bundledShare, shareTarget);
+    console.log(`travsr-plugin: emitter files installed to ${shareTarget}`);
+  }
+}
+
+function copyDir(src, dst) {
+  fs.mkdirSync(dst, { recursive: true });
+  for (const entry of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, entry.name);
+    const d = path.join(dst, entry.name);
+    if (entry.isDirectory()) copyDir(s, d);
+    else fs.copyFileSync(s, d);
+  }
 }
 
 main().catch(err => {
