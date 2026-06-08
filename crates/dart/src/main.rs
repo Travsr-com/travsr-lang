@@ -41,7 +41,8 @@ fn dart_available() -> bool {
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok();
+            .map(|s| s.success())
+            .unwrap_or(false);
         tracing::debug!(available = result, "dart_available: dart --version check");
         result
     })
@@ -224,6 +225,7 @@ fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse>
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
+                let _ = child.wait();
                 anyhow::bail!("dart emitter timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),

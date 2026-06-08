@@ -204,7 +204,9 @@ final class ScipVisitor: SyntaxVisitor {
     override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
         // Push the extended type name so extension members share symbols with
         // the original type's definitions (e.g. "swift::UserModel.validate").
-        let typeName = node.extendedType.trimmedDescription
+        // Strip generic parameters: "Array<Element>" → "Array", "Dictionary<K,V>" → "Dictionary".
+        let fullName = node.extendedType.trimmedDescription
+        let typeName = fullName.components(separatedBy: "<").first ?? fullName
         typeStack.append(typeName)
         return .visitChildren
     }
@@ -299,22 +301,17 @@ final class ScipVisitor: SyntaxVisitor {
                 }
             }
         } else if let declRef = node.calledExpression.as(DeclReferenceExprSyntax.self) {
-            // Direct call: foo() or MyType() (constructor).
             let name = declRef.baseName.text
-            references.append(Reference(symbol: "swift::\(name)", line: ln))
+            if name.first?.isUppercase == true {
+                // Constructor call: MyType() → matches InitializerDeclSyntax definition.
+                references.append(Reference(symbol: "swift::\(name).init", line: ln))
+            } else {
+                // Top-level function call: foo()
+                references.append(Reference(symbol: "swift::\(name)", line: ln))
+            }
         }
 
         return .visitChildren
     }
 
-    override func visit(_ node: ImportDeclSyntax) -> SyntaxVisitorContinueKind {
-        let modulePath = node.path.map { $0.name.text }.joined(separator: ".")
-        if !modulePath.isEmpty {
-            references.append(Reference(
-                symbol: "import::\(modulePath)",
-                line: lineOf(node)
-            ))
-        }
-        return .visitChildren
-    }
 }

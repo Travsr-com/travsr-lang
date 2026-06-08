@@ -16,6 +16,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # travsr-core is patched from a sibling repo (../travsr) because Language::Dart
+      # and Language::Swift are not yet published to crates.io. Cargo resolves the
+      # [patch.crates-io] at workspace root which requires the sibling to be present.
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          path: ../travsr
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -90,7 +98,7 @@ jobs:
 
       - uses: dart-lang/setup-dart@v1
         with:
-          sdk: "3.3.0"
+          sdk: stable
 
       - name: pub get
         working-directory: packages/dart-scip-emitter

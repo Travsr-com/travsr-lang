@@ -94,7 +94,7 @@ fn run_scip_clang(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let mut child = std::process::Command::new("scip-clang")
         .arg("--compdb-path")
         .arg(&compdb)
-        .arg("--output")
+        .arg("--index-output-path")
         .arg(&output_path)
         .current_dir(root)
         .stdout(std::process::Stdio::piped())

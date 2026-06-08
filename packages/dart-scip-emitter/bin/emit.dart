@@ -63,6 +63,7 @@ Future<void> main(List<String> args) async {
   for (final context in collection.contexts) {
     for (final filePath in context.contextRoot.analyzedFiles()) {
       if (!filePath.endsWith('.dart')) continue;
+      if (!filePath.startsWith(rootPath)) continue;
       if (_isGenerated(filePath)) continue;
 
       ResolvedUnitResult result;
@@ -184,6 +185,12 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   }
 
   @override
+  void visitEnumConstantDeclaration(EnumConstantDeclaration node) {
+    _addDef(node.declaredElement, node.name.offset, 'field');
+    super.visitEnumConstantDeclaration(node);
+  }
+
+  @override
   void visitFunctionDeclaration(FunctionDeclaration node) {
     // Only top-level functions (not nested).
     if (node.parent is CompilationUnit) {
@@ -194,11 +201,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   @override
   void visitMethodDeclaration(MethodDeclaration node) {
-    final kind = node.isGetter || node.isSetter
-        ? 'field'
-        : node.isOperator
-            ? 'function'
-            : 'function';
+    final kind = node.isGetter || node.isSetter ? 'field' : 'function';
     _addDef(node.declaredElement, node.name.offset, kind);
     super.visitMethodDeclaration(node);
   }
@@ -253,16 +256,4 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
     super.visitPrefixedIdentifier(node);
   }
 
-  @override
-  void visitImportDirective(ImportDirective node) {
-    // Record import as a reference to the imported library's URI.
-    final el = node.element;
-    if (el != null) {
-      final uri = el.importedLibrary?.source.uri.toString() ?? '';
-      if (uri.isNotEmpty) {
-        references.add({'symbol': 'import::$uri', 'line': _line(node.offset)});
-      }
-    }
-    super.visitImportDirective(node);
-  }
 }

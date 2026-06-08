@@ -172,6 +172,7 @@ fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
+                let _ = child.wait();
                 anyhow::bail!("swift emitter timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),

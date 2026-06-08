@@ -96,8 +96,23 @@ async function main() {
   if (fs.existsSync(bundledShare)) {
     const travrsHome = process.env.TRAVSR_HOME || path.join(os.homedir(), '.travsr');
     const shareTarget = path.join(travrsHome, 'share', binaryName);
-    copyDir(bundledShare, shareTarget);
-    console.log(`travsr-plugin: emitter files installed to ${shareTarget}`);
+    try {
+      copyDir(bundledShare, shareTarget);
+      console.log(`travsr-plugin: emitter files installed to ${shareTarget}`);
+    } catch (err) {
+      console.warn(`travsr-plugin: share dir copy failed (non-fatal): ${err.message}`);
+    }
+    // Regenerate package_config.json with correct local paths if dart is available.
+    const pubspec = path.join(shareTarget, 'pubspec.yaml');
+    if (fs.existsSync(pubspec)) {
+      try {
+        const { execSync } = require('child_process');
+        execSync('dart pub get', { cwd: shareTarget, stdio: 'pipe' });
+        console.log(`travsr-plugin: dart pub get completed in ${shareTarget}`);
+      } catch (_) {
+        console.warn('travsr-plugin: dart pub get failed — dart emitter requires dart on PATH at runtime');
+      }
+    }
   }
 }
 

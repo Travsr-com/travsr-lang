@@ -9,3 +9,5 @@ packages/**/.build/
 
 # Dart tool cache
 packages/**/.dart_tool/
+
+npm/**/.dart_tool/
