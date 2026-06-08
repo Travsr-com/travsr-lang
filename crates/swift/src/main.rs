@@ -258,7 +258,7 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
             None => continue,
         };
         let file_id =
-            VName::new(corpus, "", path, lang_str, format!("file:{path}")).id();
+            VName::new(corpus, "", path, lang_str, "file").id();
 
         tracing::debug!(path, ref_count = refs.len(), "parse_emitter_output: document refs");
         for r in refs {
