@@ -134,7 +134,7 @@ pub fn ingest_index(
     // source file) to the definition node. Capped per document.
     for doc in &index.documents {
         let path = &doc.relative_path;
-        let file_id = VName::new(corpus, "", path, lang_str, format!("scip:file:{}", path)).id();
+        let file_id = VName::new(corpus, "", path, lang_str, "file").id();
         let mut count = 0usize;
 
         for occ in &doc.occurrences {
@@ -372,5 +372,54 @@ mod tests {
         let resp = ingest_index(&index, "github.com/example/repo", Language::Go).unwrap();
         assert_eq!(resp.nodes.len(), 1, "one definition node");
         assert_eq!(resp.edges.len(), 1, "one ref/call edge from doc_b to def");
+    }
+
+    #[test]
+    fn ref_edge_src_aligns_with_phase_a_file_node_id() {
+        // Phase A (java.rs) creates file nodes with signature "file".
+        // Phase B ref/call edge src must hash to the same NodeId so the
+        // all_nodes lookup in travsr-cli/src/index.rs succeeds.
+        use travsr_core::{Language as CoreLang, VName};
+
+        let corpus = "local/java";
+        let path = "src/main/java/com/example/Foo.java";
+        let def_sym = "com.example Foo#doWork().".to_string();
+
+        let def_occ = scip::types::Occurrence {
+            symbol: def_sym.clone(),
+            symbol_roles: 1,
+            range: vec![0, 0],
+            ..Default::default()
+        };
+        let doc_def = scip::types::Document {
+            relative_path: "src/main/java/com/example/Bar.java".into(),
+            occurrences: vec![def_occ],
+            ..Default::default()
+        };
+        let ref_occ = scip::types::Occurrence {
+            symbol: def_sym.clone(),
+            symbol_roles: 0,
+            range: vec![2, 4],
+            ..Default::default()
+        };
+        let doc_ref = scip::types::Document {
+            relative_path: path.into(),
+            occurrences: vec![ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc_def, doc_ref],
+            ..Default::default()
+        };
+
+        let resp = ingest_index(&index, corpus, Language::Java).unwrap();
+        assert_eq!(resp.edges.len(), 1, "one ref/call edge");
+
+        // The src must equal the NodeId Phase A would compute for the same file.
+        let phase_a_file_id = VName::new(corpus, "", path, "java", "file").id();
+        assert_eq!(
+            resp.edges[0].src, phase_a_file_id,
+            "ref/call edge src must match Phase A file-node NodeId (signature='file')"
+        );
     }
 }
