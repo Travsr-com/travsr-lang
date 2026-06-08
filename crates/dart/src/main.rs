@@ -1,17 +1,22 @@
 //! Travsr Phase B — Dart semantic analysis.
 //!
-//! Spawns the `dart-scip-emitter` Dart script, which uses `package:analyzer`
-//! to walk all .dart files and emit a JSON index of definitions and references.
-//! The JSON is parsed here and converted into Travsr nodes and edges.
+//! Runs `dart run emit.dart <root> <output>` inside the ADR-017 sandbox
+//! (Standard policy + dart toolchain grants) and returns call/reference edges
+//! to the Travsr daemon via the plugin protocol.
 //!
-//! Install emitter:
+//! The emitter uses `package:analyzer` and requires:
+//!   - `dart` on PATH (Dart SDK — read-only, already under /opt/homebrew)
+//!   - `~/.pub-cache/` readable (dart package cache)
+//!   - The emitter script + .dart_tool/ readable
+//!
+//! Both sandbox grants are added by `toolchain_access("dart")` in travsr's
+//! `crates/travsr-plugin-host/src/sandbox/toolchain.rs`.
+//!
+//! Install emitter (one-time):
 //!   cd packages/dart-scip-emitter && dart pub get
 //!
-//! Register plugin:
-//!   travsr lang add dart
-//!
 //! Emitter location resolution order:
-//!   1. $TRAVSR_DART_EMITTER env var (explicit path to emit.dart)
+//!   1. $TRAVSR_DART_EMITTER (explicit path to emit.dart)
 //!   2. <binary-dir>/../../packages/dart-scip-emitter/bin/emit.dart (dev/monorepo)
 //!   3. <binary-dir>/../share/travsr-lang-dart/emit.dart (installed)
 
@@ -31,60 +36,86 @@ static DART_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn dart_available() -> bool {
     *DART_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("dart")
+        let result = std::process::Command::new("dart")
             .arg("--version")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok()
+            .is_ok();
+        tracing::debug!(available = result, "dart_available: dart --version check");
+        result
     })
 }
 
 fn emitter_path() -> Option<PathBuf> {
     // 1. Explicit env var override.
     if let Ok(p) = std::env::var("TRAVSR_DART_EMITTER") {
-        let path = PathBuf::from(p);
+        let path = PathBuf::from(&p);
+        tracing::debug!(
+            path = %path.display(),
+            exists = path.exists(),
+            "emitter_path[1]: $TRAVSR_DART_EMITTER"
+        );
         if path.exists() {
             return Some(path);
         }
     }
 
-    // 2. Relative to this binary — works in dev (cargo run) and monorepo CI.
-    if let Ok(exe) = std::env::current_exe() {
-        // target/debug/travsr-lang-dart → ../../packages/dart-scip-emitter/bin/emit.dart
-        let dev = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .and_then(|p| p.parent())
-            .map(|root| {
-                root.join("packages")
-                    .join("dart-scip-emitter")
-                    .join("bin")
-                    .join("emit.dart")
-            });
-        if let Some(path) = dev {
-            if path.exists() {
-                return Some(path);
-            }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::debug!("emitter_path: current_exe() failed: {err}");
+            return None;
         }
+    };
+    tracing::debug!(exe = %exe.display(), "emitter_path: current_exe");
 
-        // 3. Installed path: /usr/local/lib/travsr-lang-dart/emit.dart
-        let installed = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|prefix| {
-                prefix
-                    .join("share")
-                    .join("travsr-lang-dart")
-                    .join("emit.dart")
-            });
-        if let Some(path) = installed {
-            if path.exists() {
-                return Some(path);
-            }
+    // 2. Dev/monorepo: target/{debug|release}/travsr-lang-dart
+    //    → ../../packages/dart-scip-emitter/bin/emit.dart
+    let dev = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .map(|root| {
+            root.join("packages")
+                .join("dart-scip-emitter")
+                .join("bin")
+                .join("emit.dart")
+        });
+    if let Some(ref path) = dev {
+        tracing::debug!(
+            path = %path.display(),
+            exists = path.exists(),
+            "emitter_path[2]: dev monorepo path"
+        );
+        if path.exists() {
+            return Some(path.clone());
         }
     }
 
+    // 3. Installed: <prefix>/share/travsr-lang-dart/emit.dart
+    //    e.g. ~/.nvm/.../share/travsr-lang-dart/emit.dart
+    let installed = exe
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|prefix| {
+            prefix
+                .join("share")
+                .join("travsr-lang-dart")
+                .join("emit.dart")
+        });
+    if let Some(ref path) = installed {
+        tracing::debug!(
+            path = %path.display(),
+            exists = path.exists(),
+            "emitter_path[3]: installed prefix path"
+        );
+        if path.exists() {
+            return Some(path.clone());
+        }
+    }
+
+    tracing::debug!("emitter_path: not found at any location");
     None
 }
 
@@ -102,7 +133,16 @@ impl Plugin for DartPhaseB {
     }
 
     fn supports_phase_b(&self) -> bool {
-        dart_available() && emitter_path().is_some()
+        let dart = dart_available();
+        let emitter = emitter_path();
+        let supported = dart && emitter.is_some();
+        tracing::debug!(
+            dart_available = dart,
+            emitter = ?emitter,
+            supports_phase_b = supported,
+            "DartPhaseB::supports_phase_b"
+        );
+        supported
     }
 
     fn parse(&self, _req: &ParseRequest) -> ParseResponse {
@@ -110,10 +150,11 @@ impl Plugin for DartPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
+        tracing::debug!(root = %req.root.display(), corpus = %req.corpus, "DartPhaseB::invoke_phase_b");
         match run_dart_emitter(&req.root, req.corpus.as_str()) {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!("dart emitter failed for {}: {e}", req.root.display());
+                tracing::warn!("dart emitter failed for {}: {e:#}", req.root.display());
                 InvokeResponse::default()
             }
         }
@@ -124,8 +165,9 @@ impl Plugin for DartPhaseB {
 
 fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let emitter = emitter_path().context(
-        "dart-scip-emitter not found — set $TRAVSR_DART_EMITTER or run \
-         `cd packages/dart-scip-emitter && dart pub get`",
+        "dart-scip-emitter not found — install with: \
+         cd packages/dart-scip-emitter && dart pub get  \
+         (then copy emit.dart + .dart_tool/ to <prefix>/share/travsr-lang-dart/)",
     )?;
     anyhow::ensure!(dart_available(), "dart not found on PATH");
 
@@ -134,12 +176,44 @@ fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse>
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
+    // current_dir must be the package root so `dart run` can find pubspec.yaml
+    // and .dart_tool/package_config.json.
+    // Layout A (installed): <share>/travsr-lang-dart/emit.dart → parent IS root
+    // Layout B (dev):       packages/dart-scip-emitter/bin/emit.dart → parent.parent() IS root
+    let pkg_root = emitter
+        .parent()
+        .and_then(|p| {
+            if p.join("pubspec.yaml").exists() {
+                Some(p) // installed: emit.dart sits directly in the package root
+            } else {
+                p.parent() // dev: emit.dart lives in bin/, go up one more level
+            }
+        })
+        .unwrap_or(root);
+
+    tracing::debug!(
+        emitter = %emitter.display(),
+        root = %root.display(),
+        pkg_root = %pkg_root.display(),
+        output = %output_path.display(),
+        "run_dart_emitter: launching 'dart run emit.dart'"
+    );
+
+    // Log pubspec.yaml and .dart_tool presence — common failure indicators.
+    let pubspec = pkg_root.join("pubspec.yaml");
+    let dart_tool = pkg_root.join(".dart_tool").join("package_config.json");
+    tracing::debug!(
+        pubspec_exists = pubspec.exists(),
+        dart_tool_exists = dart_tool.exists(),
+        "run_dart_emitter: package root sanity check"
+    );
+
     let mut child = std::process::Command::new("dart")
         .arg("run")
         .arg(&emitter)
         .arg(root)
         .arg(&output_path)
-        .current_dir(emitter.parent().and_then(|p| p.parent()).unwrap_or(root))
+        .current_dir(pkg_root)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -160,7 +234,11 @@ fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse>
     if let Some(mut err) = child.stderr.take() {
         let _ = err.read_to_string(&mut stderr_buf);
     }
-    tracing::debug!("dart emitter stderr: {stderr_buf}");
+
+    tracing::debug!(exit_code = %status, "run_dart_emitter: subprocess exited");
+    if !stderr_buf.is_empty() {
+        tracing::debug!("run_dart_emitter stderr:\n{stderr_buf}");
+    }
 
     anyhow::ensure!(
         status.success(),
@@ -172,20 +250,30 @@ fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse>
 
 // ── JSON parsing ──────────────────────────────────────────────────────────────
 
-fn parse_emitter_output(
-    json_path: &Path,
-    corpus: &str,
-) -> anyhow::Result<InvokeResponse> {
+fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let bytes = std::fs::read(json_path)
         .with_context(|| format!("reading emitter output {}", json_path.display()))?;
+
+    tracing::debug!(
+        path = %json_path.display(),
+        bytes = bytes.len(),
+        "parse_emitter_output: read output file"
+    );
+
     if bytes.is_empty() {
+        tracing::debug!("parse_emitter_output: output file is empty — returning default");
         return Ok(InvokeResponse::default());
     }
 
-    let root: serde_json::Value =
+    let root_val: serde_json::Value =
         serde_json::from_slice(&bytes).context("parsing emitter JSON")?;
 
-    let docs = root["documents"].as_array().context("missing 'documents'")?;
+    let docs = root_val["documents"]
+        .as_array()
+        .context("missing 'documents'")?;
+
+    tracing::debug!(doc_count = docs.len(), "parse_emitter_output: documents found");
+
     let lang_str = Language::Dart.as_str();
 
     // Pass 1: build symbol → NodeId map from all definitions.
@@ -199,6 +287,7 @@ fn parse_emitter_output(
             Some(a) => a,
             None => continue,
         };
+        tracing::debug!(path, def_count = defs.len(), "parse_emitter_output: document defs");
         for d in defs {
             let sym = d["symbol"].as_str().unwrap_or("");
             let kind = d["kind"].as_str().unwrap_or("definition");
@@ -213,7 +302,7 @@ fn parse_emitter_output(
         }
     }
 
-    // Pass 2: resolve references → emit ref/call edges.
+    // Pass 2: resolve references → emit RefCall edges.
     let mut edges: Vec<Edge> = Vec::new();
 
     for doc in docs {
@@ -222,9 +311,10 @@ fn parse_emitter_output(
             Some(a) => a,
             None => continue,
         };
-        let file_id =
-            VName::new(corpus, "", path, lang_str, format!("file:{path}")).id();
+        let file_vname = VName::new(corpus, "", path, lang_str, format!("file:{path}"));
+        let file_id = file_vname.id();
 
+        tracing::debug!(path, ref_count = refs.len(), "parse_emitter_output: document refs");
         for r in refs {
             let sym = r["symbol"].as_str().unwrap_or("");
             if sym.is_empty() {
@@ -232,6 +322,8 @@ fn parse_emitter_output(
             }
             if let Some(&dst_id) = def_ids.get(sym) {
                 edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
+            } else {
+                tracing::debug!(sym, "parse_emitter_output: ref symbol not in def_ids — skipped");
             }
         }
     }
