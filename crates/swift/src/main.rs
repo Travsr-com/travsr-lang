@@ -249,28 +249,58 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
         }
     }
 
-    // Pass 2: resolve references → emit RefCall edges.
+    // Pass 2: resolve references → RefCall edges; inheritances → IsImplementation edges.
     let mut edges: Vec<Edge> = Vec::new();
 
     for doc in docs {
         let path = doc["path"].as_str().unwrap_or("");
-        let refs = match doc["references"].as_array() {
-            Some(a) => a,
-            None => continue,
-        };
-        let file_id =
-            VName::new(corpus, "", path, lang_str, "file").id();
+        let file_id = VName::new(corpus, "", path, lang_str, "file").id();
 
-        tracing::debug!(path, ref_count = refs.len(), "parse_emitter_output: document refs");
-        for r in refs {
-            let sym = r["symbol"].as_str().unwrap_or("");
-            if sym.is_empty() {
-                continue;
+        // Call-site references → RefCall edges (file node → definition node).
+        if let Some(refs) = doc["references"].as_array() {
+            tracing::debug!(path, ref_count = refs.len(), "parse_emitter_output: document refs");
+            for r in refs {
+                let sym = r["symbol"].as_str().unwrap_or("");
+                if sym.is_empty() {
+                    continue;
+                }
+                if let Some(&dst_id) = def_ids.get(sym) {
+                    edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
+                } else {
+                    tracing::debug!(
+                        sym,
+                        "parse_emitter_output: ref symbol not in def_ids — skipped"
+                    );
+                }
             }
-            if let Some(&dst_id) = def_ids.get(sym) {
-                edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
-            } else {
-                tracing::debug!(sym, "parse_emitter_output: ref symbol not in def_ids — skipped");
+        }
+
+        // Inheritance / protocol conformance → IsImplementation edges (child → parent).
+        // Absent in JSON produced by older emitter versions — silently skipped.
+        if let Some(inhs) = doc["inheritances"].as_array() {
+            tracing::debug!(
+                path,
+                inh_count = inhs.len(),
+                "parse_emitter_output: document inheritances"
+            );
+            for inh in inhs {
+                let child_sym = inh["child"].as_str().unwrap_or("");
+                let parent_sym = inh["parent"].as_str().unwrap_or("");
+                if child_sym.is_empty() || parent_sym.is_empty() {
+                    continue;
+                }
+                match (def_ids.get(child_sym), def_ids.get(parent_sym)) {
+                    (Some(&child_id), Some(&parent_id)) => {
+                        edges.push(Edge::new(child_id, parent_id, EdgeKind::IsImplementation));
+                    }
+                    _ => {
+                        tracing::debug!(
+                            child_sym,
+                            parent_sym,
+                            "parse_emitter_output: inheritance parent not in def_ids — skipped"
+                        );
+                    }
+                }
             }
         }
     }
