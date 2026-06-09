@@ -11,3 +11,7 @@ packages/**/.build/
 packages/**/.dart_tool/
 
 npm/**/.dart_tool/
+
+# .NET build artifacts
+fixtures/**/obj/
+fixtures/**/bin/
