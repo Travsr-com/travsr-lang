@@ -15,3 +15,7 @@ npm/**/.dart_tool/
 # .NET build artifacts
 fixtures/**/obj/
 fixtures/**/bin/
+
+# Scala/sbt build artifacts
+fixtures/**/target/
+fixtures/**/.bsp/
