@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "dgSpecHash": "YbJv99KPTGM=",
+  "success": true,
+  "projectFilePath": "/Users/ak/Desktop/Proj/travsr-lang/fixtures/csharp/Animals/Animals.csproj",
+  "expectedPackageFiles": [
+    "/Users/ak/.nuget/packages/microsoft.netcore.app.ref/8.0.27/microsoft.netcore.app.ref.8.0.27.nupkg.sha512",
+    "/Users/ak/.nuget/packages/microsoft.windowsdesktop.app.ref/8.0.27/microsoft.windowsdesktop.app.ref.8.0.27.nupkg.sha512",
+    "/Users/ak/.nuget/packages/microsoft.aspnetcore.app.ref/8.0.27/microsoft.aspnetcore.app.ref.8.0.27.nupkg.sha512",
+    "/Users/ak/.nuget/packages/microsoft.netcore.app.host.osx-arm64/8.0.27/microsoft.netcore.app.host.osx-arm64.8.0.27.nupkg.sha512"
+  ],
+  "logs": []
+}
