@@ -149,8 +149,7 @@ fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse
 
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = scratch.path().join("index.json");
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
     tracing::debug!(
         emitter = %emitter.display(),
@@ -214,18 +213,21 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
         return Ok(InvokeResponse::default());
     }
 
-    let root: serde_json::Value =
-        serde_json::from_slice(&bytes).context("parsing emitter JSON")?;
+    let root: serde_json::Value = serde_json::from_slice(&bytes).context("parsing emitter JSON")?;
 
-    let docs = root["documents"].as_array().context("missing 'documents'")?;
+    let docs = root["documents"]
+        .as_array()
+        .context("missing 'documents'")?;
 
-    tracing::debug!(doc_count = docs.len(), "parse_emitter_output: documents found");
+    tracing::debug!(
+        doc_count = docs.len(),
+        "parse_emitter_output: documents found"
+    );
 
     let lang_str = Language::Swift.as_str();
 
     // Pass 1: build symbol → NodeId map from all definitions.
-    let mut def_ids: std::collections::HashMap<String, NodeId> =
-        std::collections::HashMap::new();
+    let mut def_ids: std::collections::HashMap<String, NodeId> = std::collections::HashMap::new();
     let mut nodes: Vec<Node> = Vec::new();
 
     for doc in docs {
@@ -234,7 +236,11 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
             Some(a) => a,
             None => continue,
         };
-        tracing::debug!(path, def_count = defs.len(), "parse_emitter_output: document defs");
+        tracing::debug!(
+            path,
+            def_count = defs.len(),
+            "parse_emitter_output: document defs"
+        );
         for d in defs {
             let sym = d["symbol"].as_str().unwrap_or("");
             let kind = d["kind"].as_str().unwrap_or("definition");
@@ -258,7 +264,11 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
 
         // Call-site references → RefCall edges (file node → definition node).
         if let Some(refs) = doc["references"].as_array() {
-            tracing::debug!(path, ref_count = refs.len(), "parse_emitter_output: document refs");
+            tracing::debug!(
+                path,
+                ref_count = refs.len(),
+                "parse_emitter_output: document refs"
+            );
             for r in refs {
                 let sym = r["symbol"].as_str().unwrap_or("");
                 if sym.is_empty() {

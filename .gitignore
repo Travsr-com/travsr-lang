@@ -10,6 +10,10 @@ packages/**/.build/
 # Dart tool cache
 packages/**/.dart_tool/
 
+# Dart AOT-compiled binaries (platform-specific, built by CI)
+packages/dart-scip-emitter/bin/emit-native
+packages/dart-scip-emitter/bin/travsr-dart-index-emitter
+
 npm/**/.dart_tool/
 
 # .NET build artifacts

@@ -664,11 +664,9 @@ name = "travsr-lang-scala"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "tempfile",
  "tracing",
  "tracing-subscriber",
  "travsr-core",
- "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 

@@ -1,7 +1,7 @@
 {
-  "name": "@travsr-plugin/dart",
+  "name": "@travsr-plugin/swift",
   "version": "0.1.0",
-  "description": "Travsr Phase B — Dart semantic analysis (travsr-lang-dart binary + dart emitter)",
+  "description": "Travsr Phase B — Swift semantic analysis (travsr-lang-swift + travsr-swift-index-emitter)",
   "license": "MIT",
   "repository": {
     "type": "git",
@@ -11,7 +11,7 @@
     "postinstall": "node postinstall.js"
   },
   "bin": {
-    "travsr-lang-dart": "./bin/travsr-lang-dart"
+    "travsr-lang-swift": "./bin/travsr-lang-swift"
   },
   "publishConfig": {
     "access": "public"
