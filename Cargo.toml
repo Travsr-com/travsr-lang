@@ -21,4 +21,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [patch.crates-io]
-travsr-core = { path = "../travsr/crates/travsr-core" }
+travsr-core             = { path = "../travsr/crates/travsr-core" }
+travsr-plugin-protocol  = { path = "../travsr/crates/travsr-plugin-protocol" }
+travsr-plugin-sdk       = { path = "../travsr/crates/travsr-plugin-sdk" }

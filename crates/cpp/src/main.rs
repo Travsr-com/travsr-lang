@@ -48,7 +48,7 @@ impl Plugin for CppPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_clang(&req.root, req.corpus.as_str()) {
+        match run_scip_clang(&req.root, req.corpus.as_str(), &req.scratch) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("scip-clang failed for {}: {e}", req.root.display());
@@ -71,7 +71,7 @@ fn scip_clang_available() -> bool {
     })
 }
 
-fn run_scip_clang(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+fn run_scip_clang(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<InvokeResponse> {
     anyhow::ensure!(
         scip_clang_available(),
         "scip-clang not found on PATH — see https://github.com/sourcegraph/scip-clang"
@@ -87,8 +87,13 @@ fn run_scip_clang(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         return Ok(InvokeResponse::default());
     }
 
-    let scratch = tempfile::tempdir().context("failed to create temp dir")?;
-    let output_path = scratch.path().join("index.scip");
+    let _fallback_scratch;
+    let output_path = if !scratch.as_os_str().is_empty() {
+        scratch.join("index.scip")
+    } else {
+        _fallback_scratch = tempfile::tempdir().context("failed to create temp dir")?;
+        _fallback_scratch.path().join("index.scip")
+    };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
     let mut child = std::process::Command::new("scip-clang")
