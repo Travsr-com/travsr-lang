@@ -60,31 +60,48 @@ impl Plugin for JavaPhaseB {
     }
 }
 
-static SCIP_JAVA_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SCIP_JAVA_BIN: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn find_scip_java() -> Option<&'static std::path::PathBuf> {
+    SCIP_JAVA_BIN
+        .get_or_init(|| {
+            // 1. Try PATH first
+            if std::process::Command::new("scip-java")
+                .arg("--help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return Some(std::path::PathBuf::from("scip-java"));
+            }
+            // 2. travsr lang install location (GithubBinary → ~/.travsr/bin/)
+            let candidate = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)?
+                .join(".travsr/bin/scip-java");
+            candidate.exists().then_some(candidate)
+        })
+        .as_ref()
+}
 
 fn scip_java_available() -> bool {
-    *SCIP_JAVA_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("scip-java")
-            .arg("--help")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    })
+    find_scip_java().is_some()
 }
 
 fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
-    anyhow::ensure!(
-        scip_java_available(),
-        "scip-java not found on PATH — download from https://github.com/sourcegraph/scip-java/releases"
-    );
+    let bin = find_scip_java().ok_or_else(|| {
+        anyhow::anyhow!(
+            "scip-java not found — download from https://github.com/sourcegraph/scip-java/releases \
+             and place in ~/.travsr/bin/scip-java"
+        )
+    })?;
 
     // scip-java writes a SCIP index file (not stdout); use a temp dir as scratch.
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = scratch.path().join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
-    let mut child = std::process::Command::new("scip-java")
+    let mut child = std::process::Command::new(bin)
         .arg("index")
         .arg("--output")
         .arg(&output_path)

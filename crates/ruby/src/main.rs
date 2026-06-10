@@ -47,24 +47,41 @@ impl Plugin for RubyPhaseB {
     }
 }
 
-static SCIP_RUBY_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SCIP_RUBY_BIN: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn find_scip_ruby() -> Option<&'static std::path::PathBuf> {
+    SCIP_RUBY_BIN
+        .get_or_init(|| {
+            // 1. Try PATH first
+            if std::process::Command::new("scip-ruby")
+                .arg("--help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return Some(std::path::PathBuf::from("scip-ruby"));
+            }
+            // 2. travsr lang install location (GithubBinary → ~/.travsr/bin/)
+            let candidate = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)?
+                .join(".travsr/bin/scip-ruby");
+            candidate.exists().then_some(candidate)
+        })
+        .as_ref()
+}
 
 fn scip_ruby_available() -> bool {
-    *SCIP_RUBY_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("scip-ruby")
-            .arg("--help")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    })
+    find_scip_ruby().is_some()
 }
 
 fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<InvokeResponse> {
-    anyhow::ensure!(
-        scip_ruby_available(),
-        "scip-ruby not found on PATH — see https://github.com/sourcegraph/scip-ruby"
-    );
+    let bin = find_scip_ruby().ok_or_else(|| {
+        anyhow::anyhow!(
+            "scip-ruby not found — see https://github.com/sourcegraph/scip-ruby/releases \
+             or run: travsr lang install ruby"
+        )
+    })?;
 
     let _fallback_scratch;
     let output_dir = if !scratch.as_os_str().is_empty() {
@@ -79,7 +96,7 @@ fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<In
     // Derive a gem name from the corpus (last path segment) for scip-ruby metadata.
     let gem_name = corpus.split('/').next_back().unwrap_or("gem");
 
-    let mut child = std::process::Command::new("scip-ruby")
+    let mut child = std::process::Command::new(bin)
         .arg("--index-file")
         .arg(&output_path)
         .arg("--gem-metadata")

@@ -58,24 +58,41 @@ impl Plugin for CppPhaseB {
     }
 }
 
-static SCIP_CLANG_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SCIP_CLANG_BIN: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn find_scip_clang() -> Option<&'static std::path::PathBuf> {
+    SCIP_CLANG_BIN
+        .get_or_init(|| {
+            // 1. Try PATH first
+            if std::process::Command::new("scip-clang")
+                .arg("--help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return Some(std::path::PathBuf::from("scip-clang"));
+            }
+            // 2. travsr lang install location (GithubBinary → ~/.travsr/bin/)
+            let candidate = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)?
+                .join(".travsr/bin/scip-clang");
+            candidate.exists().then_some(candidate)
+        })
+        .as_ref()
+}
 
 fn scip_clang_available() -> bool {
-    *SCIP_CLANG_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("scip-clang")
-            .arg("--help")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    })
+    find_scip_clang().is_some()
 }
 
 fn run_scip_clang(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<InvokeResponse> {
-    anyhow::ensure!(
-        scip_clang_available(),
-        "scip-clang not found on PATH — see https://github.com/sourcegraph/scip-clang"
-    );
+    let bin = find_scip_clang().ok_or_else(|| {
+        anyhow::anyhow!(
+            "scip-clang not found — run: travsr lang install cpp \
+             (downloads to ~/.travsr/bin/scip-clang)"
+        )
+    })?;
 
     let compdb = root.join("compile_commands.json");
     if !compdb.exists() {
@@ -96,7 +113,7 @@ fn run_scip_clang(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<I
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
-    let mut child = std::process::Command::new("scip-clang")
+    let mut child = std::process::Command::new(bin)
         .arg("--compdb-path")
         .arg(&compdb)
         .arg("--index-output-path")

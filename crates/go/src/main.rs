@@ -46,31 +46,51 @@ impl Plugin for GoPhaseB {
     }
 }
 
-static SCIP_GO_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SCIP_GO_BIN: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn find_scip_go() -> Option<&'static std::path::PathBuf> {
+    SCIP_GO_BIN
+        .get_or_init(|| {
+            // 1. Try PATH first
+            if std::process::Command::new("scip-go")
+                .arg("--help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return Some(std::path::PathBuf::from("scip-go"));
+            }
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+            // 2. travsr-managed install (manual placement in ~/.travsr/bin/)
+            let candidate = home.join(".travsr/bin/scip-go");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // 3. Default GOPATH: `go install ...` lands here when GOPATH is unset
+            let candidate = home.join("go/bin/scip-go");
+            candidate.exists().then_some(candidate)
+        })
+        .as_ref()
+}
 
 fn scip_go_available() -> bool {
-    *SCIP_GO_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("scip-go")
-            .arg("--help")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    })
+    find_scip_go().is_some()
 }
 
 fn run_scip_go(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
-    anyhow::ensure!(
-        scip_go_available(),
-        "scip-go not found on PATH — install with: go install github.com/sourcegraph/scip-go/cmd/scip-go@latest"
-    );
+    let bin = find_scip_go().ok_or_else(|| {
+        anyhow::anyhow!(
+            "scip-go not found — install with: go install github.com/scip-code/scip-go/cmd/scip-go@latest"
+        )
+    })?;
 
     // scip-go writes to a file (not stdout); use a temp dir as scratch space.
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = scratch.path().join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
-    let mut child = std::process::Command::new("scip-go")
+    let mut child = std::process::Command::new(bin)
         .arg("--output")
         .arg(&output_path)
         .arg(root)

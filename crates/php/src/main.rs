@@ -45,30 +45,55 @@ impl Plugin for PhpPhaseB {
     }
 }
 
-static SCIP_PHP_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SCIP_PHP_BIN: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+
+fn find_scip_php() -> Option<&'static std::path::PathBuf> {
+    SCIP_PHP_BIN
+        .get_or_init(|| {
+            // 1. Try PATH first
+            if std::process::Command::new("scip-php")
+                .arg("--help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+            {
+                return Some(std::path::PathBuf::from("scip-php"));
+            }
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+            // 2. travsr-managed install (manual placement)
+            let candidate = home.join(".travsr/bin/scip-php");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // 3. Composer global install (~/.composer on macOS, ~/.config/composer on Linux)
+            let candidate = home.join(".composer/vendor/bin/scip-php");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            let candidate = home.join(".config/composer/vendor/bin/scip-php");
+            candidate.exists().then_some(candidate)
+        })
+        .as_ref()
+}
 
 fn scip_php_available() -> bool {
-    *SCIP_PHP_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("scip-php")
-            .arg("--help")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    })
+    find_scip_php().is_some()
 }
 
 fn run_scip_php(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
-    anyhow::ensure!(
-        scip_php_available(),
-        "scip-php not found on PATH — see https://github.com/sourcegraph/scip-php"
-    );
+    let bin = find_scip_php().ok_or_else(|| {
+        anyhow::anyhow!(
+            "scip-php not found — see https://github.com/davidrjenni/scip-php \
+             (composer require --dev davidrjenni/scip-php, then place vendor/bin/scip-php in ~/.travsr/bin/)"
+        )
+    })?;
 
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = scratch.path().join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
-    let mut child = std::process::Command::new("scip-php")
+    let mut child = std::process::Command::new(bin)
         .arg(root)
         .arg("--output")
         .arg(&output_path)
