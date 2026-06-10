@@ -56,7 +56,7 @@ fn find_scip_php() -> Option<&'static std::path::PathBuf> {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .is_ok_and(|s| s.success())
+                .is_ok()
             {
                 return Some(std::path::PathBuf::from("scip-php"));
             }

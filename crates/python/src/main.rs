@@ -58,7 +58,7 @@ fn find_scip_python() -> Option<&'static std::path::PathBuf> {
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
                 .status()
-                .is_ok_and(|s| s.success())
+                .is_ok()
             {
                 return Some(std::path::PathBuf::from("scip-python"));
             }
@@ -82,8 +82,7 @@ fn scip_python_available() -> bool {
 fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_python().ok_or_else(|| {
         anyhow::anyhow!(
-            "scip-python not found — install with: npm install -g @sourcegraph/scip-python \
-             or pip install scip-python"
+            "scip-python not found — install with: npm install -g @sourcegraph/scip-python"
         )
     })?;
 
