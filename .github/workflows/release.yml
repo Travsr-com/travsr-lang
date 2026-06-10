@@ -47,6 +47,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # travsr-core is patched from a sibling repo (../travsr). Mirror the same
+      # checkout+symlink pattern used in ci.yml so Cargo resolves [patch.crates-io].
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          ref: feature/travsr-core-tree-sitter-0.26-swift-dart
+          path: _travsr
+
+      - name: Symlink _travsr as ../travsr for Cargo patch resolution
+        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
