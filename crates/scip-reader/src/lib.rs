@@ -379,7 +379,7 @@ mod tests {
         // Phase A (java.rs) creates file nodes with signature "file".
         // Phase B ref/call edge src must hash to the same NodeId so the
         // all_nodes lookup in travsr-cli/src/index.rs succeeds.
-        use travsr_core::{Language as CoreLang, VName};
+        use travsr_core::VName;
 
         let corpus = "local/java";
         let path = "src/main/java/com/example/Foo.java";
