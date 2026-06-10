@@ -69,6 +69,13 @@ jobs:
         with:
           tool: cross
 
+      # cross builds inside Docker. The host symlink at ../travsr is not visible
+      # inside the container, which mounts the project at /project. Mount _travsr
+      # at /travsr so the [patch.crates-io] path ../travsr resolves correctly.
+      - name: Expose travsr sibling to cross Docker container
+        if: matrix.tool == 'cross'
+        run: echo "CROSS_DOCKER_OPTS=-v $GITHUB_WORKSPACE/_travsr:/travsr" >> $GITHUB_ENV
+
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
