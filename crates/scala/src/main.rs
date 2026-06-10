@@ -62,13 +62,37 @@ impl Plugin for ScalaPhaseB {
     }
 }
 
-static SBT_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SBT_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+fn find_sbt() -> Option<&'static PathBuf> {
+    SBT_BIN
+        .get_or_init(|| {
+            // 1. PATH — filesystem scan avoids spawning sbt's JVM just for discovery
+            if std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .any(|d| d.join("sbt").exists())
+            {
+                return Some(PathBuf::from("sbt"));
+            }
+            let home = std::env::var_os("HOME").map(PathBuf::from)?;
+            // 2. SDKMAN! — sdk install sbt
+            let candidate = home.join(".sdkman/candidates/sbt/current/bin/sbt");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // 3. Coursier on Linux — cs install sbt
+            let candidate = home.join(".local/share/coursier/bin/sbt");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // 4. Coursier on macOS
+            let candidate = home.join("Library/Application Support/Coursier/bin/sbt");
+            candidate.exists().then_some(candidate)
+        })
+        .as_ref()
+}
 
 fn sbt_available() -> bool {
-    *SBT_AVAILABLE.get_or_init(|| {
-        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-            .any(|d| d.join("sbt").exists())
-    })
+    find_sbt().is_some()
 }
 
 /// Walk up to `max_depth` levels to find the directory containing `build.sbt`.
@@ -118,7 +142,12 @@ fn find_semanticdb_files(sbt_root: &Path) -> Vec<PathBuf> {
 }
 
 fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
-    anyhow::ensure!(sbt_available(), "sbt not found on PATH");
+    let sbt_bin = find_sbt().ok_or_else(|| {
+        anyhow::anyhow!(
+            "sbt not found — install via SDKMAN! (sdk install sbt), \
+             Coursier (cs install sbt), or Homebrew (brew install sbt)"
+        )
+    })?;
 
     let sbt_root = find_sbt_root(root, 4)
         .ok_or_else(|| anyhow::anyhow!("no build.sbt found under {}", root.display()))?;
@@ -129,7 +158,7 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         .with_context(|| format!("writing {}", settings_path.display()))?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
-    let result = run_sbt_compile(&sbt_root, deadline);
+    let result = run_sbt_compile(&sbt_root, sbt_bin, deadline);
 
     let _ = std::fs::remove_file(&settings_path);
 
@@ -153,9 +182,10 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
 fn run_sbt_compile(
     sbt_root: &Path,
+    sbt_bin: &Path,
     deadline: std::time::Instant,
 ) -> anyhow::Result<(std::process::ExitStatus, String)> {
-    let mut child = std::process::Command::new("sbt")
+    let mut child = std::process::Command::new(sbt_bin)
         .arg("compile")
         .current_dir(sbt_root)
         .stdout(std::process::Stdio::piped())

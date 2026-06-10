@@ -46,24 +46,45 @@ impl Plugin for PythonPhaseB {
     }
 }
 
-static SCIP_PYTHON_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SCIP_PYTHON_BIN: std::sync::OnceLock<Option<std::path::PathBuf>> =
+    std::sync::OnceLock::new();
+
+fn find_scip_python() -> Option<&'static std::path::PathBuf> {
+    SCIP_PYTHON_BIN
+        .get_or_init(|| {
+            // 1. Try PATH first
+            if std::process::Command::new("scip-python")
+                .arg("--help")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok()
+            {
+                return Some(std::path::PathBuf::from("scip-python"));
+            }
+            let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+            // 2. travsr-managed install (manual placement)
+            let candidate = home.join(".travsr/bin/scip-python");
+            if candidate.exists() {
+                return Some(candidate);
+            }
+            // 3. pip install --user location
+            let candidate = home.join(".local/bin/scip-python");
+            candidate.exists().then_some(candidate)
+        })
+        .as_ref()
+}
 
 fn scip_python_available() -> bool {
-    *SCIP_PYTHON_AVAILABLE.get_or_init(|| {
-        std::process::Command::new("scip-python")
-            .arg("--help")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    })
+    find_scip_python().is_some()
 }
 
 fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
-    anyhow::ensure!(
-        scip_python_available(),
-        "scip-python not found on PATH — install with: pip install scip-python"
-    );
+    let bin = find_scip_python().ok_or_else(|| {
+        anyhow::anyhow!(
+            "scip-python not found — install with: npm install -g @sourcegraph/scip-python"
+        )
+    })?;
 
     // Use a temp dir as CWD so scip-python's default output (index.scip) lands
     // there rather than in the repo root, keeping the workspace clean.
@@ -71,7 +92,7 @@ fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> 
     let output_path = scratch.path().join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
-    let mut child = std::process::Command::new("scip-python")
+    let mut child = std::process::Command::new(bin)
         .args([
             "index",
             "--project-name",
