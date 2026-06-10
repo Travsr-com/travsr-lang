@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] — 2026-06-10
+
+### Added
+
+- Swift Phase B plugin: structural analysis via the bundled `swift-index-emitter` (SwiftSyntax). Produces call edges, type references, and inheritance edges. Available as `@travsr-plugin/swift`.
+- Dart Phase B plugin: semantic analysis via the bundled `dart-scip-emitter`. Available as `@travsr-plugin/dart`. The npm package installs share files to `~/.travsr/share/` and runs `dart pub get` on first install.
+- Scala Phase B plugin: semantic edges via SemanticDB and `sbt compile`. Available as `@travsr-plugin/scala`.
+- C# Phase B plugin: semantic edges via `scip-dotnet`. Available as `@travsr-plugin/csharp`.
+- Kotlin Phase B plugin: semantic edges via `kotlin-language-server` LSP client. Available as `@travsr-plugin/kotlin`.
+- One-command install for Swift and Dart: `travsr lang install swift` and `travsr lang install dart` now resolve the emitter path automatically.
+
+### Fixed
+
+- PATH fallback for Phase B binary resolution: all 7 SCIP-based plugins (C, C++, Go, Java, PHP, Python, Ruby) now correctly probe the system PATH when the binary is not found at the default install location.
+- Scala: `sbt` binary PATH fallback aligned with the same probe logic.
+- Python plugin: improved install hint when `scip-python` is not found.
+- PATH probe exit code handling: non-zero exit from a probe no longer causes a spurious error.
+
 ## [0.1.0] — 2026-05-31
 
 ### Added
@@ -36,4 +54,5 @@ All notable changes to this project will be documented in this file.
 - Removed redundant `travsr-lang-rust`, `travsr-lang-typescript`, and `travsr-lang-lsif` crates (replaced by SCIP-native pipeline).
 - `travsr-lang-php`: pass `--output` flag explicitly to `scip-php`.
 
+[0.2.0]: https://github.com/Travsr-com/travsr-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Travsr-com/travsr-lang/releases/tag/v0.1.0

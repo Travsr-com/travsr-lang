@@ -1,6 +1,6 @@
 {
   "name": "@travsr-plugin/kotlin",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Travsr Phase B — Kotlin semantic analysis (travsr-lang-kotlin binary, requires PSE approval)",
   "license": "MIT",
   "repository": {

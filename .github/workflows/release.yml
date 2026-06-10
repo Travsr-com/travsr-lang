@@ -22,6 +22,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: build (${{ matrix.target }})
@@ -46,6 +47,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # travsr-core is patched from a sibling repo (../travsr). Mirror the same
+      # checkout+symlink pattern used in ci.yml so Cargo resolves [patch.crates-io].
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          ref: feature/travsr-core-tree-sitter-0.26-swift-dart
+          path: _travsr
+
+      - name: Symlink _travsr as ../travsr for Cargo patch resolution
+        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -56,6 +68,18 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cross
+
+      # cross 0.2.5 builds inside Docker and mounts the project at the same absolute
+      # path as on the host (not /project). The host symlink ../travsr is outside
+      # the workspace mount so it is invisible inside the container. file::canonicalize
+      # also resolves through the symlink, so cross's own workspace-dep mount lands
+      # at the canonical _travsr path, not the ../travsr path Cargo looks for.
+      # CROSS_CONTAINER_OPTS (not CROSS_DOCKER_OPTS) is the correct env var in 0.2.5.
+      # We mount _travsr at $(dirname GITHUB_WORKSPACE)/travsr, i.e. the exact path
+      # ../travsr resolves to from inside the container.
+      - name: Expose travsr sibling to cross Docker container
+        if: matrix.tool == 'cross'
+        run: echo "CROSS_CONTAINER_OPTS=-v $GITHUB_WORKSPACE/_travsr:$(dirname $GITHUB_WORKSPACE)/travsr" >> $GITHUB_ENV
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
@@ -122,6 +146,7 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   build-swift-emitter:
     name: build swift-index-emitter (${{ matrix.target }})
@@ -166,6 +191,7 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   build-dart-emitter:
     name: build dart-scip-emitter (${{ matrix.target }})
@@ -211,6 +237,7 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   publish-npm:
     name: publish npm packages
