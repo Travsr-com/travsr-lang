@@ -22,6 +22,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   build:
     name: build (${{ matrix.target }})
@@ -122,6 +123,7 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   build-swift-emitter:
     name: build swift-index-emitter (${{ matrix.target }})
@@ -166,6 +168,7 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   build-dart-emitter:
     name: build dart-scip-emitter (${{ matrix.target }})
@@ -211,6 +214,7 @@ jobs:
         with:
           files: dist/*
           fail_on_unmatched_files: true
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   publish-npm:
     name: publish npm packages
