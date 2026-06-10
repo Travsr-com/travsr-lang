@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-scala"
-description = "Travsr Phase B — Scala semantic analysis via scip-scala"
+description = "Travsr Phase B — Scala semantic analysis via SemanticDB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -13,10 +13,8 @@ name = "travsr-lang-scala"
 path = "src/main.rs"
 
 [dependencies]
-travsr-plugin-sdk       = { workspace = true }
-travsr-core             = { workspace = true }
-travsr-lang-scip-reader = { workspace = true }
-anyhow                  = { workspace = true }
-tempfile                = { workspace = true }
-tracing                 = { workspace = true }
-tracing-subscriber      = { workspace = true }
+travsr-plugin-sdk  = { workspace = true }
+travsr-core        = { workspace = true }
+anyhow             = { workspace = true }
+tracing            = { workspace = true }
+tracing-subscriber = { workspace = true }

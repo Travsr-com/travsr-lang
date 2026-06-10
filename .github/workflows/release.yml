@@ -69,6 +69,7 @@ jobs:
             travsr-lang-c
             travsr-lang-cpp
             travsr-lang-csharp
+            travsr-lang-dart
             travsr-lang-go
             travsr-lang-java
             travsr-lang-kotlin
@@ -76,6 +77,7 @@ jobs:
             travsr-lang-python
             travsr-lang-ruby
             travsr-lang-scala
+            travsr-lang-swift
           )
           for bin in "${BINS[@]}"; do
             ${{ matrix.tool }} build --release --bin "$bin" --target ${{ matrix.target }}
@@ -89,6 +91,7 @@ jobs:
             travsr-lang-c
             travsr-lang-cpp
             travsr-lang-csharp
+            travsr-lang-dart
             travsr-lang-go
             travsr-lang-java
             travsr-lang-kotlin
@@ -96,6 +99,7 @@ jobs:
             travsr-lang-python
             travsr-lang-ruby
             travsr-lang-scala
+            travsr-lang-swift
           )
           mkdir -p dist
           for bin in "${BINS[@]}"; do
@@ -119,9 +123,98 @@ jobs:
           files: dist/*
           fail_on_unmatched_files: true
 
+  build-swift-emitter:
+    name: build swift-index-emitter (${{ matrix.target }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Swift (Linux only)
+        if: runner.os == 'Linux'
+        run: |
+          wget -q https://download.swift.org/swift-6.0.3-release/ubuntu2204/swift-6.0.3-RELEASE/swift-6.0.3-RELEASE-ubuntu22.04.tar.gz
+          tar -xzf swift-6.0.3-RELEASE-ubuntu22.04.tar.gz
+          echo "$GITHUB_WORKSPACE/swift-6.0.3-RELEASE-ubuntu22.04/usr/bin" >> $GITHUB_PATH
+      - name: Build swift-index-emitter
+        run: |
+          cd packages/swift-index-emitter
+          swift build -c release
+      - name: Package and checksum
+        shell: bash
+        run: |
+          TARGET=${{ matrix.target }}
+          SRC="packages/swift-index-emitter/.build/release/swift-index-emitter"
+          mkdir -p dist
+          DST="dist/travsr-swift-index-emitter-${TARGET}"
+          cp "$SRC" "$DST"
+          chmod +x "$DST"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$DST" | awk '{print $1}' > "${DST}.sha256"
+          else
+            shasum -a 256 "$DST" | awk '{print $1}' > "${DST}.sha256"
+          fi
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+
+  build-dart-emitter:
+    name: build dart-scip-emitter (${{ matrix.target }})
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+      - name: Install dependencies
+        run: |
+          cd packages/dart-scip-emitter
+          dart pub get
+      - name: Compile to native binary
+        run: |
+          cd packages/dart-scip-emitter
+          dart compile exe bin/emit.dart -o bin/travsr-dart-index-emitter
+      - name: Package and checksum
+        shell: bash
+        run: |
+          TARGET=${{ matrix.target }}
+          SRC="packages/dart-scip-emitter/bin/travsr-dart-index-emitter"
+          mkdir -p dist
+          DST="dist/travsr-dart-index-emitter-${TARGET}"
+          cp "$SRC" "$DST"
+          chmod +x "$DST"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$DST" | awk '{print $1}' > "${DST}.sha256"
+          else
+            shasum -a 256 "$DST" | awk '{print $1}' > "${DST}.sha256"
+          fi
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+
   publish-npm:
     name: publish npm packages
-    needs: build
+    needs: [build, build-swift-emitter, build-dart-emitter]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -137,7 +230,7 @@ jobs:
         run: |
           # Strip leading "v" from tag: "v0.1.0" -> "0.1.0"
           VERSION="${GITHUB_REF_NAME#v}"
-          LANGS=(c cpp csharp go java kotlin php python ruby scala)
+          LANGS=(c cpp csharp dart go java kotlin php python ruby scala swift)
           for lang in "${LANGS[@]}"; do
             echo "Publishing @travsr-plugin/${lang} @ ${VERSION} …"
             # postinstall.js lives at npm/postinstall.js (shared source of truth).

@@ -10,11 +10,29 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  test:
-    name: check + test
+  rust:
+    name: rust (check + test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # travsr-core is patched from a sibling repo (../travsr) because Language::Dart
+      # and Language::Swift are not yet published to crates.io. Cargo resolves the
+      # [patch.crates-io] at workspace root which requires the sibling to be present.
+      #
+      # actions/checkout@v4 blocks paths outside $GITHUB_WORKSPACE, so we check out
+      # into _travsr (inside the workspace) and symlink it to ../travsr so Cargo's
+      # [patch.crates-io] paths resolve without touching Cargo.toml.
+      # Pin to the travsr feature branch that adds Language::Swift and Language::Dart.
+      # Revert ref to master once both PRs (travsr + travsr-lang) are merged.
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          ref: feature/travsr-core-tree-sitter-0.26-swift-dart
+          path: _travsr
+
+      - name: Symlink _travsr as ../travsr for Cargo patch resolution
+        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -33,3 +51,86 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+  swift-macos:
+    name: swift emitter (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build
+        working-directory: packages/swift-index-emitter
+        run: swift build -c release
+
+      - name: smoke test
+        working-directory: packages/swift-index-emitter
+        run: |
+          mkdir -p /tmp/swift_smoke/Sources
+          cat > /tmp/swift_smoke/Sources/Hello.swift <<'EOF'
+          struct Greeter {
+              func greet() { print("hello") }
+          }
+          EOF
+          .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
+          grep -q '"version"' /tmp/swift_smoke_out.json
+
+  swift-linux:
+    name: swift emitter (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "5.10"
+
+      - name: build
+        working-directory: packages/swift-index-emitter
+        run: swift build -c release
+
+      - name: smoke test
+        working-directory: packages/swift-index-emitter
+        run: |
+          mkdir -p /tmp/swift_smoke/Sources
+          cat > /tmp/swift_smoke/Sources/Hello.swift <<'EOF'
+          struct Greeter {
+              func greet() { print("hello") }
+          }
+          EOF
+          .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
+          grep -q '"version"' /tmp/swift_smoke_out.json
+
+  dart:
+    name: dart emitter (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: pub get
+        working-directory: packages/dart-scip-emitter
+        run: dart pub get
+
+      - name: analyze
+        working-directory: packages/dart-scip-emitter
+        run: dart analyze bin/emit.dart
+
+      - name: smoke test
+        working-directory: packages/dart-scip-emitter
+        run: |
+          mkdir -p /tmp/dart_smoke/lib
+          cat > /tmp/dart_smoke/lib/hello.dart <<'EOF'
+          class Greeter {
+            String greet(String name) => 'Hello, $name!';
+          }
+          EOF
+          cat > /tmp/dart_smoke/pubspec.yaml <<'EOF'
+          name: dart_smoke
+          environment:
+            sdk: ">=3.0.0 <4.0.0"
+          EOF
+          dart run bin/emit.dart /tmp/dart_smoke /tmp/dart_smoke_out.json
+          grep -q '"version"' /tmp/dart_smoke_out.json

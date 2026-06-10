@@ -1,6 +1,6 @@
 [package]
-name = "travsr-lang-kotlin"
-description = "Travsr Phase B — Kotlin semantic analysis via scip-java"
+name = "travsr-lang-dart"
+description = "Travsr Phase B — Dart semantic analysis via dart analyze (stub)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -9,7 +9,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "travsr-lang-kotlin"
+name = "travsr-lang-dart"
 path = "src/main.rs"
 
 [dependencies]
@@ -17,5 +17,6 @@ travsr-plugin-sdk  = { workspace = true }
 travsr-core        = { workspace = true }
 anyhow             = { workspace = true }
 serde_json         = { workspace = true }
+tempfile           = { workspace = true }
 tracing            = { workspace = true }
 tracing-subscriber = { workspace = true }

@@ -37,7 +37,7 @@ impl Plugin for RubyPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_ruby(&req.root, req.corpus.as_str()) {
+        match run_scip_ruby(&req.root, req.corpus.as_str(), &req.scratch) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("scip-ruby failed for {}: {e}", req.root.display());
@@ -60,21 +60,31 @@ fn scip_ruby_available() -> bool {
     })
 }
 
-fn run_scip_ruby(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<InvokeResponse> {
     anyhow::ensure!(
         scip_ruby_available(),
         "scip-ruby not found on PATH — see https://github.com/sourcegraph/scip-ruby"
     );
 
-    // Use a temp dir as CWD so scip-ruby's default output (index.scip) goes
-    // there instead of the repo root.
-    let scratch = tempfile::tempdir().context("failed to create temp dir")?;
-    let output_path = scratch.path().join("index.scip");
+    let _fallback_scratch;
+    let output_dir = if !scratch.as_os_str().is_empty() {
+        scratch
+    } else {
+        _fallback_scratch = tempfile::tempdir().context("failed to create temp dir")?;
+        _fallback_scratch.path()
+    };
+    let output_path = output_dir.join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
+    // Derive a gem name from the corpus (last path segment) for scip-ruby metadata.
+    let gem_name = corpus.split('/').next_back().unwrap_or("gem");
+
     let mut child = std::process::Command::new("scip-ruby")
-        .arg(root)
-        .current_dir(scratch.path())
+        .arg("--index-file")
+        .arg(&output_path)
+        .arg("--gem-metadata")
+        .arg(format!("{gem_name}@0.0.0"))
+        .current_dir(root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -112,6 +122,7 @@ fn run_scip_ruby(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
 fn main() {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("travsr_lang_ruby=info".parse().unwrap()),

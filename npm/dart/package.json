@@ -1,0 +1,22 @@
+{
+  "name": "@travsr-plugin/dart",
+  "version": "0.1.0",
+  "description": "Travsr Phase B — Dart semantic analysis (travsr-lang-dart binary + dart emitter)",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Travsr-com/travsr-lang"
+  },
+  "scripts": {
+    "postinstall": "node postinstall.js"
+  },
+  "bin": {
+    "travsr-lang-dart": "./bin/travsr-lang-dart"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=16"
+  }
+}

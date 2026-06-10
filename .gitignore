@@ -1,2 +1,25 @@
 /target/
 Cargo.lock
+
+# Travsr graph index
+.travsr/
+
+# Swift Package Manager build artifacts
+packages/**/.build/
+
+# Dart tool cache
+packages/**/.dart_tool/
+
+# Dart AOT-compiled binaries (platform-specific, built by CI)
+packages/dart-scip-emitter/bin/emit-native
+packages/dart-scip-emitter/bin/travsr-dart-index-emitter
+
+npm/**/.dart_tool/
+
+# .NET build artifacts
+fixtures/**/obj/
+fixtures/**/bin/
+
+# Scala/sbt build artifacts
+fixtures/**/target/
+fixtures/**/.bsp/
