@@ -19,10 +19,17 @@ jobs:
       # travsr-core is patched from a sibling repo (../travsr) because Language::Dart
       # and Language::Swift are not yet published to crates.io. Cargo resolves the
       # [patch.crates-io] at workspace root which requires the sibling to be present.
+      #
+      # actions/checkout@v4 blocks paths outside $GITHUB_WORKSPACE, so we check out
+      # into _travsr (inside the workspace) and symlink it to ../travsr so Cargo's
+      # [patch.crates-io] paths resolve without touching Cargo.toml.
       - uses: actions/checkout@v4
         with:
           repository: Travsr-com/travsr
-          path: ../travsr
+          path: _travsr
+
+      - name: Symlink _travsr as ../travsr for Cargo patch resolution
+        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
