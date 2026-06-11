@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-c"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-cpp"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -558,7 +558,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-csharp"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -571,7 +571,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-dart"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -584,7 +584,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-go"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -597,7 +597,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-java"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -610,7 +610,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-kotlin"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -622,7 +622,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-php"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -635,7 +635,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-python"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-ruby"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-scala"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "tracing",
@@ -672,7 +672,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-scip-reader"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "protobuf",
@@ -685,7 +685,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-swift"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde_json",
