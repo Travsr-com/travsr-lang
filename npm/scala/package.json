@@ -1,6 +1,6 @@
 {
   "name": "@travsr-plugin/scala",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Travsr Phase B — Scala semantic analysis (travsr-lang-scala binary, requires PSE approval)",
   "license": "MIT",
   "repository": {

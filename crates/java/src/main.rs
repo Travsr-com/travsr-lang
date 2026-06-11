@@ -105,7 +105,6 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         .arg("index")
         .arg("--output")
         .arg(&output_path)
-        .arg(root)
         .current_dir(root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

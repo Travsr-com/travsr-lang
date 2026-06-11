@@ -1,8 +1,12 @@
 //! Travsr Phase B — Go semantic analysis.
 //!
-//! Runs `scip-go --output {scratch}/index.scip {root}` inside the ADR-017
-//! sandbox (Standard policy) and returns call/reference edges to the Travsr
-//! daemon via the plugin protocol.
+//! Runs `scip-go index --output {scratch}/index.scip ./...` (cwd = root) inside
+//! the ADR-017 sandbox (Standard policy) and returns call/reference edges to the
+//! Travsr daemon via the plugin protocol.
+//!
+//! IMPORTANT: `./...` is required. Passing root as a positional arg causes scip-go
+//! to load only `[1/1]` (root package), silently skipping all sub-packages. On a
+//! large repo like Kubernetes (2255 packages) that means 0 edges.
 //!
 //! Install:  go install github.com/sourcegraph/scip-go/cmd/scip-go@latest
 //! Register: travsr lang add go
@@ -91,9 +95,10 @@ fn run_scip_go(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
     let mut child = std::process::Command::new(bin)
+        .arg("index")
         .arg("--output")
         .arg(&output_path)
-        .arg(root)
+        .arg("./...")
         .current_dir(root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
