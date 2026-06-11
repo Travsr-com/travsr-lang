@@ -1,6 +1,6 @@
 {
   "name": "@travsr-plugin/java",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Travsr Phase B — Java semantic analysis (travsr-lang-java binary, requires PSE approval)",
   "license": "MIT",
   "repository": {

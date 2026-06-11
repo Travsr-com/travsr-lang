@@ -1,6 +1,6 @@
 {
   "name": "@travsr-plugin/python",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Travsr Phase B — Python semantic analysis (travsr-lang-python binary)",
   "license": "MIT",
   "repository": {

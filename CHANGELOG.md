@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.1] — 2026-06-11
+
+### Fixed
+
+- Go plugin: changed `scip-go` invocation from `scip-go --output <f> <root>` to `scip-go index --output <f> ./...` (cwd=root). The old form loaded only the root package, producing zero semantic edges on multi-package repos. `./...` is the standard Go recursive package pattern.
+- Java plugin: removed spurious positional `<root>` argument from `scip-java index --output <f>`. scip-java uses cwd for project discovery; the extra argument caused an error on unknown trailing argument.
+
 ## [0.2.0] — 2026-06-10
 
 ### Added
@@ -54,5 +61,6 @@ All notable changes to this project will be documented in this file.
 - Removed redundant `travsr-lang-rust`, `travsr-lang-typescript`, and `travsr-lang-lsif` crates (replaced by SCIP-native pipeline).
 - `travsr-lang-php`: pass `--output` flag explicitly to `scip-php`.
 
+[0.2.1]: https://github.com/Travsr-com/travsr-lang/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Travsr-com/travsr-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Travsr-com/travsr-lang/releases/tag/v0.1.0
