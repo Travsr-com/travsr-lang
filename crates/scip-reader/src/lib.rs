@@ -86,12 +86,27 @@ pub fn ingest_index(
             if (occ.symbol_roles & 1) == 0 {
                 continue;
             }
+            // G3: SCIP anonymous locals (`local N`) are intra-function noise —
+            // on kubernetes they are 77% of all definitions. Drop at ingest.
+            if occ.symbol.starts_with("local ") {
+                continue;
+            }
 
-            let line = occ.range.first().copied().unwrap_or(0) as u32 + 1;
+            // G2: prefer `enclosing_range` (the full declaration body span,
+            // e.g. a Go function's `{ … }` block) over `range` (just the name
+            // token). Without the body span the enclosing-function lookup in
+            // write_scip_attributed_batch can only match refs that sit on the
+            // definition line itself.
+            let span: &[i32] = if occ.enclosing_range.len() >= 3 {
+                &occ.enclosing_range
+            } else {
+                &occ.range
+            };
+            let line = span.first().copied().unwrap_or(0) as u32 + 1;
             // SCIP range encoding: 3-element = [start_line, start_col, end_col] (single line);
             // 4-element = [start_line, start_col, end_line, end_col] (multi-line).
-            let end_line = if occ.range.len() >= 4 {
-                occ.range[2] as u32 + 1
+            let end_line = if span.len() >= 4 {
+                span[2] as u32 + 1
             } else {
                 line // single-line declaration: end == start
             };
@@ -154,6 +169,10 @@ pub fn ingest_index(
             }
             if (occ.symbol_roles & 1) != 0 {
                 continue; // skip definitions
+            }
+            // G3: references to anonymous locals are dropped with their defs.
+            if occ.symbol.starts_with("local ") {
+                continue;
             }
             if count >= MAX_REF_EDGES_PER_DOC {
                 break;
