@@ -626,7 +626,8 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         let def_id = def_vname.id();
         nodes.push(
             Node::new(def_vname, sym.kind_str())
-                .with_line(sym.sel_range.start.line.saturating_add(1) as u32),
+                .with_line(sym.sel_range.start.line.saturating_add(1) as u32)
+                .with_end_line(sym.range.end.line.saturating_add(1) as u32),
         );
 
         let refs_val = match session.request(

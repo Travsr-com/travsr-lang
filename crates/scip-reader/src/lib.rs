@@ -88,6 +88,13 @@ pub fn ingest_index(
             }
 
             let line = occ.range.first().copied().unwrap_or(0) as u32 + 1;
+            // SCIP range encoding: 3-element = [start_line, start_col, end_col] (single line);
+            // 4-element = [start_line, start_col, end_line, end_col] (multi-line).
+            let end_line = if occ.range.len() >= 4 {
+                occ.range[2] as u32 + 1
+            } else {
+                line // single-line declaration: end == start
+            };
             let kind = kind_map
                 .get(occ.symbol.as_str())
                 .cloned()
@@ -97,7 +104,11 @@ pub fn ingest_index(
             let vname = VName::new(corpus, "", path, lang_str, &sig);
             let node_id = vname.id();
             def_ids.insert(occ.symbol.clone(), node_id);
-            nodes.push(Node::new(vname, &kind).with_line(line));
+            nodes.push(
+                Node::new(vname, &kind)
+                    .with_line(line)
+                    .with_end_line(end_line),
+            );
         }
     }
 
