@@ -325,7 +325,11 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
         "swift emitter ingestion complete"
     );
 
-    Ok(InvokeResponse { nodes, edges })
+    Ok(InvokeResponse {
+        nodes,
+        edges,
+        ..Default::default()
+    })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

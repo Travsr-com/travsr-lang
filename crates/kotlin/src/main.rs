@@ -683,7 +683,11 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     tracing::info!("KLS phase B: {} nodes, {} edges", nodes.len(), edges.len());
 
     session.shutdown(deadline);
-    Ok(InvokeResponse { nodes, edges })
+    Ok(InvokeResponse {
+        nodes,
+        edges,
+        ..Default::default()
+    })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

@@ -27,7 +27,7 @@ use anyhow::Context as _;
 use protobuf::Message as _;
 use std::collections::HashMap;
 use std::path::Path;
-use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
+use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
 use travsr_plugin_sdk::InvokeResponse;
 
 /// Maximum reference-occurrence edges emitted per document (per SCIP document,
@@ -139,13 +139,13 @@ pub fn ingest_index(
         }
     }
 
-    // ── Pass 3: reference-occurrence edges ───────────────────────────────────
-    // For each reference occurrence resolved to a known definition, emit a
-    // ref/call edge from a synthetic "file" node (representing the referencing
-    // source file) to the definition node. Capped per document.
+    // ── Pass 3: reference-occurrence → ScipRef records (G2 attribution) ────────
+    // Each occurrence carries a source line which `write_scip_attributed_batch`
+    // uses to find the innermost enclosing function span and re-home the
+    // ref/call edge from file → function (RFC-014 G2).
+    let mut refs: Vec<ScipRef> = Vec::new();
     for doc in &index.documents {
         let path = &doc.relative_path;
-        let file_id = VName::new(corpus, "", path, lang_str, "file").id();
         let mut count = 0usize;
 
         for occ in &doc.occurrences {
@@ -158,8 +158,18 @@ pub fn ingest_index(
             if count >= MAX_REF_EDGES_PER_DOC {
                 break;
             }
-            if let Some(&dst_id) = def_ids.get(occ.symbol.as_str()) {
-                edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
+            if let Some(&callee_id) = def_ids.get(occ.symbol.as_str()) {
+                let caller_line = occ
+                    .range
+                    .first()
+                    .copied()
+                    .map(|l| l as u32 + 1)
+                    .unwrap_or(1);
+                refs.push(ScipRef {
+                    caller_path: path.clone(),
+                    caller_line,
+                    callee_id,
+                });
                 count += 1;
             }
         }
@@ -167,11 +177,12 @@ pub fn ingest_index(
 
     tracing::info!(
         nodes = nodes.len(),
-        edges = edges.len(),
+        structural_edges = edges.len(),
+        refs = refs.len(),
         "SCIP ingestion complete"
     );
 
-    Ok(InvokeResponse { nodes, edges })
+    Ok(InvokeResponse { nodes, edges, refs })
 }
 
 /// Map a SCIP `SymbolInformation.kind` field to a Travsr kind string.
@@ -382,16 +393,18 @@ mod tests {
 
         let resp = ingest_index(&index, "github.com/example/repo", Language::Go).unwrap();
         assert_eq!(resp.nodes.len(), 1, "one definition node");
-        assert_eq!(resp.edges.len(), 1, "one ref/call edge from doc_b to def");
+        // G2: reference occurrences become ScipRef records (not raw edges) so the
+        // daemon can attribute them to the enclosing function at write time.
+        assert_eq!(resp.refs.len(), 1, "one ScipRef from doc_b to def");
+        assert_eq!(resp.refs[0].caller_path, "cmd/main.go");
+        assert_eq!(resp.refs[0].caller_line, 4); // 0-indexed line 3 → 1-indexed 4
+        assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
     }
 
     #[test]
-    fn ref_edge_src_aligns_with_phase_a_file_node_id() {
-        // Phase A (java.rs) creates file nodes with signature "file".
-        // Phase B ref/call edge src must hash to the same NodeId so the
-        // all_nodes lookup in travsr-cli/src/index.rs succeeds.
-        use travsr_core::VName;
-
+    fn ref_scip_ref_callee_matches_def_node() {
+        // G2: ScipRef.callee_id must equal the definition node's NodeId so that
+        // write_scip_attributed_batch can resolve the target without extra lookups.
         let corpus = "local/java";
         let path = "src/main/java/com/example/Foo.java";
         let def_sym = "com.example Foo#doWork().".to_string();
@@ -424,13 +437,10 @@ mod tests {
         };
 
         let resp = ingest_index(&index, corpus, Language::Java).unwrap();
-        assert_eq!(resp.edges.len(), 1, "one ref/call edge");
-
-        // The src must equal the NodeId Phase A would compute for the same file.
-        let phase_a_file_id = VName::new(corpus, "", path, "java", "file").id();
-        assert_eq!(
-            resp.edges[0].src, phase_a_file_id,
-            "ref/call edge src must match Phase A file-node NodeId (signature='file')"
-        );
+        assert_eq!(resp.refs.len(), 1, "one ScipRef");
+        assert_eq!(resp.refs[0].caller_path, path);
+        assert_eq!(resp.refs[0].caller_line, 3); // 0-indexed line 2 → 1-indexed 3
+                                                 // callee_id must be the definition node — the daemon resolves src at write time.
+        assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
     }
 }

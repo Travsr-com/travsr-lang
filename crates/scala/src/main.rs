@@ -558,7 +558,11 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
         "semanticdb: built graph"
     );
 
-    InvokeResponse { nodes, edges }
+    InvokeResponse {
+        nodes,
+        edges,
+        ..Default::default()
+    }
 }
 
 fn main() {
