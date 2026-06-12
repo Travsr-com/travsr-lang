@@ -231,6 +231,7 @@ struct SymbolInfo {
 #[derive(Debug)]
 struct Occurrence {
     start_line: u32,
+    end_line: u32,
     symbol: String,
     role: u32, // 1 = REFERENCE, 2 = DEFINITION
 }
@@ -268,8 +269,11 @@ fn skip_field(data: &[u8], pos: &mut usize, wire_type: u64) {
     }
 }
 
-fn parse_range_start_line(data: &[u8]) -> u32 {
+/// Parse both start_line (field 1) and end_line (field 3) from a SemanticDB Range message.
+fn parse_range_lines(data: &[u8]) -> (u32, u32) {
     let mut pos = 0;
+    let mut start_line = 0u32;
+    let mut end_line = 0u32;
     while pos < data.len() {
         let Some(tag) = read_varint(data, &mut pos) else {
             break;
@@ -278,20 +282,23 @@ fn parse_range_start_line(data: &[u8]) -> u32 {
         let wtype = tag & 7;
         if wtype == 0 {
             let val = read_varint(data, &mut pos).unwrap_or(0);
-            if field == 1 {
-                return val as u32;
+            match field {
+                1 => start_line = val as u32,
+                3 => end_line = val as u32,
+                _ => {}
             }
         } else {
             skip_field(data, &mut pos, wtype);
         }
     }
-    0
+    (start_line, end_line)
 }
 
 fn parse_occurrence(data: &[u8]) -> Occurrence {
     let mut pos = 0;
     let mut occ = Occurrence {
         start_line: 0,
+        end_line: 0,
         symbol: String::new(),
         role: 0,
     };
@@ -303,10 +310,12 @@ fn parse_occurrence(data: &[u8]) -> Occurrence {
         let wtype = tag & 7;
         match (field, wtype) {
             (1, 2) => {
-                // range
+                // range — extract both start_line and end_line
                 let len = read_varint(data, &mut pos).unwrap_or(0) as usize;
                 let end = pos.saturating_add(len).min(data.len());
-                occ.start_line = parse_range_start_line(&data[pos..end]);
+                let (sl, el) = parse_range_lines(&data[pos..end]);
+                occ.start_line = sl;
+                occ.end_line = if el > 0 { el } else { sl }; // single-line: end == start
                 pos = end;
             }
             (2, 2) => {
@@ -500,14 +509,16 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
                 continue;
             }
             let vname = sdb_vname(&sym.symbol, uri, corpus);
+            let def_occ = doc
+                .occurrences
+                .iter()
+                .find(|o| o.role == 2 && o.symbol == sym.symbol);
+            let start_line = def_occ.map(|o| o.start_line + 1).unwrap_or(0);
+            let end_line = def_occ.map(|o| o.end_line + 1).unwrap_or(start_line);
             nodes.push(
-                Node::new(vname, kind_str(sym.kind)).with_line(
-                    doc.occurrences
-                        .iter()
-                        .find(|o| o.role == 2 && o.symbol == sym.symbol)
-                        .map(|o| o.start_line + 1) // 1-based
-                        .unwrap_or(0),
-                ),
+                Node::new(vname, kind_str(sym.kind))
+                    .with_line(start_line)
+                    .with_end_line(end_line),
             );
         }
 
@@ -547,7 +558,11 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
         "semanticdb: built graph"
     );
 
-    InvokeResponse { nodes, edges }
+    InvokeResponse {
+        nodes,
+        edges,
+        ..Default::default()
+    }
 }
 
 fn main() {

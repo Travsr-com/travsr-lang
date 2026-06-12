@@ -23,12 +23,13 @@ jobs:
       # actions/checkout@v4 blocks paths outside $GITHUB_WORKSPACE, so we check out
       # into _travsr (inside the workspace) and symlink it to ../travsr so Cargo's
       # [patch.crates-io] paths resolve without touching Cargo.toml.
-      # Pin to the travsr feature branch that adds Language::Swift and Language::Dart.
-      # Revert ref to master once both PRs (travsr + travsr-lang) are merged.
+      # Pin to the travsr feature branch that adds ScipRef + the RFC-014 Phase B
+      # protocol (1 GiB frame cap, InvokeResponse.refs, Node.end_line).
+      # Revert ref to master once both PRs (travsr #321 + travsr-lang #6) are merged.
       - uses: actions/checkout@v4
         with:
           repository: Travsr-com/travsr
-          ref: feature/travsr-core-tree-sitter-0.26-swift-dart
+          ref: feature/travsr-indexer-store-317-phase-b-unification
           path: _travsr
 
       - name: Symlink _travsr as ../travsr for Cargo patch resolution

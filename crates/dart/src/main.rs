@@ -239,7 +239,11 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
             let vname = VName::new(corpus, "", path, lang_str, sym);
             let node_id = vname.id();
             def_ids.insert(sym.to_string(), node_id);
-            nodes.push(Node::new(vname, kind).with_line(line));
+            let mut node = Node::new(vname, kind).with_line(line);
+            if let Some(el) = d["end_line"].as_u64() {
+                node = node.with_end_line(el as u32);
+            }
+            nodes.push(node);
         }
     }
 
@@ -281,7 +285,11 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
         "dart emitter ingestion complete"
     );
 
-    Ok(InvokeResponse { nodes, edges })
+    Ok(InvokeResponse {
+        nodes,
+        edges,
+        ..Default::default()
+    })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

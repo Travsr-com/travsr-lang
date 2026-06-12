@@ -14,7 +14,7 @@
 ///     {
 ///       "path": "lib/src/foo.dart",       // relative to root-path
 ///       "definitions": [
-///         { "symbol": "<uri>::<qname>", "kind": "class|function|constructor|field|variable", "line": 5 }
+///         { "symbol": "<uri>::<qname>", "kind": "class|function|constructor|field|variable", "line": 5, "end_line": 12 }
 ///       ],
 ///       "references": [
 ///         { "symbol": "<uri>::<qname>", "line": 12 }
@@ -143,10 +143,18 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   int _line(int offset) => lineInfo.getLocation(offset).lineNumber;
 
-  void _addDef(Element? element, int offset, String kind) {
+  /// Record a definition. [nameOffset] is the name token's offset (for `line`).
+  /// [declEnd] is the exclusive end offset of the full declaration node (for
+  /// `end_line`); pass `node.end` and this method subtracts 1 internally.
+  void _addDef(Element? element, int nameOffset, String kind, {required int declEnd}) {
     final sym = _elementSymbol(element);
     if (sym.isEmpty) return;
-    definitions.add({'symbol': sym, 'kind': kind, 'line': _line(offset)});
+    definitions.add({
+      'symbol': sym,
+      'kind': kind,
+      'line': _line(nameOffset),
+      'end_line': _line(declEnd - 1),
+    });
   }
 
   void _addRef(Element? element, int offset) {
@@ -159,13 +167,13 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   @override
   void visitClassDeclaration(ClassDeclaration node) {
-    _addDef(node.declaredElement, node.name.offset, 'class');
+    _addDef(node.declaredElement, node.name.offset, 'class', declEnd: node.end);
     super.visitClassDeclaration(node);
   }
 
   @override
   void visitMixinDeclaration(MixinDeclaration node) {
-    _addDef(node.declaredElement, node.name.offset, 'class');
+    _addDef(node.declaredElement, node.name.offset, 'class', declEnd: node.end);
     super.visitMixinDeclaration(node);
   }
 
@@ -173,20 +181,21 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   void visitExtensionDeclaration(ExtensionDeclaration node) {
     final el = node.declaredElement;
     if (el != null && el.name != null && el.name!.isNotEmpty) {
-      _addDef(el, node.extensionKeyword.offset, 'class');
+      _addDef(el, node.extensionKeyword.offset, 'class', declEnd: node.end);
     }
     super.visitExtensionDeclaration(node);
   }
 
   @override
   void visitEnumDeclaration(EnumDeclaration node) {
-    _addDef(node.declaredElement, node.name.offset, 'class');
+    _addDef(node.declaredElement, node.name.offset, 'class', declEnd: node.end);
     super.visitEnumDeclaration(node);
   }
 
   @override
   void visitEnumConstantDeclaration(EnumConstantDeclaration node) {
-    _addDef(node.declaredElement, node.name.offset, 'field');
+    // Enum constants are single-line; end == name line.
+    _addDef(node.declaredElement, node.name.offset, 'field', declEnd: node.end);
     super.visitEnumConstantDeclaration(node);
   }
 
@@ -194,7 +203,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   void visitFunctionDeclaration(FunctionDeclaration node) {
     // Only top-level functions (not nested).
     if (node.parent is CompilationUnit) {
-      _addDef(node.declaredElement, node.name.offset, 'function');
+      _addDef(node.declaredElement, node.name.offset, 'function', declEnd: node.end);
     }
     super.visitFunctionDeclaration(node);
   }
@@ -202,7 +211,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   @override
   void visitMethodDeclaration(MethodDeclaration node) {
     final kind = node.isGetter || node.isSetter ? 'field' : 'function';
-    _addDef(node.declaredElement, node.name.offset, kind);
+    _addDef(node.declaredElement, node.name.offset, kind, declEnd: node.end);
     super.visitMethodDeclaration(node);
   }
 
@@ -212,6 +221,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
       node.declaredElement,
       node.returnType.offset,
       'constructor',
+      declEnd: node.end,
     );
     super.visitConstructorDeclaration(node);
   }
@@ -219,7 +229,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   @override
   void visitFieldDeclaration(FieldDeclaration node) {
     for (final v in node.fields.variables) {
-      _addDef(v.declaredElement, v.name.offset, 'field');
+      _addDef(v.declaredElement, v.name.offset, 'field', declEnd: node.end);
     }
     super.visitFieldDeclaration(node);
   }
@@ -227,7 +237,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   @override
   void visitTopLevelVariableDeclaration(TopLevelVariableDeclaration node) {
     for (final v in node.variables.variables) {
-      _addDef(v.declaredElement, v.name.offset, 'variable');
+      _addDef(v.declaredElement, v.name.offset, 'variable', declEnd: node.end);
     }
     super.visitTopLevelVariableDeclaration(node);
   }

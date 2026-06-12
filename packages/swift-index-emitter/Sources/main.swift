@@ -40,6 +40,12 @@ struct Definition: Encodable {
     let symbol: String
     let kind: String
     let line: Int
+    let endLine: Int
+
+    enum CodingKeys: String, CodingKey {
+        case symbol, kind, line
+        case endLine = "end_line"
+    }
 }
 
 struct Reference: Encodable {
@@ -177,6 +183,10 @@ final class ScipVisitor: SyntaxVisitor {
         node.startLocation(converter: converter).line
     }
 
+    private func endLineOf(_ node: some SyntaxProtocol) -> Int {
+        node.endLocation(converter: converter).line
+    }
+
     // "swift::Type.member" when inside a type, "swift::name" at top level.
     private func memberSymbol(_ name: String) -> String {
         if let t = currentType { return "swift::\(t).\(name)" }
@@ -269,7 +279,7 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
-        definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name)))
+        definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
@@ -278,7 +288,7 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
-        definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name)))
+        definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
@@ -287,7 +297,7 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
-        definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name)))
+        definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
@@ -296,7 +306,7 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: ProtocolDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
-        definitions.append(Definition(symbol: "swift::\(name)", kind: "protocol", line: lineOf(node.name)))
+        definitions.append(Definition(symbol: "swift::\(name)", kind: "protocol", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
@@ -305,7 +315,7 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: ActorDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
-        definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name)))
+        definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
@@ -325,7 +335,8 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: TypeAliasDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
-        definitions.append(Definition(symbol: memberSymbol(name), kind: "class", line: lineOf(node.name)))
+        let ln = lineOf(node.name)
+        definitions.append(Definition(symbol: memberSymbol(name), kind: "class", line: ln, endLine: ln))
         return .visitChildren
     }
 
@@ -333,10 +344,12 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
+        let endLine = node.body.map { endLineOf($0.rightBrace) } ?? lineOf(node.name)
         definitions.append(Definition(
             symbol: memberSymbol(name),
             kind: "function",
-            line: lineOf(node.name)
+            line: lineOf(node.name),
+            endLine: endLine
         ))
         pushScope()
         if let t = currentType { bindLocal("self", type: t) }
@@ -347,10 +360,12 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
         if let t = currentType {
+            let endLine = node.body.map { endLineOf($0.rightBrace) } ?? lineOf(node.initKeyword)
             definitions.append(Definition(
                 symbol: "swift::\(t).init",
                 kind: "constructor",
-                line: lineOf(node.initKeyword)
+                line: lineOf(node.initKeyword),
+                endLine: endLine
             ))
         }
         pushScope()
@@ -362,10 +377,13 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: SubscriptDeclSyntax) -> SyntaxVisitorContinueKind {
         if let t = currentType {
+            let ln = lineOf(node.subscriptKeyword)
+            let endLine = node.accessorBlock.map { endLineOf($0.rightBrace) } ?? ln
             definitions.append(Definition(
                 symbol: "swift::\(t).subscript",
                 kind: "function",
-                line: lineOf(node.subscriptKeyword)
+                line: ln,
+                endLine: endLine
             ))
         }
         return .visitChildren
@@ -375,10 +393,12 @@ final class ScipVisitor: SyntaxVisitor {
         for binding in node.bindings {
             guard let idPat = binding.pattern.as(IdentifierPatternSyntax.self) else { continue }
             let name = idPat.identifier.text
+            let ln = lineOf(idPat.identifier)
             definitions.append(Definition(
                 symbol: memberSymbol(name),
                 kind: typeStack.isEmpty ? "variable" : "field",
-                line: lineOf(idPat.identifier)
+                line: ln,
+                endLine: ln  // variables/fields are single-line declarations
             ))
             // Track explicit type annotation for instance-call resolution.
             // Only active inside a scope frame (i.e., inside a function body).
@@ -393,10 +413,12 @@ final class ScipVisitor: SyntaxVisitor {
     override func visit(_ node: EnumCaseDeclSyntax) -> SyntaxVisitorContinueKind {
         for el in node.elements {
             let name = el.name.text
+            let ln = lineOf(el.name)
             definitions.append(Definition(
                 symbol: memberSymbol(name),
                 kind: "field",
-                line: lineOf(el.name)
+                line: ln,
+                endLine: ln  // enum cases are single-line
             ))
         }
         return .visitChildren
