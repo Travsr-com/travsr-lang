@@ -11,7 +11,7 @@
     "postinstall": "node postinstall.js"
   },
   "bin": {
-    "travsr-objc-index-emitter": "./bin/travsr-objc-index-emitter"
+    "travsr-lang-objectivec": "./bin/travsr-lang-objectivec"
   },
   "publishConfig": {
     "access": "public"

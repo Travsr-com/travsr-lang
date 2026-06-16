@@ -85,7 +85,7 @@ jobs:
 
       - name: smoke test — binary starts and exits cleanly on EOF
         run: |
-          ./target/release/travsr-objc-index-emitter < /dev/null
+          ./target/release/travsr-lang-objectivec < /dev/null
           echo "binary exited OK"
 
   swift-macos:

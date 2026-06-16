@@ -10,7 +10,7 @@ repository.workspace = true
 rust-version = "1.81"
 
 [[bin]]
-name = "travsr-objc-index-emitter"
+name = "travsr-lang-objectivec"
 path = "src/main.rs"
 
 [dependencies]
