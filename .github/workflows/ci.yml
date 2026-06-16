@@ -23,13 +23,10 @@ jobs:
       # actions/checkout@v4 blocks paths outside $GITHUB_WORKSPACE, so we check out
       # into _travsr (inside the workspace) and symlink it to ../travsr so Cargo's
       # [patch.crates-io] paths resolve without touching Cargo.toml.
-      # Pin to the travsr feature branch that adds ScipRef + the RFC-014 Phase B
-      # protocol (1 GiB frame cap, InvokeResponse.refs, Node.end_line).
-      # Revert ref to master once both PRs (travsr #321 + travsr-lang #6) are merged.
       - uses: actions/checkout@v4
         with:
           repository: Travsr-com/travsr
-          ref: feature/travsr-indexer-store-317-phase-b-unification
+          ref: master
           path: _travsr
 
       - name: Symlink _travsr as ../travsr for Cargo patch resolution
@@ -52,6 +49,44 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+  objc-macos:
+    name: objc emitter (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          ref: master
+          path: _travsr
+
+      - name: Symlink _travsr as ../travsr for Cargo patch resolution
+        run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Locate libclang and set runtime paths
+        run: |
+          CLANG_BIN=$(xcrun --find clang)
+          CLANG_LIB=$(dirname "$CLANG_BIN")/../lib
+          LIBCLANG_DIR=$(realpath "$CLANG_LIB")
+          echo "LIBCLANG_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
+          echo "DYLD_LIBRARY_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
+
+      - name: build
+        run: cargo build --release -p travsr-lang-objc
+
+      - name: test (symbol unit tests)
+        run: cargo test -p travsr-lang-objc
+
+      - name: smoke test — binary starts and exits cleanly on EOF
+        run: |
+          ./target/release/travsr-objc-index-emitter < /dev/null
+          echo "binary exited OK"
 
   swift-macos:
     name: swift emitter (macOS)
