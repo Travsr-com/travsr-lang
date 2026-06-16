@@ -18,17 +18,22 @@
 #[cfg(target_os = "macos")]
 mod compdb;
 mod diag;
+#[cfg(target_os = "macos")]
 mod symbol;
 #[cfg(target_os = "macos")]
 mod visitor;
 
-use anyhow::Context as _;
-use std::path::Path;
 use travsr_core::Language;
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
 
+#[cfg(target_os = "macos")]
+use anyhow::Context as _;
+#[cfg(target_os = "macos")]
+use std::path::Path;
+
+#[cfg(target_os = "macos")]
 const TIMEOUT_SECS: u64 = 300;
 
 struct ObjcPhaseB;
@@ -52,6 +57,9 @@ impl Plugin for ObjcPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
+        #[cfg(not(target_os = "macos"))]
+        let _ = req;
+
         #[cfg(target_os = "macos")]
         match run_emitter(
             &req.root,
