@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/Travsr-com/travsr-lang/actions/workflows/ci.yml/badge.svg)](https://github.com/Travsr-com/travsr-lang/actions/workflows/ci.yml)
 [![Release](https://github.com/Travsr-com/travsr-lang/actions/workflows/release.yml/badge.svg)](https://github.com/Travsr-com/travsr-lang/actions/workflows/release.yml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 ---
 
@@ -290,7 +290,7 @@ Create `npm/<lang>/package.json` and `npm/<lang>/.gitignore`:
   "name": "@travsr-plugin/<lang>",
   "version": "0.1.0",
   "description": "Travsr Phase B — <Language> semantic analysis (travsr-lang-<lang> binary)",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": { "type": "git", "url": "https://github.com/Travsr-com/travsr-lang" },
   "scripts": { "postinstall": "node postinstall.js" },
   "bin": { "travsr-lang-<lang>": "./bin/travsr-lang-<lang>" },
@@ -422,6 +422,6 @@ See [ADR-017](https://github.com/Travsr-com/travsr/blob/master/docs/adrs/ADR-017
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Apache-2.0 — see [LICENSE](LICENSE).
 
 Part of the [Travsr](https://travsr.com) project.

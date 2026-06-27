@@ -2,7 +2,7 @@
   "name": "@travsr-plugin/c",
   "version": "0.2.1",
   "description": "Travsr Phase B — C semantic analysis (travsr-lang-c binary)",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/Travsr-com/travsr-lang"
