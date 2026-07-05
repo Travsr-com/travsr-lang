@@ -317,7 +317,15 @@ jobs:
           VERSION="${GITHUB_REF_NAME#v}"
           LANGS=(c cpp csharp dart go java kotlin objectivec php python ruby scala swift)
           for lang in "${LANGS[@]}"; do
-            echo "Publishing @travsr-plugin/${lang} @ ${VERSION} …"
+            pkg="@travsr-plugin/${lang}"
+            # Idempotent: skip versions already on the registry so re-running a
+            # release (e.g. to add a package that failed the first time) does not
+            # abort on E403 "cannot publish over previously published versions".
+            if npm view "${pkg}@${VERSION}" version >/dev/null 2>&1; then
+              echo "Skipping ${pkg}@${VERSION} (already published)"
+              continue
+            fi
+            echo "Publishing ${pkg} @ ${VERSION} …"
             # postinstall.js lives at npm/postinstall.js (shared source of truth).
             # Copy it into the package dir so it is included in the npm tarball.
             cp npm/postinstall.js "npm/${lang}/postinstall.js"
