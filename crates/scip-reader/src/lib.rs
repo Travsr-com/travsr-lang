@@ -201,7 +201,7 @@ pub fn ingest_index(
         "SCIP ingestion complete"
     );
 
-    Ok(InvokeResponse { nodes, edges, refs })
+    Ok(InvokeResponse { nodes, edges, refs, ..Default::default() })
 }
 
 /// Map a SCIP `SymbolInformation.kind` field to a Travsr kind string.
