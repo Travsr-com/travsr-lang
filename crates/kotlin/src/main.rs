@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
+use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
@@ -609,6 +609,10 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     // 6. Build nodes + ref/call edges
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    // #299 S1: occurrence records (path:line) so the daemon populates edge_sites
+    // and find_references works. The LSP already hands us each reference location;
+    // record it as a ScipRef instead of discarding the line into an edge.
+    let mut refs: Vec<ScipRef> = Vec::new();
 
     // Collect all (uri, sym) pairs first to avoid borrowing issues
     let all_syms: Vec<(String, DocSym)> = sym_map
@@ -676,6 +680,11 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
                     });
 
                 edges.push(Edge::new(caller_id, def_id, EdgeKind::RefCall));
+                refs.push(ScipRef {
+                    caller_path: ref_rel.clone(),
+                    caller_line: (ref_line as u32).saturating_add(1),
+                    callee_id: def_id,
+                });
             }
         }
     }
@@ -686,7 +695,8 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     Ok(InvokeResponse {
         nodes,
         edges,
-        ..Default::default()
+        refs,
+        unresolved_calls: Vec::new(),
     })
 }
 

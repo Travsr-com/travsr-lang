@@ -26,7 +26,7 @@ use anyhow::Context as _;
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use travsr_core::{Edge, EdgeKind, Node, VName};
+use travsr_core::{Edge, EdgeKind, Node, NodeId, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
@@ -479,6 +479,26 @@ fn sdb_vname(symbol: &str, path: &str, corpus: &str) -> VName {
 fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
+    // #299 S1: occurrence records (path:line) so the daemon can populate
+    // edge_sites and answer find_references. Without these, only structural
+    // ref/call edges exist and find_references returns 0.
+    let mut refs: Vec<ScipRef> = Vec::new();
+
+    // Pre-pass: global symbol → definition NodeId, so a reference in one file to a
+    // symbol defined in another resolves to the correct callee node (the per-doc
+    // edge builder below keys dst on the *reference's* uri, which is wrong across
+    // files; refs use this map instead).
+    let mut def_ids: HashMap<String, NodeId> = HashMap::new();
+    for doc in docs {
+        for sym in &doc.symbols {
+            if is_stdlib_symbol(&sym.symbol) {
+                continue;
+            }
+            def_ids
+                .entry(sym.symbol.clone())
+                .or_insert_with(|| sdb_vname(&sym.symbol, &doc.uri, corpus).id());
+        }
+    }
 
     for doc in docs {
         let uri = &doc.uri;
@@ -531,6 +551,18 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
                 continue;
             }
 
+            // #299 S1: emit an occurrence record for this reference so the daemon
+            // attributes it to its enclosing function (span lookup at write time)
+            // and records an edge_sites row. Independent of the container heuristic
+            // below — write_scip_attributed_batch does its own enclosing lookup.
+            if let Some(&callee_id) = def_ids.get(&occ.symbol) {
+                refs.push(ScipRef {
+                    caller_path: uri.clone(),
+                    caller_line: occ.start_line + 1,
+                    callee_id,
+                });
+            }
+
             // enclosing = last container DEF with start_line ≤ occ.start_line
             let Some((_, enc_sym)) = def_containers
                 .iter()
@@ -561,7 +593,8 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
     InvokeResponse {
         nodes,
         edges,
-        ..Default::default()
+        refs,
+        unresolved_calls: Vec::new(),
     }
 }
 

@@ -23,7 +23,7 @@
 use anyhow::Context as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
+use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
@@ -261,6 +261,9 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
 
     // Pass 2: resolve references → RefCall edges; inheritances → IsImplementation edges.
     let mut edges: Vec<Edge> = Vec::new();
+    // #299 S1: occurrence records (path:line) so the daemon populates edge_sites
+    // and find_references works — the emitter already gives us each ref's line.
+    let mut refs_out: Vec<ScipRef> = Vec::new();
 
     for doc in docs {
         let path = doc["path"].as_str().unwrap_or("");
@@ -280,6 +283,14 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                 }
                 if let Some(&dst_id) = def_ids.get(sym) {
                     edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
+                    // Emitter lines are 1-based (definitions store them as-is).
+                    if let Some(line) = r["line"].as_u64() {
+                        refs_out.push(ScipRef {
+                            caller_path: path.to_string(),
+                            caller_line: line as u32,
+                            callee_id: dst_id,
+                        });
+                    }
                 } else {
                     tracing::debug!(
                         sym,
@@ -328,7 +339,8 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     Ok(InvokeResponse {
         nodes,
         edges,
-        ..Default::default()
+        refs: refs_out,
+        unresolved_calls: Vec::new(),
     })
 }
 
