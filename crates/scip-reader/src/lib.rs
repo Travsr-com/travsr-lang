@@ -248,7 +248,7 @@ pub fn ingest_index(
         nodes,
         edges,
         refs,
-        unresolved_calls: Vec::new(),
+        ..Default::default()
     })
 }
 

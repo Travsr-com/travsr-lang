@@ -67,8 +67,6 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: Swatinem/rust-cache@v2
-
       - name: Locate libclang and set runtime paths
         run: |
           CLANG_BIN=$(xcrun --find clang)
@@ -76,6 +74,16 @@ jobs:
           LIBCLANG_DIR=$(realpath "$CLANG_LIB")
           echo "LIBCLANG_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
           echo "DYLD_LIBRARY_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
+          # clang-sys bakes an absolute -L search path to the active Xcode's lib
+          # dir into the cached clang-sys build script output. When the macos-latest
+          # runner image bumps Xcode, that cached path (e.g. Xcode_16.4) disappears
+          # and linking travsr-lang-objectivec fails with "library 'clang' not found".
+          # Key the Rust cache on the Xcode build so an image bump invalidates it.
+          echo "XCODE_BUILD=$(xcodebuild -version 2>/dev/null | tr '\n' '-' | tr -d ' ')" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: objc-${{ env.XCODE_BUILD }}
 
       - name: build
         run: cargo build --release -p travsr-lang-objc
