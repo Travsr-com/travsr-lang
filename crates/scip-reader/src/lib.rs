@@ -221,15 +221,15 @@ pub fn ingest_index(
                 break;
             }
             if let Some(&callee_id) = def_ids.get(occ.symbol.as_str()) {
-                let caller_line = occ
-                    .range
-                    .first()
-                    .copied()
-                    .map(|l| l as u32 + 1)
-                    .unwrap_or(1);
+                // #299 F4: a range-less occurrence (malformed / partial SCIP)
+                // carries no real position — skip it rather than fabricating a
+                // phantom `path:1` reference via `unwrap_or(1)`.
+                let Some(start) = occ.range.first().copied() else {
+                    continue;
+                };
                 refs.push(ScipRef {
                     caller_path: path.clone(),
-                    caller_line,
+                    caller_line: start as u32 + 1,
                     callee_id,
                 });
                 count += 1;
