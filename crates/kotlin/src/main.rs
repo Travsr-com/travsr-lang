@@ -38,13 +38,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
+use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
 
 const TIMEOUT_SECS: u64 = 600;
-const PROGRESS_WAIT_SECS: u64 = 30;
+// #299 F12: cold Gradle/Maven dependency resolution routinely exceeds 30s, after
+// which references ran against a half-built index and silently under-counted.
+// Scale to the overall session budget and warn on timeout instead of proceeding
+// silently. Overridable via TRAVSR_KLS_PROGRESS_WAIT_SECS for very large repos.
+const PROGRESS_WAIT_SECS: u64 = 180;
 const MAX_REFS_PER_SYMBOL: usize = 500;
 
 // ── Binary lookup ─────────────────────────────────────────────────────────────
@@ -309,7 +313,11 @@ impl LspSession {
     }
 
     /// Drain `$/progress` notifications until begin+end pair or timeout.
-    fn wait_for_progress_end(&mut self, timeout: Duration) -> anyhow::Result<()> {
+    /// Wait for KLS indexing to finish. Returns `Ok(true)` when the project's
+    /// progress notifications ended cleanly, `Ok(false)` when the wait timed out
+    /// (KLS still indexing) so the caller can warn — references gathered against a
+    /// half-built index would silently under-count (#299 F12).
+    fn wait_for_progress_end(&mut self, timeout: Duration) -> anyhow::Result<bool> {
         let deadline = Instant::now() + timeout;
         let mut active: i32 = 0;
         let mut any_begin = false;
@@ -318,7 +326,7 @@ impl LspSession {
             match self.recv_one(deadline)? {
                 None => {
                     tracing::debug!("progress wait timed out (active={active}), proceeding");
-                    return Ok(());
+                    return Ok(false);
                 }
                 Some(msg) => {
                     if is_progress_begin(&msg) {
@@ -332,7 +340,7 @@ impl LspSession {
                         active = (active - 1).max(0);
                         tracing::debug!("KLS progress end (active={active})");
                         if any_begin && active == 0 {
-                            return Ok(());
+                            return Ok(true);
                         }
                     } else {
                         self.inbox.push_back(msg);
@@ -559,9 +567,24 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     session.notify("initialized", json!({}))?;
 
     // 3. Wait for KLS to finish indexing (Maven/Gradle dep resolution happens here)
+    let progress_wait_secs = std::env::var("TRAVSR_KLS_PROGRESS_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(PROGRESS_WAIT_SECS);
     tracing::info!("waiting for KLS to index {} …", root.display());
-    session.wait_for_progress_end(Duration::from_secs(PROGRESS_WAIT_SECS))?;
-    tracing::info!("KLS ready");
+    if session.wait_for_progress_end(Duration::from_secs(progress_wait_secs))? {
+        tracing::info!("KLS ready");
+    } else {
+        // #299 F12: timed out while KLS was still indexing. documentSymbol /
+        // references below run against an incomplete index, so the reference
+        // counts may under-report. Surface it as a warning (not a silent debug)
+        // and let the user raise TRAVSR_KLS_PROGRESS_WAIT_SECS for cold Gradle builds.
+        tracing::warn!(
+            "KLS did not finish indexing within {progress_wait_secs}s; \
+             reference results may be incomplete for a cold/large Gradle project"
+        );
+    }
 
     // 4. Collect .kt files
     let kt_files = collect_kt_files(root);
@@ -609,6 +632,10 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     // 6. Build nodes + ref/call edges
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
+    // #299 S1: occurrence records (path:line) so the daemon populates edge_sites
+    // and find_references works. The LSP already hands us each reference location;
+    // record it as a ScipRef instead of discarding the line into an edge.
+    let mut refs: Vec<ScipRef> = Vec::new();
 
     // Collect all (uri, sym) pairs first to avoid borrowing issues
     let all_syms: Vec<(String, DocSym)> = sym_map
@@ -663,19 +690,31 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
                     None => continue,
                 };
 
-                let caller_id: NodeId = find_enclosing(&sym_map, ref_uri, ref_line, ref_char)
-                    .map(|enc| {
-                        let enc_rel = rel_map
-                            .get(&enc.uri)
-                            .map(|s| s.as_str())
-                            .unwrap_or(ref_rel.as_str());
-                        enc.node_id(corpus, enc_rel)
-                    })
-                    .unwrap_or_else(|| {
-                        VName::new(corpus, "", &ref_rel, "kotlin", format!("file:{}", ref_rel)).id()
-                    });
-
-                edges.push(Edge::new(caller_id, def_id, EdgeKind::RefCall));
+                // #299 F5: only emit the structural edge when there is a real
+                // enclosing symbol node. The previous fallback synthesized a
+                // `file:{rel}` VName that was never inserted as a Node → a
+                // dangling edge, while the ScipRef pipeline separately attributed
+                // the same occurrence to a *different*, real file node. For the
+                // no-enclosing case we now rely solely on the ScipRef below:
+                // `write_scip_attributed_batch` re-homes it to the correct
+                // enclosing span or a real file node (`file_node_for_attribution`)
+                // and records both the ref/call edge and the edge_site.
+                if let Some(enc) = find_enclosing(&sym_map, ref_uri, ref_line, ref_char) {
+                    let enc_rel = rel_map
+                        .get(&enc.uri)
+                        .map(|s| s.as_str())
+                        .unwrap_or(ref_rel.as_str());
+                    edges.push(Edge::new(
+                        enc.node_id(corpus, enc_rel),
+                        def_id,
+                        EdgeKind::RefCall,
+                    ));
+                }
+                refs.push(ScipRef {
+                    caller_path: ref_rel.clone(),
+                    caller_line: (ref_line as u32).saturating_add(1),
+                    callee_id: def_id,
+                });
             }
         }
     }
@@ -686,7 +725,8 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     Ok(InvokeResponse {
         nodes,
         edges,
-        ..Default::default()
+        refs,
+        unresolved_calls: Vec::new(),
     })
 }
 

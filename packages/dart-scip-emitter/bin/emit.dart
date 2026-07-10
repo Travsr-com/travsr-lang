@@ -53,9 +53,16 @@ Future<void> main(List<String> args) async {
     exit(1);
   }
 
+  // #299 E1: this is an AOT-compiled binary, so the analyzer's default SDK
+  // auto-detection (relative to Platform.resolvedExecutable) points at the
+  // emitter's own install dir (~/.travsr/lib/...) and fails to read the SDK.
+  // Accept an explicit SDK path via DART_SDK so the daemon can pass the real
+  // SDK location. Empty/unset falls back to the (broken for AOT) auto-detect.
+  final sdkPath = Platform.environment['DART_SDK'];
   final collection = AnalysisContextCollection(
     includedPaths: [rootPath],
     resourceProvider: PhysicalResourceProvider.INSTANCE,
+    sdkPath: (sdkPath != null && sdkPath.isNotEmpty) ? sdkPath : null,
   );
 
   final documents = <Map<String, dynamic>>[];

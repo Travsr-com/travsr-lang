@@ -64,8 +64,32 @@ pub fn ingest_index(
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
+    // #299 C1: C and C++ share one indexer (scip-clang) and one compile database,
+    // so the `.h`-triggered C pass and the `.cpp`-triggered C++ pass both index the
+    // whole project and emit the SAME symbols — under two different language tags,
+    // producing duplicate nodes (`Animal#describe` as both `c` and `cpp`). Derive
+    // each node's language from its file extension instead of the pass, so both
+    // passes tag a given file identically and the duplicates collapse to one node
+    // (identical VName → identical NodeId → deduped downstream).
+    let c_family = matches!(language, Language::C | Language::Cpp);
+    let doc_language = |path: &str| -> &'static str {
+        if c_family {
+            path.rsplit('.')
+                .next()
+                .and_then(Language::from_extension)
+                .map(Language::as_str)
+                .unwrap_or(lang_str)
+        } else {
+            lang_str
+        }
+    };
+
     // symbol_string → NodeId; populated in pass 1, consumed in passes 2 & 3.
     let mut def_ids: HashMap<String, NodeId> = HashMap::new();
+    // Track which def_ids entries came from a header declaration so a later
+    // source-file definition of the same symbol can take precedence (C/C++:
+    // references must resolve to the definition, which carries the sites).
+    let mut def_from_header: HashMap<String, bool> = HashMap::new();
 
     // ── Pass 1: definition nodes ─────────────────────────────────────────────
     for doc in &index.documents {
@@ -116,9 +140,21 @@ pub fn ingest_index(
                 .unwrap_or_else(|| kind_from_symbol_string(&occ.symbol));
 
             let sig = format!("scip:{}:{}", path, occ.symbol);
-            let vname = VName::new(corpus, "", path, lang_str, &sig);
+            let node_lang = doc_language(path);
+            let vname = VName::new(corpus, "", path, node_lang, &sig);
             let node_id = vname.id();
-            def_ids.insert(occ.symbol.clone(), node_id);
+            // Prefer a source-file definition over a header declaration as the
+            // canonical target for references (C/C++). First non-header wins;
+            // otherwise first seen.
+            let is_header = is_header_path(path);
+            match def_from_header.get(&occ.symbol) {
+                Some(false) => {} // already have a source def — keep it
+                Some(true) if is_header => {}
+                _ => {
+                    def_ids.insert(occ.symbol.clone(), node_id);
+                    def_from_header.insert(occ.symbol.clone(), is_header);
+                }
+            }
             nodes.push(
                 Node::new(vname, &kind)
                     .with_line(line)
@@ -161,6 +197,13 @@ pub fn ingest_index(
     let mut refs: Vec<ScipRef> = Vec::new();
     for doc in &index.documents {
         let path = &doc.relative_path;
+        // #299 C1: scip-clang emits a reference occurrence at a symbol's *header
+        // declaration* line (not a call site). Attributing those to a header
+        // pollutes find_references with a spurious "use" on the declaration.
+        // Header occurrences for C/C++ are declarations, not call sites — skip.
+        if c_family && is_header_path(path) {
+            continue;
+        }
         let mut count = 0usize;
 
         for occ in &doc.occurrences {
@@ -178,15 +221,15 @@ pub fn ingest_index(
                 break;
             }
             if let Some(&callee_id) = def_ids.get(occ.symbol.as_str()) {
-                let caller_line = occ
-                    .range
-                    .first()
-                    .copied()
-                    .map(|l| l as u32 + 1)
-                    .unwrap_or(1);
+                // #299 F4: a range-less occurrence (malformed / partial SCIP)
+                // carries no real position — skip it rather than fabricating a
+                // phantom `path:1` reference via `unwrap_or(1)`.
+                let Some(start) = occ.range.first().copied() else {
+                    continue;
+                };
                 refs.push(ScipRef {
                     caller_path: path.clone(),
-                    caller_line,
+                    caller_line: start as u32 + 1,
                     callee_id,
                 });
                 count += 1;
@@ -275,6 +318,14 @@ fn kind_from_scip_kind(
         _ => "definition",
     }
     .into()
+}
+
+/// Whether a repo-relative path is a C/C++ header (declaration site). Used to
+/// prefer a source-file definition over a header declaration when resolving the
+/// canonical node for a symbol's references (#299 C1).
+fn is_header_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".h") || p.ends_with(".hpp") || p.ends_with(".hh") || p.ends_with(".hxx")
 }
 
 /// Fallback kind inference from the SCIP descriptor suffix when
