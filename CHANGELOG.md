@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-07-12
+
+### Added
+
+- Occurrence emission (`ScipRef` records) across the Scala, Kotlin, Swift, and Dart Phase B plugins and the shared scip-reader. This powers all-language `find_references` and `find_pattern` in the travsr CLI (#299).
+
+### Fixed
+
+- Objective-C plugin: bake the libclang RPATH into the binary via `build.rs` so it resolves libclang at runtime instead of relying on a stale or absent library path.
+
 ## [0.2.1] — 2026-06-11
 
 ### Fixed
