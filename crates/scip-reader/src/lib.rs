@@ -684,6 +684,23 @@ mod tests {
     }
 
     #[test]
+    fn innermost_enclosing_def_picks_smaller_nested_span() {
+        // A class span (1..=20) and a method span nested inside it (5..=10):
+        // a line inside the method must resolve to the method, not the class,
+        // even though both spans contain it.
+        let class_id = NodeId(1);
+        let method_id = NodeId(2);
+        let spans = vec![(1, 20, class_id), (5, 10, method_id)];
+        assert_eq!(innermost_enclosing_def(Some(&spans), 7), Some(method_id));
+        // Outside the method but still inside the class: falls back to the class.
+        assert_eq!(innermost_enclosing_def(Some(&spans), 15), Some(class_id));
+        // Outside both: no enclosing definition.
+        assert_eq!(innermost_enclosing_def(Some(&spans), 25), None);
+        // No spans at all for the document.
+        assert_eq!(innermost_enclosing_def(None, 7), None);
+    }
+
+    #[test]
     fn ref_scip_ref_callee_matches_def_node() {
         // G2: ScipRef.callee_id must equal the definition node's NodeId so that
         // write_scip_attributed_batch can resolve the target without extra lookups.

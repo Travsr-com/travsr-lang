@@ -432,7 +432,14 @@ extern "C" fn visit_refs(
         // type is known. Unresolvable receivers (id-typed, dynamic dispatch) are
         // silently skipped to avoid emitting wrong edges.
         let referenced = unsafe { clang_getCursorReferenced(cursor) };
-        let mut emitted = false;
+        // Tracks whether clang *semantically resolved* the call, not whether an
+        // occurrence was actually added: a resolved-but-system-header target
+        // (e.g. `[NSDate date]`) is correctly resolved but intentionally not
+        // indexed, and must not fall through to the syntactic fallback below,
+        // which would otherwise re-derive the same system-framework symbol
+        // from the receiver class ref and reintroduce the noise this skip
+        // exists to avoid.
+        let mut resolved = false;
         if unsafe { clang_Cursor_isNull(referenced) } == 0 {
             let ref_kind = unsafe { clang_getCursorKind(referenced) };
             if matches!(
@@ -457,10 +464,10 @@ extern "C" fn visit_refs(
                         }
                     }
                 }
-                emitted = true;
+                resolved = true;
             }
         }
-        if !emitted {
+        if !resolved {
             // #449: bridged or header-less calls, clang cannot resolve the
             // method decl (e.g. an ObjC → Swift call whose generated -Swift.h
             // is not visible under the glob-fallback compdb). For a class
