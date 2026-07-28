@@ -90,6 +90,10 @@ pub fn ingest_index(
     // source-file definition of the same symbol can take precedence (C/C++:
     // references must resolve to the definition, which carries the sites).
     let mut def_from_header: HashMap<String, bool> = HashMap::new();
+    // #449: per-document definition spans (start_line, end_line, NodeId),
+    // 1-indexed — used by pass 3b to attribute a cross-language reference to
+    // its innermost enclosing definition.
+    let mut doc_def_spans: HashMap<String, Vec<(u32, u32, NodeId)>> = HashMap::new();
 
     // ── Pass 1: definition nodes ─────────────────────────────────────────────
     for doc in &index.documents {
@@ -155,6 +159,10 @@ pub fn ingest_index(
                     def_from_header.insert(occ.symbol.clone(), is_header);
                 }
             }
+            doc_def_spans
+                .entry(path.clone())
+                .or_default()
+                .push((line, end_line, node_id));
             nodes.push(
                 Node::new(vname, &kind)
                     .with_line(line)
@@ -195,6 +203,17 @@ pub fn ingest_index(
     // uses to find the innermost enclosing function span and re-home the
     // ref/call edge from file → function (RFC-014 G2).
     let mut refs: Vec<ScipRef> = Vec::new();
+    // #449 pass 3b: cross-language references. An ObjC → Swift bridged call
+    // (`[Type registerEnvironments]`) references a symbol whose definition
+    // lives in the *Swift* index, so it can never appear in this index's
+    // def_ids. Instead of dropping it, hand it to the daemon as an
+    // `UnresolvedCall` (src = innermost enclosing definition, callee_sig =
+    // Phase A leading-keyword convention) — `resolve_unresolved_calls` then
+    // emits the RefCall edge + edge_sites row against the store. Gated to
+    // ObjC: for go/java/c/c++ a ref without an in-index def is a dependency
+    // or stdlib symbol, and converting those would flood the resolver.
+    let cross_lang = matches!(language, Language::ObjectiveC);
+    let mut unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
     for doc in &index.documents {
         let path = &doc.relative_path;
         // #299 C1: scip-clang emits a reference occurrence at a symbol's *header
@@ -220,17 +239,36 @@ pub fn ingest_index(
             if count >= MAX_REF_EDGES_PER_DOC {
                 break;
             }
+            // #299 F4: a range-less occurrence (malformed / partial SCIP)
+            // carries no real position — skip it rather than fabricating a
+            // phantom `path:1` reference via `unwrap_or(1)`.
+            let Some(start) = occ.range.first().copied() else {
+                continue;
+            };
+            let caller_line = start as u32 + 1;
             if let Some(&callee_id) = def_ids.get(occ.symbol.as_str()) {
-                // #299 F4: a range-less occurrence (malformed / partial SCIP)
-                // carries no real position — skip it rather than fabricating a
-                // phantom `path:1` reference via `unwrap_or(1)`.
-                let Some(start) = occ.range.first().copied() else {
-                    continue;
-                };
                 refs.push(ScipRef {
                     caller_path: path.clone(),
-                    caller_line: start as u32 + 1,
+                    caller_line,
                     callee_id,
+                });
+                count += 1;
+            } else if cross_lang {
+                let Some(callee_sig) = leading_keyword_sig(&occ.symbol) else {
+                    continue;
+                };
+                // Attribute to the innermost enclosing definition; a ref with
+                // no enclosing def (top-level) is skipped rather than pinned
+                // to the file.
+                let Some(src) = innermost_enclosing_def(doc_def_spans.get(path), caller_line)
+                else {
+                    continue;
+                };
+                unresolved.push(travsr_core::UnresolvedCall {
+                    src,
+                    callee_sig,
+                    hint_crate: None,
+                    caller_line,
                 });
                 count += 1;
             }
@@ -241,6 +279,7 @@ pub fn ingest_index(
         nodes = nodes.len(),
         structural_edges = edges.len(),
         refs = refs.len(),
+        unresolved_calls = unresolved.len(),
         "SCIP ingestion complete"
     );
 
@@ -248,8 +287,38 @@ pub fn ingest_index(
         nodes,
         edges,
         refs,
-        ..Default::default()
+        unresolved_calls: unresolved,
     })
+}
+
+/// #449: Phase A leading-keyword signature for a SCIP *method* symbol whose
+/// definition is not in this index (cross-language target).
+///
+/// `objc . corp 0.0.0 ClassC#registerEnvironments().` → `fn:registerEnvironments`
+/// `objc . corp 0.0.0 Foo#setWidth:height:().`        → `fn:setWidth`
+///
+/// Returns `None` for non-method descriptors (classes, properties, modules) —
+/// only calls are worth an `UnresolvedCall`.
+fn leading_keyword_sig(symbol: &str) -> Option<String> {
+    let leaf = symbol.split_whitespace().last()?;
+    let body = leaf.strip_suffix("().")?;
+    let name = body.rsplit_once('#').map(|(_, n)| n).unwrap_or(body);
+    let leading = name.split(':').next().unwrap_or(name);
+    let leading = leading.trim_matches('`');
+    if leading.is_empty() {
+        return None;
+    }
+    Some(format!("fn:{leading}"))
+}
+
+/// #449: innermost (smallest-span) definition whose `[start, end]` line range
+/// contains `line`. Spans are 1-indexed inclusive.
+fn innermost_enclosing_def(spans: Option<&Vec<(u32, u32, NodeId)>>, line: u32) -> Option<NodeId> {
+    spans?
+        .iter()
+        .filter(|(start, end, _)| *start <= line && line <= *end)
+        .min_by_key(|(start, end, _)| end - start)
+        .map(|&(_, _, id)| id)
 }
 
 /// Map a SCIP `SymbolInformation.kind` field to a Travsr kind string.
@@ -474,6 +543,144 @@ mod tests {
         assert_eq!(resp.refs[0].caller_path, "cmd/main.go");
         assert_eq!(resp.refs[0].caller_line, 4); // 0-indexed line 3 → 1-indexed 4
         assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
+    }
+
+    #[test]
+    fn objc_ref_without_def_becomes_unresolved_call() {
+        // #449: a bridged ObjC → Swift call references a symbol with no def in
+        // the ObjC index. It must surface as an UnresolvedCall attributed to
+        // the innermost enclosing definition, with a leading-keyword sig.
+        let caller_sym = "objc . corp 0.0.0 Bridge#run().".to_string();
+        let bridged_sym = "objc . corp 0.0.0 ClassC#registerEnvironments().".to_string();
+
+        let def_occ = scip::types::Occurrence {
+            symbol: caller_sym.clone(),
+            symbol_roles: 1,
+            // name token range; enclosing_range covers the method body
+            range: vec![2, 0, 5],
+            enclosing_range: vec![2, 0, 8, 1],
+            ..Default::default()
+        };
+        let ref_occ = scip::types::Occurrence {
+            symbol: bridged_sym,
+            symbol_roles: 0,
+            range: vec![4, 4],
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "Bridge.m".into(),
+            occurrences: vec![def_occ, ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        assert!(resp.refs.is_empty(), "no in-index target — no ScipRef");
+        assert_eq!(resp.unresolved_calls.len(), 1);
+        let uc = &resp.unresolved_calls[0];
+        assert_eq!(uc.callee_sig, "fn:registerEnvironments");
+        assert_eq!(uc.caller_line, 5); // 0-indexed 4 → 1-indexed 5
+        assert_eq!(uc.src, resp.nodes[0].id, "attributed to enclosing method");
+        assert!(uc.hint_crate.is_none());
+    }
+
+    #[test]
+    fn objc_ref_without_enclosing_def_is_skipped() {
+        let ref_occ = scip::types::Occurrence {
+            symbol: "objc . corp 0.0.0 ClassC#registerEnvironments().".to_string(),
+            symbol_roles: 0,
+            range: vec![0, 0],
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "Bridge.m".into(),
+            occurrences: vec![ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        assert!(resp.unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn non_method_ref_without_def_is_not_unresolved() {
+        // Class refs (`ClassC#`) without defs are not calls — skip.
+        let def_occ = scip::types::Occurrence {
+            symbol: "objc . corp 0.0.0 Bridge#run().".to_string(),
+            symbol_roles: 1,
+            range: vec![0, 0, 3],
+            enclosing_range: vec![0, 0, 5, 1],
+            ..Default::default()
+        };
+        let ref_occ = scip::types::Occurrence {
+            symbol: "objc . corp 0.0.0 ClassC#".to_string(),
+            symbol_roles: 0,
+            range: vec![2, 4],
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "Bridge.m".into(),
+            occurrences: vec![def_occ, ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        assert!(resp.unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn go_ref_without_def_stays_dropped() {
+        // The cross-language pass is gated to ObjC — dependency/stdlib refs in
+        // other SCIP languages must not become UnresolvedCalls.
+        let def_occ = scip::types::Occurrence {
+            symbol: "go mod example.com 1.0.0 Caller().".to_string(),
+            symbol_roles: 1,
+            range: vec![0, 0, 6],
+            enclosing_range: vec![0, 0, 9, 1],
+            ..Default::default()
+        };
+        let ref_occ = scip::types::Occurrence {
+            symbol: "go mod fmt 1.0.0 Println().".to_string(),
+            symbol_roles: 0,
+            range: vec![3, 1],
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "main.go".into(),
+            occurrences: vec![def_occ, ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let resp = ingest_index(&index, "example.com", Language::Go).unwrap();
+        assert!(resp.unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn leading_keyword_sig_forms() {
+        assert_eq!(
+            leading_keyword_sig("objc . c 0.0.0 ClassC#registerEnvironments()."),
+            Some("fn:registerEnvironments".into())
+        );
+        assert_eq!(
+            leading_keyword_sig("objc . c 0.0.0 Foo#setWidth:height:()."),
+            Some("fn:setWidth".into())
+        );
+        // Non-method descriptors: class, property, protocol.
+        assert_eq!(leading_keyword_sig("objc . c 0.0.0 ClassC#"), None);
+        assert_eq!(leading_keyword_sig("objc . c 0.0.0 ClassC#prop."), None);
+        assert_eq!(leading_keyword_sig("objc . c 0.0.0 Proto/"), None);
     }
 
     #[test]

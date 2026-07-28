@@ -432,23 +432,50 @@ extern "C" fn visit_refs(
         // type is known. Unresolvable receivers (id-typed, dynamic dispatch) are
         // silently skipped to avoid emitting wrong edges.
         let referenced = unsafe { clang_getCursorReferenced(cursor) };
+        let mut emitted = false;
         if unsafe { clang_Cursor_isNull(referenced) } == 0 {
             let ref_kind = unsafe { clang_getCursorKind(referenced) };
             if matches!(
                 ref_kind,
                 CXCursor_ObjCInstanceMethodDecl | CXCursor_ObjCClassMethodDecl
             ) {
-                let selector = cursor_spelling(referenced);
-                let parent = unsafe { clang_getCursorSemanticParent(referenced) };
-                let class_name = resolve_type_name(parent);
+                // Skip refs into system headers/SDK frameworks — their symbols
+                // have no definition in this index and would only feed noise
+                // into the daemon's unresolved-call resolution.
+                let ref_loc = unsafe { clang_getCursorLocation(referenced) };
+                if unsafe { clang_Location_isInSystemHeader(ref_loc) } == 0 {
+                    let selector = cursor_spelling(referenced);
+                    let parent = unsafe { clang_getCursorSemanticParent(referenced) };
+                    let class_name = resolve_type_name(parent);
 
-                if !selector.is_empty() && !class_name.is_empty() {
-                    let target_sym = symbol::method_symbol(&ctx.corpus, &class_name, &selector);
-                    if let Some((rel_path, ref_occ)) =
-                        make_ref_occurrence(cursor, &target_sym, &ctx.root)
-                    {
-                        ctx.builder.add_occurrence(&rel_path, ref_occ);
+                    if !selector.is_empty() && !class_name.is_empty() {
+                        let target_sym = symbol::method_symbol(&ctx.corpus, &class_name, &selector);
+                        if let Some((rel_path, ref_occ)) =
+                            make_ref_occurrence(cursor, &target_sym, &ctx.root)
+                        {
+                            ctx.builder.add_occurrence(&rel_path, ref_occ);
+                        }
                     }
+                }
+                emitted = true;
+            }
+        }
+        if !emitted {
+            // #449: bridged or header-less calls — clang cannot resolve the
+            // method decl (e.g. an ObjC → Swift call whose generated -Swift.h
+            // is not visible under the glob-fallback compdb). For a class
+            // message the receiver class is still syntactically present as an
+            // ObjCClassRef child, so synthesize the target symbol from
+            // receiver + selector. Instance receivers with unknown type remain
+            // skipped (precision over recall).
+            let selector = cursor_spelling(cursor);
+            let receiver = first_objc_class_ref(cursor);
+            if !selector.is_empty() && !receiver.is_empty() {
+                let target_sym = symbol::method_symbol(&ctx.corpus, &receiver, &selector);
+                if let Some((rel_path, ref_occ)) =
+                    make_ref_occurrence(cursor, &target_sym, &ctx.root)
+                {
+                    ctx.builder.add_occurrence(&rel_path, ref_occ);
                 }
             }
         }
@@ -536,6 +563,13 @@ fn category_base_class(category_cursor: CXCursor) -> String {
         clang_visitChildren(category_cursor, visit_base_class, &mut ctx as *mut _ as _);
     }
     ctx.name
+}
+
+/// Name of the first `ObjCClassRef` child of any cursor — for a class message
+/// expr (`[ClassC method]`) this is the receiver class. Same walk as
+/// [`category_base_class`]; named separately for call-site clarity (#449).
+fn first_objc_class_ref(cursor: CXCursor) -> String {
+    category_base_class(cursor)
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

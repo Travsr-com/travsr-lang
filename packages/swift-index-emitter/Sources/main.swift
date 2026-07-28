@@ -481,14 +481,47 @@ final class ScipVisitor: SyntaxVisitor {
         } else if let declRef = node.calledExpression.as(DeclReferenceExprSyntax.self) {
             let name = declRef.baseName.text
             if name.first?.isUppercase == true {
-                // Constructor call: MyType() → matches InitializerDeclSyntax.
-                references.append(Reference(symbol: "swift::\(name).init", line: ln))
+                // Constructor call: MyType() → the type itself, not its `.init`
+                // member (#449). find_references/get_callers query by type name
+                // ("ClassA", not "ClassA.init"), and every type is guaranteed to
+                // have a `swift::TypeName` definition regardless of whether it
+                // declares an explicit initializer — unlike `.init`, which only
+                // exists in def_ids when the type has one.
+                references.append(Reference(symbol: "swift::\(name)", line: ln))
             } else {
                 // Top-level or local function call: foo()
                 references.append(Reference(symbol: "swift::\(name)", line: ln))
             }
         }
 
+        return .visitChildren
+    }
+
+    // ── References (non-call member accesses) ──────────────────────────────────
+
+    override func visit(_ node: MemberAccessExprSyntax) -> SyntaxVisitorContinueKind {
+        // Called-expressions are already handled (with implicit-self and
+        // instance resolution) by visit(FunctionCallExprSyntax) — skip them
+        // to avoid double emission.
+        if let call = node.parent?.as(FunctionCallExprSyntax.self),
+           call.calledExpression.id == node.id {
+            return .visitChildren
+        }
+        guard let base = node.base, let declRef = base.as(DeclReferenceExprSyntax.self) else {
+            // Complex or absent base (chained access, implicit member `.red`): skip.
+            return .visitChildren
+        }
+        let memberName = node.declName.baseName.text
+        let baseName = declRef.baseName.text
+        let ln = lineOf(node)
+        if baseName.first?.isUppercase == true {
+            // Static member access without a call: ClassC.shared, Color.red.
+            references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln))
+        } else if let resolvedType = lookupType(baseName) {
+            // Property access on an explicitly-typed local: svc.total.
+            references.append(Reference(symbol: "swift::\(resolvedType).\(memberName)", line: ln))
+        }
+        // Unresolvable base (inferred type): skip rather than guess.
         return .visitChildren
     }
 }

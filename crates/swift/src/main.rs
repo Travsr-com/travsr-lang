@@ -344,6 +344,83 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     })
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> InvokeResponse {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out.json");
+        std::fs::write(&path, json).expect("write canned JSON");
+        parse_emitter_output(&path, "testcorpus").expect("parse")
+    }
+
+    fn node_id(path: &str, sym: &str) -> NodeId {
+        VName::new("testcorpus", "", path, Language::Swift.as_str(), sym).id()
+    }
+
+    #[test]
+    fn constructor_call_resolves_to_class_node() {
+        // #449: the emitter targets the type itself (`swift::ClassA`), not a
+        // synthetic `.init` member — `find_references("ClassA")` must see
+        // constructor call sites directly, regardless of whether the type
+        // declares an explicit initializer.
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"ClassA.swift","definitions":[
+                    {"symbol":"swift::ClassA","kind":"class","line":1,"end_line":10},
+                    {"symbol":"swift::ClassA.init","kind":"function","line":2,"end_line":4}
+                ],"references":[],"inheritances":[]},
+                {"path":"ClassB.swift","definitions":[],
+                 "references":[{"symbol":"swift::ClassA","line":7}],"inheritances":[]}
+            ]}"#,
+        );
+        let class_id = node_id("ClassA.swift", "swift::ClassA");
+        assert!(resp
+            .edges
+            .iter()
+            .any(|e| e.dst == class_id && e.kind == EdgeKind::RefCall));
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].callee_id, class_id);
+        assert_eq!(resp.refs[0].caller_path, "ClassB.swift");
+        assert_eq!(resp.refs[0].caller_line, 7);
+    }
+
+    #[test]
+    fn dotted_static_access_resolves_to_field_node() {
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"ClassC.swift","definitions":[
+                    {"symbol":"swift::ClassC","kind":"class","line":1,"end_line":8},
+                    {"symbol":"swift::ClassC.shared","kind":"field","line":2,"end_line":2}
+                ],"references":[],"inheritances":[]},
+                {"path":"Caller.swift","definitions":[],
+                 "references":[{"symbol":"swift::ClassC.shared","line":4}],"inheritances":[]}
+            ]}"#,
+        );
+        let shared_id = node_id("ClassC.swift", "swift::ClassC.shared");
+        assert!(resp
+            .edges
+            .iter()
+            .any(|e| e.dst == shared_id && e.kind == EdgeKind::RefCall));
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].callee_id, shared_id);
+    }
+
+    #[test]
+    fn unknown_ref_symbol_is_skipped() {
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"A.swift","definitions":[
+                    {"symbol":"swift::A","kind":"class","line":1,"end_line":2}
+                ],"references":[{"symbol":"swift::Nowhere.method","line":2}],"inheritances":[]}
+            ]}"#,
+        );
+        assert!(resp.edges.is_empty());
+        assert!(resp.refs.is_empty());
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 fn main() {
