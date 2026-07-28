@@ -439,7 +439,7 @@ extern "C" fn visit_refs(
                 ref_kind,
                 CXCursor_ObjCInstanceMethodDecl | CXCursor_ObjCClassMethodDecl
             ) {
-                // Skip refs into system headers/SDK frameworks — their symbols
+                // Skip refs into system headers/SDK frameworks: their symbols
                 // have no definition in this index and would only feed noise
                 // into the daemon's unresolved-call resolution.
                 let ref_loc = unsafe { clang_getCursorLocation(referenced) };
@@ -461,7 +461,7 @@ extern "C" fn visit_refs(
             }
         }
         if !emitted {
-            // #449: bridged or header-less calls — clang cannot resolve the
+            // #449: bridged or header-less calls, clang cannot resolve the
             // method decl (e.g. an ObjC → Swift call whose generated -Swift.h
             // is not visible under the glob-fallback compdb). For a class
             // message the receiver class is still syntactically present as an
@@ -565,7 +565,7 @@ fn category_base_class(category_cursor: CXCursor) -> String {
     ctx.name
 }
 
-/// Name of the first `ObjCClassRef` child of any cursor — for a class message
+/// Name of the first `ObjCClassRef` child of any cursor. For a class message
 /// expr (`[ClassC method]`) this is the receiver class. Same walk as
 /// [`category_base_class`]; named separately for call-site clarity (#449).
 fn first_objc_class_ref(cursor: CXCursor) -> String {

@@ -362,7 +362,7 @@ mod tests {
     #[test]
     fn constructor_call_resolves_to_class_node() {
         // #449: the emitter targets the type itself (`swift::ClassA`), not a
-        // synthetic `.init` member — `find_references("ClassA")` must see
+        // synthetic `.init` member, so `find_references("ClassA")` must see
         // constructor call sites directly, regardless of whether the type
         // declares an explicit initializer.
         let resp = parse(

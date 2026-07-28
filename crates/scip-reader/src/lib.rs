@@ -91,7 +91,7 @@ pub fn ingest_index(
     // references must resolve to the definition, which carries the sites).
     let mut def_from_header: HashMap<String, bool> = HashMap::new();
     // #449: per-document definition spans (start_line, end_line, NodeId),
-    // 1-indexed — used by pass 3b to attribute a cross-language reference to
+    // 1-indexed, used by pass 3b to attribute a cross-language reference to
     // its innermost enclosing definition.
     let mut doc_def_spans: HashMap<String, Vec<(u32, u32, NodeId)>> = HashMap::new();
 
@@ -208,7 +208,7 @@ pub fn ingest_index(
     // lives in the *Swift* index, so it can never appear in this index's
     // def_ids. Instead of dropping it, hand it to the daemon as an
     // `UnresolvedCall` (src = innermost enclosing definition, callee_sig =
-    // Phase A leading-keyword convention) — `resolve_unresolved_calls` then
+    // Phase A leading-keyword convention). `resolve_unresolved_calls` then
     // emits the RefCall edge + edge_sites row against the store. Gated to
     // ObjC: for go/java/c/c++ a ref without an in-index def is a dependency
     // or stdlib symbol, and converting those would flood the resolver.
@@ -297,8 +297,8 @@ pub fn ingest_index(
 /// `objc . corp 0.0.0 ClassC#registerEnvironments().` → `fn:registerEnvironments`
 /// `objc . corp 0.0.0 Foo#setWidth:height:().`        → `fn:setWidth`
 ///
-/// Returns `None` for non-method descriptors (classes, properties, modules) —
-/// only calls are worth an `UnresolvedCall`.
+/// Returns `None` for non-method descriptors (classes, properties, modules),
+/// since only calls are worth an `UnresolvedCall`.
 fn leading_keyword_sig(symbol: &str) -> Option<String> {
     let leaf = symbol.split_whitespace().last()?;
     let body = leaf.strip_suffix("().")?;
@@ -578,7 +578,7 @@ mod tests {
         };
 
         let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
-        assert!(resp.refs.is_empty(), "no in-index target — no ScipRef");
+        assert!(resp.refs.is_empty(), "no in-index target, no ScipRef");
         assert_eq!(resp.unresolved_calls.len(), 1);
         let uc = &resp.unresolved_calls[0];
         assert_eq!(uc.callee_sig, "fn:registerEnvironments");
@@ -610,7 +610,7 @@ mod tests {
 
     #[test]
     fn non_method_ref_without_def_is_not_unresolved() {
-        // Class refs (`ClassC#`) without defs are not calls — skip.
+        // Class refs (`ClassC#`) without defs are not calls, skip.
         let def_occ = scip::types::Occurrence {
             symbol: "objc . corp 0.0.0 Bridge#run().".to_string(),
             symbol_roles: 1,
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn go_ref_without_def_stays_dropped() {
-        // The cross-language pass is gated to ObjC — dependency/stdlib refs in
+        // The cross-language pass is gated to ObjC: dependency/stdlib refs in
         // other SCIP languages must not become UnresolvedCalls.
         let def_occ = scip::types::Occurrence {
             symbol: "go mod example.com 1.0.0 Caller().".to_string(),

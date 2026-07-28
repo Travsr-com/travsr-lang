@@ -485,7 +485,7 @@ final class ScipVisitor: SyntaxVisitor {
                 // member (#449). find_references/get_callers query by type name
                 // ("ClassA", not "ClassA.init"), and every type is guaranteed to
                 // have a `swift::TypeName` definition regardless of whether it
-                // declares an explicit initializer — unlike `.init`, which only
+                // declares an explicit initializer, unlike `.init`, which only
                 // exists in def_ids when the type has one.
                 references.append(Reference(symbol: "swift::\(name)", line: ln))
             } else {
@@ -501,7 +501,7 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: MemberAccessExprSyntax) -> SyntaxVisitorContinueKind {
         // Called-expressions are already handled (with implicit-self and
-        // instance resolution) by visit(FunctionCallExprSyntax) — skip them
+        // instance resolution) by visit(FunctionCallExprSyntax). Skip them
         // to avoid double emission.
         if let call = node.parent?.as(FunctionCallExprSyntax.self),
            call.calledExpression.id == node.id {
