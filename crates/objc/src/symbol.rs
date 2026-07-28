@@ -5,7 +5,7 @@
 //! Descriptor rules:
 //!   Class / Interface / Implementation  → `ClassName#`
 //!   Protocol                            → `ProtocolName/`
-//!   Instance or class method            → `ClassName#selector:parts:`
+//!   Instance or class method            → `ClassName#selector:parts:().`
 //!   C function                          → `functionName.`
 //!   Property                            → `ClassName#propertyName.`
 //!
@@ -30,9 +30,14 @@ pub fn protocol_symbol(corpus: &str, protocol_name: &str) -> String {
 /// The full ObjC selector (colons preserved) is used verbatim so that
 /// `setWidth:height:` stays distinguishable from `setWidth:` and `height:`.
 /// Category methods MUST pass the *base class* name, not the category name.
+///
+/// #449: the `().` method suffix makes the descriptor SCIP-grammar-conformant
+/// so travsr core's `scip_name_kind` parses it as
+/// `(container: Class, name: selector, kind: function)` and the node unifies
+/// with its Phase A counterpart.
 pub fn method_symbol(corpus: &str, class_name: &str, selector: &str) -> String {
     format!(
-        "objc . {} 0.0.0 {}#{}",
+        "objc . {} 0.0.0 {}#{}().",
         pkg(corpus),
         escape(class_name),
         selector,
@@ -97,6 +102,13 @@ mod tests {
     fn method_preserves_selector_colons() {
         let sym = method_symbol("corp", "Foo", "setWidth:height:");
         assert!(sym.contains("Foo#setWidth:height:"), "got: {sym}");
+    }
+
+    #[test]
+    fn method_has_scip_function_suffix() {
+        // #449: `().` suffix so travsr core parses the descriptor as a function.
+        let sym = method_symbol("corp", "Foo", "setWidth:height:");
+        assert!(sym.ends_with("Foo#setWidth:height:()."), "got: {sym}");
     }
 
     #[test]
