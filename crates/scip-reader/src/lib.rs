@@ -269,6 +269,12 @@ pub fn ingest_index(
                     callee_sig,
                     hint_crate: None,
                     caller_line,
+                    // SCIP cross-language refs carry no syntactic receiver type,
+                    // so the daemon's #529 receiver-resolution path does not
+                    // apply here. Neutral values keep the pre-#529 leaf-name
+                    // resolution behavior for these edges.
+                    is_method_call: false,
+                    recv_type: None,
                 });
                 count += 1;
             }

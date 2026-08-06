@@ -6,7 +6,7 @@
 //!   Class / Interface / Implementation  → `ClassName#`
 //!   Protocol                            → `ProtocolName/`
 //!   Instance or class method            → `ClassName#selector:parts:().`
-//!   C function                          → `functionName.`
+//!   C function                          → `functionName().`
 //!   Property                            → `ClassName#propertyName.`
 //!
 //! Category methods always resolve to the *base class* symbol — the caller is
@@ -55,8 +55,14 @@ pub fn property_symbol(corpus: &str, class_name: &str, property_name: &str) -> S
 }
 
 /// SCIP symbol for a C function defined in an ObjC translation unit.
+///
+/// #596: the `().` method/function suffix (matching `method_symbol`) makes the
+/// descriptor parse as `kind: function` in travsr core's `scip_name_kind`, so
+/// the node unifies with its Phase A `fn:<name>` counterpart instead of being
+/// mis-read as a bare `variable` term (a `.` suffix) and surviving as a
+/// duplicate def node.
 pub fn function_symbol(corpus: &str, func_name: &str) -> String {
-    format!("objc . {} 0.0.0 {}.", pkg(corpus), escape(func_name))
+    format!("objc . {} 0.0.0 {}().", pkg(corpus), escape(func_name))
 }
 
 /// Sanitize corpus for use as the SCIP package name.
@@ -118,8 +124,10 @@ mod tests {
     }
 
     #[test]
-    fn function_ends_with_dot() {
-        assert!(function_symbol("corp", "helper").ends_with("helper."));
+    fn function_has_scip_function_suffix() {
+        // #596: `().` suffix so travsr core parses a C function as a function and
+        // it unifies with its Phase A `fn:helper` node.
+        assert!(function_symbol("corp", "helper").ends_with("helper()."));
     }
 
     #[test]
