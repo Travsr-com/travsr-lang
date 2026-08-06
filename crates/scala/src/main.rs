@@ -568,19 +568,32 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
                 continue;
             }
 
-            // #299 S1: emit an occurrence record for this reference so the daemon
-            // attributes it to its enclosing function (span lookup at write time)
-            // and records an edge_sites row. Independent of the container heuristic
-            // below — write_scip_attributed_batch does its own enclosing lookup.
+            // #299 S1 + R6: emit an occurrence record for this reference so the
+            // daemon attributes it to its enclosing function (positional span
+            // lookup in write_scip_attributed_batch) and records an edge_sites
+            // row. A ScipRef, when produced, SUPERSEDES the structural enclosing
+            // edge below: emitting both creates a spurious second ref/call caller
+            // because the structural edge derives its src from the def-container
+            // heuristic, not the positional span, so the two rows differ under
+            // ON CONFLICT(src, dst, kind). The structural edge also mis-keyed its
+            // dst on the *reference's* uri instead of the definition's (#597),
+            // dangling for every cross-file reference; routing resolved refs
+            // solely through the ScipRef (callee_id keyed on the def uri via
+            // def_ids) removes that dangling too.
             if let Some(&callee_id) = def_ids.get(&occ.symbol) {
                 refs.push(ScipRef {
                     caller_path: uri.clone(),
                     caller_line: occ.start_line + 1,
                     callee_id,
                 });
+                continue;
             }
 
-            // enclosing = last container DEF with start_line ≤ occ.start_line
+            // Fallback only when the callee has no in-corpus definition (no
+            // ScipRef, no def node): a best-effort enclosing → reference edge.
+            // It has no resolvable callee node and is dropped by the daemon's
+            // fail-closed callee gate; kept minimal to avoid a wider behavioral
+            // change than R6 requires.
             let Some((_, enc_sym)) = def_containers
                 .iter()
                 .rev()
@@ -625,4 +638,98 @@ fn main() {
         .init();
 
     run_plugin(ScalaPhaseB);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sym(symbol: &str, kind: u32) -> SymbolInfo {
+        SymbolInfo {
+            symbol: symbol.to_string(),
+            kind,
+        }
+    }
+
+    fn occ(symbol: &str, line: u32, role: u32) -> Occurrence {
+        Occurrence {
+            start_line: line,
+            end_line: line,
+            symbol: symbol.to_string(),
+            role,
+            has_range: true,
+        }
+    }
+
+    // R6 + #597: a cross-file reference to a defined symbol is carried solely by
+    // a ScipRef whose callee_id is keyed on the DEFINITION's uri; no structural
+    // RefCall edge (which would mis-key its dst on the reference's uri and
+    // duplicate the positional edge) is emitted.
+    #[test]
+    fn resolved_cross_file_ref_emits_scipref_only() {
+        let docs = vec![
+            TextDocument {
+                uri: "A.scala".to_string(),
+                symbols: vec![
+                    sym("a/Caller#", KIND_CLASS),
+                    sym("a/Caller#call().", KIND_METHOD),
+                ],
+                occurrences: vec![
+                    occ("a/Caller#", 0, 2),
+                    occ("a/Caller#call().", 1, 2),
+                    // reference to a symbol defined in B.scala
+                    occ("b/Callee#target().", 3, 1),
+                ],
+            },
+            TextDocument {
+                uri: "B.scala".to_string(),
+                symbols: vec![
+                    sym("b/Callee#", KIND_CLASS),
+                    sym("b/Callee#target().", KIND_METHOD),
+                ],
+                occurrences: vec![occ("b/Callee#", 0, 2), occ("b/Callee#target().", 1, 2)],
+            },
+        ];
+
+        let resp = build_edges(&docs, "testcorpus");
+
+        // exactly one ScipRef, callee keyed on the DEFINITION uri (B.scala)
+        let callee_id = sdb_vname("b/Callee#target().", "B.scala", "testcorpus").id();
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].caller_path, "A.scala");
+        assert_eq!(resp.refs[0].caller_line, 4); // 3 + 1
+        assert_eq!(resp.refs[0].callee_id, callee_id);
+        // no structural RefCall edge for the resolved ref (supersede)
+        assert!(!resp.edges.iter().any(|e| e.kind == EdgeKind::RefCall));
+    }
+
+    // Fallback: a reference to a symbol with no in-corpus definition still emits
+    // the best-effort enclosing → reference edge (dropped fail-closed downstream)
+    // and no ScipRef.
+    #[test]
+    fn unresolved_ref_emits_fallback_edge_only() {
+        let docs = vec![TextDocument {
+            uri: "A.scala".to_string(),
+            symbols: vec![
+                sym("a/Caller#", KIND_CLASS),
+                sym("a/Caller#call().", KIND_METHOD),
+            ],
+            occurrences: vec![
+                occ("a/Caller#", 0, 2),
+                occ("a/Caller#call().", 1, 2),
+                // reference to an undefined symbol (not in def_ids)
+                occ("z/Unknown#gone().", 5, 1),
+            ],
+        }];
+
+        let resp = build_edges(&docs, "testcorpus");
+
+        assert!(resp.refs.is_empty());
+        let src = sdb_vname("a/Caller#call().", "A.scala", "testcorpus").id();
+        let dst = sdb_vname("z/Unknown#gone().", "A.scala", "testcorpus").id();
+        assert!(resp
+            .edges
+            .iter()
+            .any(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::RefCall));
+    }
 }
