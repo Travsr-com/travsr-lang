@@ -12,7 +12,9 @@
 //! 3. Drain `$/progress` notifications until KLS finishes indexing
 //! 4. `textDocument/didOpen` + `textDocument/documentSymbol` per `.kt` file
 //! 5. `textDocument/references` per defined symbol (using `selectionRange.start`)
-//! 6. Map each reference location to its enclosing symbol → `ref/call` edge
+//! 6. Emit each reference location as a `ScipRef`; the daemon's positional
+//!    lookup re-homes it to the enclosing function (or a file node when none
+//!    exists) and records the `ref/call` edge
 //! 7. `shutdown` + `exit`
 //!
 //! ## Install KLS
@@ -38,7 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
+use travsr_core::{Edge, Language, Node, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
@@ -133,7 +135,6 @@ struct DocSym {
     sel_range: LspRange,
     /// Dot-separated container path (e.g. `"Greeter"` for a method inside class Greeter).
     container: String,
-    uri: String,
 }
 
 impl DocSym {
@@ -148,10 +149,6 @@ impl DocSym {
 
     fn kind_str(&self) -> &'static str {
         kind_to_str(self.kind)
-    }
-
-    fn node_id(&self, corpus: &str, rel_path: &str) -> NodeId {
-        VName::new(corpus, "", rel_path, "kotlin", self.signature()).id()
     }
 }
 
@@ -428,7 +425,7 @@ fn parse_range(v: &Value) -> LspRange {
 }
 
 /// Recursively flatten hierarchical `DocumentSymbol[]` into a flat `Vec<DocSym>`.
-fn flatten_doc_syms(arr: &[Value], container: &str, uri: &str, out: &mut Vec<DocSym>) {
+fn flatten_doc_syms(arr: &[Value], container: &str, out: &mut Vec<DocSym>) {
     for sym in arr {
         let name = sym["name"].as_str().unwrap_or("?").to_string();
         let kind = sym["kind"].as_u64().unwrap_or(0);
@@ -450,7 +447,6 @@ fn flatten_doc_syms(arr: &[Value], container: &str, uri: &str, out: &mut Vec<Doc
             range,
             sel_range,
             container: container.to_string(),
-            uri: uri.to_string(),
         });
 
         let child_container = if container.is_empty() {
@@ -460,36 +456,9 @@ fn flatten_doc_syms(arr: &[Value], container: &str, uri: &str, out: &mut Vec<Doc
         };
 
         if let Some(children) = sym["children"].as_array() {
-            flatten_doc_syms(children, &child_container, uri, out);
+            flatten_doc_syms(children, &child_container, out);
         }
     }
-}
-
-// ── Enclosing symbol lookup ───────────────────────────────────────────────────
-
-fn range_contains(r: &LspRange, line: u64, character: u64) -> bool {
-    let after_start =
-        line > r.start.line || (line == r.start.line && character >= r.start.character);
-    let before_end = line < r.end.line || (line == r.end.line && character <= r.end.character);
-    after_start && before_end
-}
-
-fn range_lines(r: &LspRange) -> u64 {
-    r.end.line.saturating_sub(r.start.line)
-}
-
-/// Return the most specific (smallest-range) symbol that contains `(line, character)`.
-fn find_enclosing<'a>(
-    sym_map: &'a HashMap<String, Vec<DocSym>>,
-    uri: &str,
-    line: u64,
-    character: u64,
-) -> Option<&'a DocSym> {
-    sym_map
-        .get(uri)?
-        .iter()
-        .filter(|s| range_contains(&s.range, line, character))
-        .min_by_key(|s| range_lines(&s.range))
 }
 
 // ── File walker ───────────────────────────────────────────────────────────────
@@ -622,7 +591,7 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
         let mut syms = Vec::new();
         if let Some(arr) = result.as_array() {
-            flatten_doc_syms(arr, "", &uri, &mut syms);
+            flatten_doc_syms(arr, "", &mut syms);
         }
         tracing::debug!("{}: {} symbols", rel_path, syms.len());
         sym_map.insert(uri.clone(), syms);
@@ -631,7 +600,9 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
     // 6. Build nodes + ref/call edges
     let mut nodes: Vec<Node> = Vec::new();
-    let mut edges: Vec<Edge> = Vec::new();
+    // R6: no structural RefCall edges are built here — every reference carries
+    // a ScipRef instead (see the loop below).
+    let edges: Vec<Edge> = Vec::new();
     // #299 S1: occurrence records (path:line) so the daemon populates edge_sites
     // and find_references works. The LSP already hands us each reference location;
     // record it as a ScipRef instead of discarding the line into an edge.
@@ -683,33 +654,26 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
                     None => continue,
                 };
                 let ref_line = loc["range"]["start"]["line"].as_u64().unwrap_or(0);
-                let ref_char = loc["range"]["start"]["character"].as_u64().unwrap_or(0);
 
                 let ref_rel = match uri_to_rel(root, ref_uri) {
                     Some(r) => r,
                     None => continue,
                 };
 
-                // #299 F5: only emit the structural edge when there is a real
-                // enclosing symbol node. The previous fallback synthesized a
-                // `file:{rel}` VName that was never inserted as a Node → a
-                // dangling edge, while the ScipRef pipeline separately attributed
-                // the same occurrence to a *different*, real file node. For the
-                // no-enclosing case we now rely solely on the ScipRef below:
-                // `write_scip_attributed_batch` re-homes it to the correct
-                // enclosing span or a real file node (`file_node_for_attribution`)
-                // and records both the ref/call edge and the edge_site.
-                if let Some(enc) = find_enclosing(&sym_map, ref_uri, ref_line, ref_char) {
-                    let enc_rel = rel_map
-                        .get(&enc.uri)
-                        .map(|s| s.as_str())
-                        .unwrap_or(ref_rel.as_str());
-                    edges.push(Edge::new(
-                        enc.node_id(corpus, enc_rel),
-                        def_id,
-                        EdgeKind::RefCall,
-                    ));
-                }
+                // R6 (mirrors swift/scala on this branch): every reference from
+                // `textDocument/references` carries a real line, so a ScipRef is
+                // always produced here — there is no line-less fallback case for
+                // KLS. Emitting a structural edge from our own `find_enclosing`
+                // symbol-range heuristic alongside it would always be redundant,
+                // and the two are computed independently (KLS documentSymbol
+                // ranges here vs. the daemon's function/method-only span table
+                // in `write_scip_attributed_batch`), so they are not guaranteed
+                // to agree — confirmed producing real spurious duplicate callers
+                // on `travsr-test-fixtures/kotlin` (e.g. `class:Cat`, `class:Dog`,
+                // `sym:Zoo.animals` all also duplicated as `file`-attributed
+                // edges into `class:Animal`). The daemon's positional lookup
+                // re-homes the ScipRef to the enclosing function, or a file node
+                // when no enclosing function span exists.
                 refs.push(ScipRef {
                     caller_path: ref_rel.clone(),
                     caller_line: (ref_line as u32).saturating_add(1),
