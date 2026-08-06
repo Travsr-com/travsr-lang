@@ -214,6 +214,20 @@ extern "C" fn visit_top_level(
             if let Some((rel_path, occ, si)) = make_function_def(cursor, ctx) {
                 ctx.builder.add_occurrence(&rel_path, occ);
                 ctx.builder.add_symbol_info(&rel_path, si);
+
+                // #596: walk the C-function body for ObjCMessageExpr call sites
+                // (e.g. `main()` calling `[obj doThing]`). ObjC method bodies get
+                // this via visit_members; a plain C function is dispatched here at
+                // the top level, so without this walk its calls were never
+                // collected and produced no ref/call edges.
+                let mut ref_ctx = RefCtx {
+                    corpus: ctx.builder.corpus.clone(),
+                    root: ctx.builder.root.clone(),
+                    builder: ctx.builder,
+                };
+                unsafe {
+                    clang_visitChildren(cursor, visit_refs, &mut ref_ctx as *mut _ as _);
+                }
             }
         }
         _ => {}
@@ -244,13 +258,7 @@ fn handle_interface(cursor: CXCursor, ctx: &mut VisitorCtx) {
     }
 
     // Visit methods and properties declared in this interface.
-    let mut member_ctx = MemberCtx {
-        class_name: class_name.clone(),
-        builder: ctx.builder,
-    };
-    unsafe {
-        clang_visitChildren(cursor, visit_members, &mut member_ctx as *mut _ as _);
-    }
+    walk_members(cursor, class_name, ctx.builder);
 }
 
 // ── @implementation handler ───────────────────────────────────────────────────
@@ -271,13 +279,7 @@ fn handle_implementation(cursor: CXCursor, ctx: &mut VisitorCtx) {
         // avoid duplicating the class node with potentially empty relationships.
     }
 
-    let mut member_ctx = MemberCtx {
-        class_name,
-        builder: ctx.builder,
-    };
-    unsafe {
-        clang_visitChildren(cursor, visit_members, &mut member_ctx as *mut _ as _);
-    }
+    walk_members(cursor, class_name, ctx.builder);
 }
 
 // ── Category handler ──────────────────────────────────────────────────────────
@@ -302,13 +304,7 @@ fn handle_category(cursor: CXCursor, kind: CXCursorKind, ctx: &mut VisitorCtx) {
         }
     }
 
-    let mut member_ctx = MemberCtx {
-        class_name: base_class,
-        builder: ctx.builder,
-    };
-    unsafe {
-        clang_visitChildren(cursor, visit_members, &mut member_ctx as *mut _ as _);
-    }
+    walk_members(cursor, base_class, ctx.builder);
 }
 
 // ── @protocol handler ─────────────────────────────────────────────────────────
@@ -328,20 +324,55 @@ fn handle_protocol(cursor: CXCursor, ctx: &mut VisitorCtx) {
 
     // Protocol methods are ObjCMethodDecl children — emit them under the
     // protocol name (used as the "class_name" for selector scoping).
-    let mut member_ctx = MemberCtx {
-        class_name: proto_name,
-        builder: ctx.builder,
-    };
-    unsafe {
-        clang_visitChildren(cursor, visit_members, &mut member_ctx as *mut _ as _);
-    }
+    walk_members(cursor, proto_name, ctx.builder);
 }
 
 // ── Member visitor (methods + properties inside a type) ───────────────────────
 
+/// Collect the `(line, col)` of every `@property` declaration under `container`,
+/// then walk its members (skipping synthesized property accessors — #596).
+fn walk_members(container: CXCursor, class_name: String, builder: &mut IndexBuilder) {
+    let mut property_locs: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
+    unsafe {
+        clang_visitChildren(
+            container,
+            collect_property_locs,
+            &mut property_locs as *mut _ as _,
+        );
+    }
+    let mut member_ctx = MemberCtx {
+        class_name,
+        builder,
+        property_locs,
+    };
+    unsafe {
+        clang_visitChildren(container, visit_members, &mut member_ctx as *mut _ as _);
+    }
+}
+
+extern "C" fn collect_property_locs(
+    cursor: CXCursor,
+    _parent: CXCursor,
+    data: CXClientData,
+) -> CXChildVisitResult {
+    if unsafe { clang_getCursorKind(cursor) } == CXCursor_ObjCPropertyDecl {
+        if let Some((_, line, col)) = cursor_name_location(cursor) {
+            let set = unsafe { &mut *(data as *mut std::collections::HashSet<(u32, u32)>) };
+            set.insert((line, col));
+        }
+    }
+    CXChildVisit_Continue
+}
+
 struct MemberCtx<'a> {
     class_name: String,
     builder: &'a mut IndexBuilder,
+    /// `(line, col)` of every `@property` declaration in this container. A
+    /// clang-synthesized getter/setter `ObjCMethodDecl` shares its property's
+    /// source location, so methods at one of these positions are skipped
+    /// (#596): they have no tree-sitter Phase A counterpart and would survive
+    /// as un-unifiable orphan def nodes.
+    property_locs: std::collections::HashSet<(u32, u32)>,
 }
 
 extern "C" fn visit_members(
@@ -363,6 +394,15 @@ extern "C" fn visit_members(
             let selector = cursor_spelling(cursor);
             if selector.is_empty() {
                 return CXChildVisit_Continue;
+            }
+            // #596: skip clang-synthesized @property getter/setter methods.
+            // Their ObjCMethodDecl shares the property's source location, and
+            // Phase A (tree-sitter) models the property, not its accessors, so
+            // emitting them yields orphan def nodes that never unify.
+            if let Some((_, line, col)) = cursor_name_location(cursor) {
+                if ctx.property_locs.contains(&(line, col)) {
+                    return CXChildVisit_Continue;
+                }
             }
             let sym = symbol::method_symbol(&ctx.builder.corpus, &ctx.class_name, &selector);
 
