@@ -678,6 +678,9 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
                     caller_path: ref_rel.clone(),
                     caller_line: (ref_line as u32).saturating_add(1),
                     callee_id: def_id,
+                    // is_call (#650): no call/non-call signal available here;
+                    // preserve prior behavior / wire default (default_true).
+                    is_call: true,
                 });
             }
         }

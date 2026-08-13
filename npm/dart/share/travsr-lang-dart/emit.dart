@@ -14,7 +14,7 @@
 ///     {
 ///       "path": "lib/src/foo.dart",       // relative to root-path
 ///       "definitions": [
-///         { "symbol": "<uri>::<qname>", "kind": "class|function|constructor|field|variable", "line": 5 }
+///         { "symbol": "<uri>::<qname>", "kind": "class|type|function|constructor|field|variable", "line": 5, "end_line": 12 }
 ///       ],
 ///       "references": [
 ///         { "symbol": "<uri>::<qname>", "line": 12 }
@@ -53,9 +53,16 @@ Future<void> main(List<String> args) async {
     exit(1);
   }
 
+  // #299 E1: this is an AOT-compiled binary, so the analyzer's default SDK
+  // auto-detection (relative to Platform.resolvedExecutable) points at the
+  // emitter's own install dir (~/.travsr/lib/...) and fails to read the SDK.
+  // Accept an explicit SDK path via DART_SDK so the daemon can pass the real
+  // SDK location. Empty/unset falls back to the (broken for AOT) auto-detect.
+  final sdkPath = Platform.environment['DART_SDK'];
   final collection = AnalysisContextCollection(
     includedPaths: [rootPath],
     resourceProvider: PhysicalResourceProvider.INSTANCE,
+    sdkPath: (sdkPath != null && sdkPath.isNotEmpty) ? sdkPath : null,
   );
 
   final documents = <Map<String, dynamic>>[];
@@ -143,10 +150,18 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   int _line(int offset) => lineInfo.getLocation(offset).lineNumber;
 
-  void _addDef(Element? element, int offset, String kind) {
+  /// Record a definition. [nameOffset] is the name token's offset (for `line`).
+  /// [declEnd] is the exclusive end offset of the full declaration node (for
+  /// `end_line`); pass `node.end` and this method subtracts 1 internally.
+  void _addDef(Element? element, int nameOffset, String kind, {required int declEnd}) {
     final sym = _elementSymbol(element);
     if (sym.isEmpty) return;
-    definitions.add({'symbol': sym, 'kind': kind, 'line': _line(offset)});
+    definitions.add({
+      'symbol': sym,
+      'kind': kind,
+      'line': _line(nameOffset),
+      'end_line': _line(declEnd - 1),
+    });
   }
 
   void _addRef(Element? element, int offset) {
@@ -159,13 +174,13 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   @override
   void visitClassDeclaration(ClassDeclaration node) {
-    _addDef(node.declaredElement, node.name.offset, 'class');
+    _addDef(node.declaredElement, node.name.offset, 'class', declEnd: node.end);
     super.visitClassDeclaration(node);
   }
 
   @override
   void visitMixinDeclaration(MixinDeclaration node) {
-    _addDef(node.declaredElement, node.name.offset, 'class');
+    _addDef(node.declaredElement, node.name.offset, 'class', declEnd: node.end);
     super.visitMixinDeclaration(node);
   }
 
@@ -173,20 +188,21 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   void visitExtensionDeclaration(ExtensionDeclaration node) {
     final el = node.declaredElement;
     if (el != null && el.name != null && el.name!.isNotEmpty) {
-      _addDef(el, node.extensionKeyword.offset, 'class');
+      _addDef(el, node.extensionKeyword.offset, 'class', declEnd: node.end);
     }
     super.visitExtensionDeclaration(node);
   }
 
   @override
   void visitEnumDeclaration(EnumDeclaration node) {
-    _addDef(node.declaredElement, node.name.offset, 'class');
+    _addDef(node.declaredElement, node.name.offset, 'class', declEnd: node.end);
     super.visitEnumDeclaration(node);
   }
 
   @override
   void visitEnumConstantDeclaration(EnumConstantDeclaration node) {
-    _addDef(node.declaredElement, node.name.offset, 'field');
+    // Enum constants are single-line; end == name line.
+    _addDef(node.declaredElement, node.name.offset, 'field', declEnd: node.end);
     super.visitEnumConstantDeclaration(node);
   }
 
@@ -194,7 +210,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   void visitFunctionDeclaration(FunctionDeclaration node) {
     // Only top-level functions (not nested).
     if (node.parent is CompilationUnit) {
-      _addDef(node.declaredElement, node.name.offset, 'function');
+      _addDef(node.declaredElement, node.name.offset, 'function', declEnd: node.end);
     }
     super.visitFunctionDeclaration(node);
   }
@@ -202,7 +218,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   @override
   void visitMethodDeclaration(MethodDeclaration node) {
     final kind = node.isGetter || node.isSetter ? 'field' : 'function';
-    _addDef(node.declaredElement, node.name.offset, kind);
+    _addDef(node.declaredElement, node.name.offset, kind, declEnd: node.end);
     super.visitMethodDeclaration(node);
   }
 
@@ -212,6 +228,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
       node.declaredElement,
       node.returnType.offset,
       'constructor',
+      declEnd: node.end,
     );
     super.visitConstructorDeclaration(node);
   }
@@ -219,7 +236,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   @override
   void visitFieldDeclaration(FieldDeclaration node) {
     for (final v in node.fields.variables) {
-      _addDef(v.declaredElement, v.name.offset, 'field');
+      _addDef(v.declaredElement, v.name.offset, 'field', declEnd: node.end);
     }
     super.visitFieldDeclaration(node);
   }
@@ -227,9 +244,26 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   @override
   void visitTopLevelVariableDeclaration(TopLevelVariableDeclaration node) {
     for (final v in node.variables.variables) {
-      _addDef(v.declaredElement, v.name.offset, 'variable');
+      _addDef(v.declaredElement, v.name.offset, 'variable', declEnd: node.end);
     }
     super.visitTopLevelVariableDeclaration(node);
+  }
+
+  @override
+  void visitGenericTypeAlias(GenericTypeAlias node) {
+    // Modern typedefs: `typedef Middleware = Handler Function(Handler)`.
+    // Without this they are never defined, so references to them resolve to
+    // nothing and `find_references Middleware` returns a false zero.
+    _addDef(node.declaredElement, node.name.offset, 'type', declEnd: node.end);
+    super.visitGenericTypeAlias(node);
+  }
+
+  @override
+  void visitFunctionTypeAlias(FunctionTypeAlias node) {
+    // Legacy typedefs: `typedef Handler = FutureOr<Response> Function(Request)`
+    // written in the old `typedef ... Handler(...)` form.
+    _addDef(node.declaredElement, node.name.offset, 'type', declEnd: node.end);
+    super.visitFunctionTypeAlias(node);
   }
 
   // ── References (call sites) ────────────────────────────────────────────────
@@ -256,4 +290,15 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
     super.visitPrefixedIdentifier(node);
   }
 
+  @override
+  void visitNamedType(NamedType node) {
+    // Type-position references — the dominant way a typed library's public API
+    // is used: `Request request`, `FutureOr<Response>`, `Middleware m`, generic
+    // arguments, and `extends`/`implements`/`with`/`on` clauses. Without this
+    // every type used in type position had zero references (the C1 root cause).
+    // `element` resolves to the class / mixin / enum / typedef being named;
+    // it is null for `dynamic`/`void`/unresolved names, which `_addRef` drops.
+    _addRef(node.element, node.name2.offset);
+    super.visitNamedType(node);
+  }
 }

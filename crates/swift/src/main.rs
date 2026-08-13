@@ -297,6 +297,9 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                             caller_path: path.to_string(),
                             caller_line: line as u32,
                             callee_id: dst_id,
+                            // is_call (#650): no call/non-call signal available
+                            // here; preserve prior behavior / wire default.
+                            is_call: true,
                         });
                     } else {
                         edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
