@@ -585,6 +585,9 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
                     caller_path: uri.clone(),
                     caller_line: occ.start_line + 1,
                     callee_id,
+                    // is_call (#650): no call/non-call signal available here;
+                    // preserve prior behavior / wire default (default_true).
+                    is_call: true,
                 });
                 continue;
             }

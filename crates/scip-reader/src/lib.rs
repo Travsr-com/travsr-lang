@@ -251,6 +251,13 @@ pub fn ingest_index(
                     caller_path: path.clone(),
                     caller_line,
                     callee_id,
+                    // travsr-core added is_call to separate real calls from
+                    // non-call refs (#650). SCIP occurrences carry no call/
+                    // non-call signal we can key off here, so preserve prior
+                    // behavior and match the wire default (default_true): every
+                    // ingested occurrence is treated as a call. Refining this per
+                    // symbol_role is a separate change.
+                    is_call: true,
                 });
                 count += 1;
             } else if cross_lang {
