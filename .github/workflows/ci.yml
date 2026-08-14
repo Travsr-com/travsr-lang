@@ -50,6 +50,29 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+  windows:
+    name: windows (check)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          ref: master
+          path: _travsr
+
+      - name: Rewrite Cargo.toml patch paths for CI
+        shell: bash
+        run: sed -i.bak 's|path = "\.\./travsr/|path = "_travsr/|g' Cargo.toml && rm -f Cargo.toml.bak
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: check
+        run: cargo check --workspace
+
   objc-macos:
     name: objc emitter (macOS)
     runs-on: macos-latest

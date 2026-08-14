@@ -87,7 +87,6 @@ jobs:
             travsr-lang-c
             travsr-lang-cpp
             travsr-lang-csharp
-            travsr-lang-dart
             travsr-lang-go
             travsr-lang-java
             travsr-lang-kotlin
@@ -95,8 +94,10 @@ jobs:
             travsr-lang-python
             travsr-lang-ruby
             travsr-lang-scala
-            travsr-lang-swift
           )
+          if [[ "${{ matrix.target }}" != *windows* ]]; then
+            BINS+=(travsr-lang-dart travsr-lang-swift)
+          fi
           for bin in "${BINS[@]}"; do
             ${{ matrix.tool }} build --release --bin "$bin" --target ${{ matrix.target }}
           done
@@ -109,7 +110,6 @@ jobs:
             travsr-lang-c
             travsr-lang-cpp
             travsr-lang-csharp
-            travsr-lang-dart
             travsr-lang-go
             travsr-lang-java
             travsr-lang-kotlin
@@ -117,17 +117,21 @@ jobs:
             travsr-lang-python
             travsr-lang-ruby
             travsr-lang-scala
-            travsr-lang-swift
           )
+          if [[ "$TARGET" != *windows* ]]; then
+            BINS+=(travsr-lang-dart travsr-lang-swift)
+          fi
+          EXT=""
+          [[ "$TARGET" == *windows* ]] && EXT=".exe"
           mkdir -p dist
           for bin in "${BINS[@]}"; do
-            src="target/${TARGET}/release/${bin}"
+            src="target/${TARGET}/release/${bin}${EXT}"
             # strip reduces binary size; skip silently on cross-compiled targets
             # where the host strip does not understand the target arch
             strip "$src" 2>/dev/null || true
-            dst="dist/${bin}-${TARGET}"
+            dst="dist/${bin}-${TARGET}${EXT}"
             cp "$src" "$dst"
-            # SHA256: sha256sum on Linux, shasum on macOS
+            # SHA256: sha256sum on Linux/Windows, shasum on macOS
             if command -v sha256sum >/dev/null 2>&1; then
               sha256sum "$dst" | awk '{print $1}' > "${dst}.sha256"
             else

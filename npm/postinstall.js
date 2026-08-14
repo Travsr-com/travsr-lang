@@ -33,6 +33,7 @@ function platformTarget() {
   if (platform === 'darwin' && arch === 'arm64') return 'aarch64-apple-darwin';
   if (platform === 'linux' && arch === 'x64') return 'x86_64-unknown-linux-gnu';
   if (platform === 'linux' && arch === 'arm64') return 'aarch64-unknown-linux-gnu';
+  if (platform === 'win32' && arch === 'x64') return 'x86_64-pc-windows-msvc';
   return null;
 }
 
@@ -66,7 +67,8 @@ async function main() {
     return;
   }
 
-  const assetName = `${binaryName}-${target}`;
+  const ext = target.includes('windows') ? '.exe' : '';
+  const assetName = `${binaryName}-${target}${ext}`;
   const base = `https://github.com/${REPO}/releases/download/v${version}`;
 
   console.log(`travsr-plugin: downloading ${assetName} …`);
@@ -85,9 +87,9 @@ async function main() {
 
   const binDir = path.join(process.cwd(), 'bin');
   fs.mkdirSync(binDir, { recursive: true });
-  const dest = path.join(binDir, binaryName);
+  const dest = path.join(binDir, `${binaryName}${ext}`);
   fs.writeFileSync(dest, binary, { mode: 0o755 });
-  console.log(`travsr-plugin: ${binaryName} installed`);
+  console.log(`travsr-plugin: ${binaryName}${ext} installed`);
 
   // Install bundled share/<binaryName>/ to ~/.travsr/share/<binaryName>/ so
   // that sidecar binaries in ~/.travsr/bin/ resolve emitter_path() correctly.
