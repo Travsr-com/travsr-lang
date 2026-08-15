@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Windows (`x86_64-pc-windows-msvc`) release builds for every wrapper binary, published as `travsr-lang-<lang>-x86_64-pc-windows-msvc.exe` alongside a matching `.exe.sha256` (travsr#588). No tag had ever shipped a Windows asset, so `travsr lang install <lang>` 404'd on Windows for every language. `travsr-lang-objectivec` stays macOS-only — it links libclang and shells out to `xcrun`.
+- A Windows CI job that builds all twelve wrappers and runs the test suite, so a Windows-only compile break surfaces on the PR rather than midway through publishing a tag.
+
 ## [0.3.0] - 2026-07-12
 
 ### Added

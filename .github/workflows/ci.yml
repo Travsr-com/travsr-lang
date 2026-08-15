@@ -50,6 +50,62 @@ jobs:
       - name: test
         run: cargo test --workspace
 
+  # travsr#588: the release workflow now ships x86_64-pc-windows-msvc wrappers.
+  # Nothing built them on Windows before, so a Windows-only compile break would
+  # only have surfaced during a tag, after the release was already half-published.
+  # Every wrapper except objc (libclang/xcrun, macOS-only) is built here.
+  windows:
+    name: rust (Windows build)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/checkout@v4
+        with:
+          repository: Travsr-com/travsr
+          ref: master
+          path: _travsr
+
+      # Same trick as the release workflow rather than the `ln -s` the Linux job
+      # uses: a Git Bash symlink on Windows needs Developer Mode and silently
+      # degrades to a copy without it.
+      - name: Rewrite Cargo.toml patch paths for CI
+        shell: bash
+        run: sed -i.bak 's|path = "\.\./travsr/|path = "_travsr/|g' Cargo.toml && rm -f Cargo.toml.bak
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+
+      - name: build every released wrapper
+        shell: bash
+        run: |
+          BINS=(
+            travsr-lang-c
+            travsr-lang-cpp
+            travsr-lang-csharp
+            travsr-lang-dart
+            travsr-lang-go
+            travsr-lang-java
+            travsr-lang-kotlin
+            travsr-lang-php
+            travsr-lang-python
+            travsr-lang-ruby
+            travsr-lang-scala
+            travsr-lang-swift
+          )
+          for bin in "${BINS[@]}"; do
+            cargo build --bin "$bin" --target x86_64-pc-windows-msvc
+          done
+
+      - name: test
+        shell: bash
+        run: cargo test --workspace --exclude travsr-lang-objc
+
   objc-macos:
     name: objc emitter (macOS)
     runs-on: macos-latest
