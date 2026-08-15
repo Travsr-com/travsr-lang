@@ -78,19 +78,102 @@ impl Plugin for ObjcPhaseB {
     }
 }
 
-// ── libclang availability ─────────────────────────────────────────────────────
+// ── libclang availability & runtime loading (travsr-lang#17) ───────────────────
+
+/// Directory containing this machine's active `libclang.dylib`.
+///
+/// Resolved at runtime — never from the build host. Order: `LIBCLANG_PATH`,
+/// then the active toolchain via `xcrun --find clang` (works for both Command
+/// Line Tools and a full Xcode.app, wherever installed), then well-known
+/// fallbacks.
+#[cfg(target_os = "macos")]
+fn active_libclang_dir() -> Option<std::path::PathBuf> {
+    // 1. Explicit override — a file path or a directory.
+    if let Some(p) = std::env::var_os("LIBCLANG_PATH") {
+        let raw = std::path::PathBuf::from(p);
+        let dir = if raw.is_file() {
+            raw.parent().map(Path::to_path_buf)
+        } else {
+            Some(raw)
+        };
+        if let Some(dir) = dir {
+            if dir.join("libclang.dylib").exists() {
+                return Some(dir);
+            }
+        }
+    }
+
+    // 2. Active toolchain via xcrun: <toolchain>/usr/bin/clang → .../usr/lib.
+    if let Ok(out) = std::process::Command::new("xcrun")
+        .args(["--find", "clang"])
+        .output()
+    {
+        if out.status.success() {
+            if let Ok(s) = std::str::from_utf8(&out.stdout) {
+                let lib = Path::new(s.trim())
+                    .parent() // usr/bin
+                    .and_then(Path::parent) // usr
+                    .map(|usr| usr.join("lib"));
+                if let Some(lib) = lib {
+                    if lib.join("libclang.dylib").exists() {
+                        return Some(lib);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. Well-known fallbacks (full Xcode, CLT, Homebrew LLVM).
+    for candidate in [
+        "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib",
+        "/Library/Developer/CommandLineTools/usr/lib",
+        "/opt/homebrew/opt/llvm/lib",
+        "/usr/local/opt/llvm/lib",
+    ] {
+        let dir = std::path::PathBuf::from(candidate);
+        if dir.join("libclang.dylib").exists() {
+            return Some(dir);
+        }
+    }
+
+    None
+}
+
+/// Load libclang once, dynamically, against this machine's toolchain.
+///
+/// travsr-lang#17: the binary no longer link-binds libclang, so the first FFI
+/// call would panic ("a `libclang` function was called before the library was
+/// loaded") unless we `clang_sys::load()` first. A missing libclang returns a
+/// clean `Err` the caller reports as a warning, instead of a dyld crash that
+/// truncated the plugin pipe and stalled the whole repo's Phase B.
+#[cfg(target_os = "macos")]
+fn ensure_libclang_loaded() -> anyhow::Result<()> {
+    use std::sync::OnceLock;
+    static LOADED: OnceLock<Result<(), String>> = OnceLock::new();
+    LOADED
+        .get_or_init(|| {
+            // clang-sys's runtime loader honors LIBCLANG_PATH; point it at the
+            // active toolchain when the user has not set it explicitly.
+            if std::env::var_os("LIBCLANG_PATH").is_none() {
+                if let Some(dir) = active_libclang_dir() {
+                    std::env::set_var("LIBCLANG_PATH", dir);
+                }
+            }
+            clang_sys::load().map_err(|e| e.to_string())
+        })
+        .clone()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "libclang could not be loaded: {e}. Install the Xcode Command Line \
+                 Tools (`xcode-select --install`) or set LIBCLANG_PATH to a directory \
+                 containing libclang.dylib."
+            )
+        })
+}
 
 #[cfg(target_os = "macos")]
 fn libclang_available() -> bool {
-    // On macOS, libclang is provided by Xcode. xcrun confirms that the active
-    // Xcode toolchain is installed; if xcrun succeeds, libclang is present.
-    std::process::Command::new("xcrun")
-        .args(["--find", "clang"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    ensure_libclang_loaded().is_ok()
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -116,6 +199,10 @@ fn run_emitter(
     };
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
+
+    // travsr-lang#17: dlopen libclang before any FFI. Once loaded on this thread
+    // the shared handle is visible to the visitor thread spawned below.
+    ensure_libclang_loaded()?;
 
     // Build the SCIP index via the libclang visitor. The visitor is synchronous;
     // the timeout guards against pathological translation units.

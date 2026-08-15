@@ -101,6 +101,12 @@ fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<In
         .arg(&output_path)
         .arg("--gem-metadata")
         .arg(format!("{gem_name}@0.0.0"))
+        // travsr-lang#17: scip-ruby requires a positional folder/file to index.
+        // Without it scip-ruby exits 1 ("You must pass either `-e` or at least
+        // one folder or ruby file.") and writes nothing, so every Ruby symbol
+        // ended up with a bare defines/binding edge and no callers/refs. We run
+        // with `.current_dir(root)`, so `.` indexes the whole checkout.
+        .arg(".")
         .current_dir(root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

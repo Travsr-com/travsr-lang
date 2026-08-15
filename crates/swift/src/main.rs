@@ -411,6 +411,10 @@ mod tests {
         assert_eq!(resp.refs[0].callee_id, class_id);
         assert_eq!(resp.refs[0].caller_path, "ClassB.swift");
         assert_eq!(resp.refs[0].caller_line, 7);
+        // travsr-lang#17: the ref must be flagged as a call so the daemon derives
+        // a call edge (get_callers / blast radius). A ref with is_call=false is
+        // recorded for find_references only and yields no caller edge.
+        assert!(resp.refs[0].is_call, "swift call-site ref must set is_call");
     }
 
     #[test]

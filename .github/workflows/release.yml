@@ -168,6 +168,13 @@ jobs:
             shasum -a 256 "$DST" | awk '{print $1}' > "${DST}.sha256"
           fi
 
+      # travsr-lang#17: fail the release if the objc emitter ever regresses to a
+      # link-time libclang dependency or a baked build-host rpath (the original
+      # dyld-crash root cause). The runtime-loaded binary must carry neither.
+      - name: Guard against build-host rpaths
+        shell: bash
+        run: bash .github/scripts/check-no-buildhost-rpaths.sh "dist/travsr-lang-objectivec-${{ matrix.target }}"
+
       - name: Upload to release
         uses: softprops/action-gh-release@v2
         with:

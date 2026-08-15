@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Ruby: `travsr-lang-ruby` now passes the checkout directory (`.`) as scip-ruby's positional input. Without it scip-ruby exited 1 ("You must pass either `-e` or at least one folder or ruby file.") and wrote nothing, so every Ruby symbol carried only a `defines/binding` edge and `find_references` returned pending (travsr-lang#17).
+- Objective-C: `travsr-lang-objectivec` loads libclang dynamically at runtime (clang-sys `runtime` feature) instead of link-binding it. The release binary previously baked the build host's Xcode path into `LC_RPATH`, so dyld aborted the process before `main()` on any machine without that exact path, which also stalled the whole repo's Phase B on the host side. libclang is now resolved against the active toolchain (`LIBCLANG_PATH`, then `xcrun`, then well-known dirs) and a missing libclang is a catchable error, not a crash (travsr-lang#17).
+
+### Added
+
+- A release check (`.github/scripts/check-no-buildhost-rpaths.sh`) that fails the build if the objc emitter regresses to a link-time libclang dependency or a build-host absolute rpath (travsr-lang#17).
+
 ## [0.4.0] - 2026-08-15
 
 ### Added
