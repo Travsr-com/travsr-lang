@@ -142,13 +142,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Locate libclang and set runtime paths
+      - name: Locate libclang and set runtime path
         run: |
+          # travsr-lang#17: the emitter dlopens libclang at runtime, so it needs
+          # only LIBCLANG_PATH. No DYLD_LIBRARY_PATH — there is no link-time
+          # dependency to satisfy, and the shipped binary must carry no libclang
+          # load command (enforced by check-no-buildhost-rpaths.sh below).
           CLANG_BIN=$(xcrun --find clang)
           CLANG_LIB=$(dirname "$CLANG_BIN")/../lib
           LIBCLANG_DIR=$(realpath "$CLANG_LIB")
           echo "LIBCLANG_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
-          echo "DYLD_LIBRARY_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
 
       - name: Build travsr-lang-objectivec
         run: cargo build --release --bin travsr-lang-objectivec --target ${{ matrix.target }}
@@ -167,6 +170,13 @@ jobs:
           else
             shasum -a 256 "$DST" | awk '{print $1}' > "${DST}.sha256"
           fi
+
+      # travsr-lang#17: fail the release if the objc emitter ever regresses to a
+      # link-time libclang dependency or a baked build-host rpath (the original
+      # dyld-crash root cause). The runtime-loaded binary must carry neither.
+      - name: Guard against build-host rpaths
+        shell: bash
+        run: bash .github/scripts/check-no-buildhost-rpaths.sh "dist/travsr-lang-objectivec-${{ matrix.target }}"
 
       - name: Upload to release
         uses: softprops/action-gh-release@v2

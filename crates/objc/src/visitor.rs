@@ -100,19 +100,41 @@ pub fn build_index(root: &Path, corpus: &str, files: Option<&[String]>) -> anyho
         anyhow::bail!("clang_createIndex returned null");
     }
 
+    let mut parsed_ok = 0usize;
     for entry in &entries {
-        if let Err(e) = process_tu(cx_index, &entry.file, &entry.args, &mut builder) {
-            tracing::warn!(
+        match process_tu(cx_index, &entry.file, &entry.args, &mut builder) {
+            Ok(()) => parsed_ok += 1,
+            Err(e) => tracing::warn!(
                 file = %entry.file.display(),
                 "TU parse failed: {e:#}"
-            );
+            ),
         }
     }
 
     unsafe { clang_disposeIndex(cx_index) };
 
+    // If EVERY translation unit failed to parse, this is a hard failure (libclang
+    // could not read a required path, or no SDK resolves), not a repo that
+    // legitimately has no Objective-C symbols. Returning Ok(empty) here is
+    // indistinguishable from "nothing to index" and produced a silent zero-node
+    // result upstream — surface it as an error so the cause is diagnosable
+    // (the host forwards the sidecar's stderr on a zero-node/failed invoke).
+    if parsed_ok == 0 {
+        anyhow::bail!(
+            "all {} Objective-C translation unit(s) failed to parse — libclang could \
+             not process any source file; check the active toolchain/SDK and the \
+             sandbox read grants",
+            entries.len()
+        );
+    }
+
     let index = builder.finish();
-    tracing::info!(documents = index.documents.len(), "objc visitor complete");
+    tracing::info!(
+        documents = index.documents.len(),
+        parsed_ok,
+        total = entries.len(),
+        "objc visitor complete"
+    );
     Ok(index)
 }
 
