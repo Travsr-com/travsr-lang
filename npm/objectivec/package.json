@@ -2,7 +2,7 @@
   "name": "@travsr-plugin/objectivec",
   "version": "0.3.0",
   "description": "Travsr Phase B — Objective-C semantic analysis (travsr-objc-index-emitter, macOS only)",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/Travsr-com/travsr-lang"
