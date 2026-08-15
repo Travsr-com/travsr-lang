@@ -30,6 +30,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c02d123df017efcdfbd739ef81735b36c5ba83ec3c59c80a9d7ecc718f92e50"
 
 [[package]]
+name = "base64"
+version = "0.22.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
+
+[[package]]
 name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -548,7 +554,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-c"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -561,7 +567,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-cpp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -574,7 +580,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-csharp"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -587,7 +593,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-dart"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -600,7 +606,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-go"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -613,7 +619,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-java"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -626,7 +632,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-kotlin"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -638,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-objc"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "clang-sys",
@@ -655,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-php"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -668,7 +674,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-python"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -681,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-ruby"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tempfile",
@@ -694,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-scala"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "tracing",
@@ -705,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-scip-reader"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "protobuf",
@@ -718,7 +724,7 @@ dependencies = [
 
 [[package]]
 name = "travsr-lang-swift"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -733,6 +739,7 @@ dependencies = [
 name = "travsr-plugin-protocol"
 version = "0.7.0"
 dependencies = [
+ "base64",
  "serde",
  "serde_json",
  "thiserror",

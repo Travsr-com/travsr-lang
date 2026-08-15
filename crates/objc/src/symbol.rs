@@ -5,8 +5,8 @@
 //! Descriptor rules:
 //!   Class / Interface / Implementation  → `ClassName#`
 //!   Protocol                            → `ProtocolName/`
-//!   Instance or class method            → `ClassName#selector:parts:`
-//!   C function                          → `functionName.`
+//!   Instance or class method            → `ClassName#selector:parts:().`
+//!   C function                          → `functionName().`
 //!   Property                            → `ClassName#propertyName.`
 //!
 //! Category methods always resolve to the *base class* symbol — the caller is
@@ -30,9 +30,14 @@ pub fn protocol_symbol(corpus: &str, protocol_name: &str) -> String {
 /// The full ObjC selector (colons preserved) is used verbatim so that
 /// `setWidth:height:` stays distinguishable from `setWidth:` and `height:`.
 /// Category methods MUST pass the *base class* name, not the category name.
+///
+/// #449: the `().` method suffix makes the descriptor SCIP-grammar-conformant
+/// so travsr core's `scip_name_kind` parses it as
+/// `(container: Class, name: selector, kind: function)` and the node unifies
+/// with its Phase A counterpart.
 pub fn method_symbol(corpus: &str, class_name: &str, selector: &str) -> String {
     format!(
-        "objc . {} 0.0.0 {}#{}",
+        "objc . {} 0.0.0 {}#{}().",
         pkg(corpus),
         escape(class_name),
         selector,
@@ -50,8 +55,14 @@ pub fn property_symbol(corpus: &str, class_name: &str, property_name: &str) -> S
 }
 
 /// SCIP symbol for a C function defined in an ObjC translation unit.
+///
+/// #596: the `().` method/function suffix (matching `method_symbol`) makes the
+/// descriptor parse as `kind: function` in travsr core's `scip_name_kind`, so
+/// the node unifies with its Phase A `fn:<name>` counterpart instead of being
+/// mis-read as a bare `variable` term (a `.` suffix) and surviving as a
+/// duplicate def node.
 pub fn function_symbol(corpus: &str, func_name: &str) -> String {
-    format!("objc . {} 0.0.0 {}.", pkg(corpus), escape(func_name))
+    format!("objc . {} 0.0.0 {}().", pkg(corpus), escape(func_name))
 }
 
 /// Sanitize corpus for use as the SCIP package name.
@@ -100,14 +111,23 @@ mod tests {
     }
 
     #[test]
+    fn method_has_scip_function_suffix() {
+        // #449: `().` suffix so travsr core parses the descriptor as a function.
+        let sym = method_symbol("corp", "Foo", "setWidth:height:");
+        assert!(sym.ends_with("Foo#setWidth:height:()."), "got: {sym}");
+    }
+
+    #[test]
     fn empty_corpus_uses_dot() {
         let sym = class_symbol("", "Bar");
         assert!(sym.starts_with("objc . . 0.0.0"), "got: {sym}");
     }
 
     #[test]
-    fn function_ends_with_dot() {
-        assert!(function_symbol("corp", "helper").ends_with("helper."));
+    fn function_has_scip_function_suffix() {
+        // #596: `().` suffix so travsr core parses a C function as a function and
+        // it unifies with its Phase A `fn:helper` node.
+        assert!(function_symbol("corp", "helper").ends_with("helper()."));
     }
 
     #[test]

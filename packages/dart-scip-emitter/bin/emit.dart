@@ -14,7 +14,7 @@
 ///     {
 ///       "path": "lib/src/foo.dart",       // relative to root-path
 ///       "definitions": [
-///         { "symbol": "<uri>::<qname>", "kind": "class|function|constructor|field|variable", "line": 5, "end_line": 12 }
+///         { "symbol": "<uri>::<qname>", "kind": "class|type|function|constructor|field|variable", "line": 5, "end_line": 12 }
 ///       ],
 ///       "references": [
 ///         { "symbol": "<uri>::<qname>", "line": 12 }
@@ -53,9 +53,16 @@ Future<void> main(List<String> args) async {
     exit(1);
   }
 
+  // #299 E1: this is an AOT-compiled binary, so the analyzer's default SDK
+  // auto-detection (relative to Platform.resolvedExecutable) points at the
+  // emitter's own install dir (~/.travsr/lib/...) and fails to read the SDK.
+  // Accept an explicit SDK path via DART_SDK so the daemon can pass the real
+  // SDK location. Empty/unset falls back to the (broken for AOT) auto-detect.
+  final sdkPath = Platform.environment['DART_SDK'];
   final collection = AnalysisContextCollection(
     includedPaths: [rootPath],
     resourceProvider: PhysicalResourceProvider.INSTANCE,
+    sdkPath: (sdkPath != null && sdkPath.isNotEmpty) ? sdkPath : null,
   );
 
   final documents = <Map<String, dynamic>>[];
@@ -242,6 +249,23 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
     super.visitTopLevelVariableDeclaration(node);
   }
 
+  @override
+  void visitGenericTypeAlias(GenericTypeAlias node) {
+    // Modern typedefs: `typedef Middleware = Handler Function(Handler)`.
+    // Without this they are never defined, so references to them resolve to
+    // nothing and `find_references Middleware` returns a false zero.
+    _addDef(node.declaredElement, node.name.offset, 'type', declEnd: node.end);
+    super.visitGenericTypeAlias(node);
+  }
+
+  @override
+  void visitFunctionTypeAlias(FunctionTypeAlias node) {
+    // Legacy typedefs: `typedef Handler = FutureOr<Response> Function(Request)`
+    // written in the old `typedef ... Handler(...)` form.
+    _addDef(node.declaredElement, node.name.offset, 'type', declEnd: node.end);
+    super.visitFunctionTypeAlias(node);
+  }
+
   // ── References (call sites) ────────────────────────────────────────────────
 
   @override
@@ -266,4 +290,15 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
     super.visitPrefixedIdentifier(node);
   }
 
+  @override
+  void visitNamedType(NamedType node) {
+    // Type-position references — the dominant way a typed library's public API
+    // is used: `Request request`, `FutureOr<Response>`, `Middleware m`, generic
+    // arguments, and `extends`/`implements`/`with`/`on` clauses. Without this
+    // every type used in type position had zero references (the C1 root cause).
+    // `element` resolves to the class / mixin / enum / typedef being named;
+    // it is null for `dynamic`/`void`/unresolved names, which `_addRef` drops.
+    _addRef(node.element, node.name2.offset);
+    super.visitNamedType(node);
+  }
 }

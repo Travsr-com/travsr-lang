@@ -23,7 +23,7 @@
 use anyhow::Context as _;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
-use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
+use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
@@ -261,6 +261,9 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
 
     // Pass 2: resolve references → RefCall edges; inheritances → IsImplementation edges.
     let mut edges: Vec<Edge> = Vec::new();
+    // #299 S1: occurrence records (path:line) so the daemon populates edge_sites
+    // and find_references works — the emitter already gives us each ref's line.
+    let mut refs_out: Vec<ScipRef> = Vec::new();
 
     for doc in docs {
         let path = doc["path"].as_str().unwrap_or("");
@@ -279,7 +282,28 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                     continue;
                 }
                 if let Some(&dst_id) = def_ids.get(sym) {
-                    edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
+                    // R6: when the reference carries a line, emit only the
+                    // ScipRef. The daemon's write_scip_attributed_batch re-homes
+                    // it to the enclosing function and records the ref/call edge
+                    // plus an edge_site. Also emitting the file-granular edge
+                    // would add a spurious `file -> callee` duplicate: edges are
+                    // keyed ON CONFLICT(src, dst, kind), and the file src differs
+                    // from the enclosing-fn src, so both rows survive. The
+                    // file-granular edge is kept ONLY as a fallback for a
+                    // line-less reference, where no ScipRef is possible.
+                    // Emitter lines are 1-based (definitions store them as-is).
+                    if let Some(line) = r["line"].as_u64() {
+                        refs_out.push(ScipRef {
+                            caller_path: path.to_string(),
+                            caller_line: line as u32,
+                            callee_id: dst_id,
+                            // is_call (#650): no call/non-call signal available
+                            // here; preserve prior behavior / wire default.
+                            is_call: true,
+                        });
+                    } else {
+                        edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
+                    }
                 } else {
                     tracing::debug!(
                         sym,
@@ -328,7 +352,8 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     Ok(InvokeResponse {
         nodes,
         edges,
-        ..Default::default()
+        refs: refs_out,
+        unresolved_calls: Vec::new(),
     })
 }
 
@@ -344,4 +369,108 @@ fn main() {
         .init();
 
     run_plugin(SwiftPhaseB);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(json: &str) -> InvokeResponse {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("out.json");
+        std::fs::write(&path, json).expect("write canned JSON");
+        parse_emitter_output(&path, "testcorpus").expect("parse")
+    }
+
+    fn node_id(path: &str, sym: &str) -> NodeId {
+        VName::new("testcorpus", "", path, Language::Swift.as_str(), sym).id()
+    }
+
+    #[test]
+    fn constructor_call_resolves_to_class_node() {
+        // #449: the emitter targets the type itself (`swift::ClassA`), not a
+        // synthetic `.init` member, so `find_references("ClassA")` must see
+        // constructor call sites directly, regardless of whether the type
+        // declares an explicit initializer.
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"ClassA.swift","definitions":[
+                    {"symbol":"swift::ClassA","kind":"class","line":1,"end_line":10},
+                    {"symbol":"swift::ClassA.init","kind":"function","line":2,"end_line":4}
+                ],"references":[],"inheritances":[]},
+                {"path":"ClassB.swift","definitions":[],
+                 "references":[{"symbol":"swift::ClassA","line":7}],"inheritances":[]}
+            ]}"#,
+        );
+        let class_id = node_id("ClassA.swift", "swift::ClassA");
+        // R6: a ranged reference is carried solely by the ScipRef (which the
+        // daemon attributes to the enclosing function). No file-granular
+        // RefCall edge is emitted, so no spurious `file -> class` duplicate.
+        assert!(!resp.edges.iter().any(|e| e.kind == EdgeKind::RefCall));
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].callee_id, class_id);
+        assert_eq!(resp.refs[0].caller_path, "ClassB.swift");
+        assert_eq!(resp.refs[0].caller_line, 7);
+    }
+
+    #[test]
+    fn lineless_ref_emits_fallback_file_edge() {
+        // R6: a reference with no line cannot become a ScipRef, so the
+        // file-granular RefCall edge survives as the only fallback.
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"ClassA.swift","definitions":[
+                    {"symbol":"swift::ClassA","kind":"class","line":1,"end_line":10}
+                ],"references":[],"inheritances":[]},
+                {"path":"ClassB.swift","definitions":[],
+                 "references":[{"symbol":"swift::ClassA"}],"inheritances":[]}
+            ]}"#,
+        );
+        let class_id = node_id("ClassA.swift", "swift::ClassA");
+        let file_id = VName::new(
+            "testcorpus",
+            "",
+            "ClassB.swift",
+            Language::Swift.as_str(),
+            "file",
+        )
+        .id();
+        assert!(resp
+            .edges
+            .iter()
+            .any(|e| e.src == file_id && e.dst == class_id && e.kind == EdgeKind::RefCall));
+        assert!(resp.refs.is_empty());
+    }
+
+    #[test]
+    fn dotted_static_access_resolves_to_field_node() {
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"ClassC.swift","definitions":[
+                    {"symbol":"swift::ClassC","kind":"class","line":1,"end_line":8},
+                    {"symbol":"swift::ClassC.shared","kind":"field","line":2,"end_line":2}
+                ],"references":[],"inheritances":[]},
+                {"path":"Caller.swift","definitions":[],
+                 "references":[{"symbol":"swift::ClassC.shared","line":4}],"inheritances":[]}
+            ]}"#,
+        );
+        let shared_id = node_id("ClassC.swift", "swift::ClassC.shared");
+        // R6: ranged ref → ScipRef only, no file-granular RefCall duplicate.
+        assert!(!resp.edges.iter().any(|e| e.kind == EdgeKind::RefCall));
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].callee_id, shared_id);
+    }
+
+    #[test]
+    fn unknown_ref_symbol_is_skipped() {
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"A.swift","definitions":[
+                    {"symbol":"swift::A","kind":"class","line":1,"end_line":2}
+                ],"references":[{"symbol":"swift::Nowhere.method","line":2}],"inheritances":[]}
+            ]}"#,
+        );
+        assert!(resp.edges.is_empty());
+        assert!(resp.refs.is_empty());
+    }
 }

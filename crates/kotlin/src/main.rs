@@ -12,7 +12,9 @@
 //! 3. Drain `$/progress` notifications until KLS finishes indexing
 //! 4. `textDocument/didOpen` + `textDocument/documentSymbol` per `.kt` file
 //! 5. `textDocument/references` per defined symbol (using `selectionRange.start`)
-//! 6. Map each reference location to its enclosing symbol → `ref/call` edge
+//! 6. Emit each reference location as a `ScipRef`; the daemon's positional
+//!    lookup re-homes it to the enclosing function (or a file node when none
+//!    exists) and records the `ref/call` edge
 //! 7. `shutdown` + `exit`
 //!
 //! ## Install KLS
@@ -38,13 +40,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
-use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
+use travsr_core::{Edge, Language, Node, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
 
 const TIMEOUT_SECS: u64 = 600;
-const PROGRESS_WAIT_SECS: u64 = 30;
+// #299 F12: cold Gradle/Maven dependency resolution routinely exceeds 30s, after
+// which references ran against a half-built index and silently under-counted.
+// Scale to the overall session budget and warn on timeout instead of proceeding
+// silently. Overridable via TRAVSR_KLS_PROGRESS_WAIT_SECS for very large repos.
+const PROGRESS_WAIT_SECS: u64 = 180;
 const MAX_REFS_PER_SYMBOL: usize = 500;
 
 // ── Binary lookup ─────────────────────────────────────────────────────────────
@@ -129,7 +135,6 @@ struct DocSym {
     sel_range: LspRange,
     /// Dot-separated container path (e.g. `"Greeter"` for a method inside class Greeter).
     container: String,
-    uri: String,
 }
 
 impl DocSym {
@@ -144,10 +149,6 @@ impl DocSym {
 
     fn kind_str(&self) -> &'static str {
         kind_to_str(self.kind)
-    }
-
-    fn node_id(&self, corpus: &str, rel_path: &str) -> NodeId {
-        VName::new(corpus, "", rel_path, "kotlin", self.signature()).id()
     }
 }
 
@@ -309,7 +310,11 @@ impl LspSession {
     }
 
     /// Drain `$/progress` notifications until begin+end pair or timeout.
-    fn wait_for_progress_end(&mut self, timeout: Duration) -> anyhow::Result<()> {
+    /// Wait for KLS indexing to finish. Returns `Ok(true)` when the project's
+    /// progress notifications ended cleanly, `Ok(false)` when the wait timed out
+    /// (KLS still indexing) so the caller can warn — references gathered against a
+    /// half-built index would silently under-count (#299 F12).
+    fn wait_for_progress_end(&mut self, timeout: Duration) -> anyhow::Result<bool> {
         let deadline = Instant::now() + timeout;
         let mut active: i32 = 0;
         let mut any_begin = false;
@@ -318,7 +323,7 @@ impl LspSession {
             match self.recv_one(deadline)? {
                 None => {
                     tracing::debug!("progress wait timed out (active={active}), proceeding");
-                    return Ok(());
+                    return Ok(false);
                 }
                 Some(msg) => {
                     if is_progress_begin(&msg) {
@@ -332,7 +337,7 @@ impl LspSession {
                         active = (active - 1).max(0);
                         tracing::debug!("KLS progress end (active={active})");
                         if any_begin && active == 0 {
-                            return Ok(());
+                            return Ok(true);
                         }
                     } else {
                         self.inbox.push_back(msg);
@@ -420,7 +425,7 @@ fn parse_range(v: &Value) -> LspRange {
 }
 
 /// Recursively flatten hierarchical `DocumentSymbol[]` into a flat `Vec<DocSym>`.
-fn flatten_doc_syms(arr: &[Value], container: &str, uri: &str, out: &mut Vec<DocSym>) {
+fn flatten_doc_syms(arr: &[Value], container: &str, out: &mut Vec<DocSym>) {
     for sym in arr {
         let name = sym["name"].as_str().unwrap_or("?").to_string();
         let kind = sym["kind"].as_u64().unwrap_or(0);
@@ -442,7 +447,6 @@ fn flatten_doc_syms(arr: &[Value], container: &str, uri: &str, out: &mut Vec<Doc
             range,
             sel_range,
             container: container.to_string(),
-            uri: uri.to_string(),
         });
 
         let child_container = if container.is_empty() {
@@ -452,36 +456,9 @@ fn flatten_doc_syms(arr: &[Value], container: &str, uri: &str, out: &mut Vec<Doc
         };
 
         if let Some(children) = sym["children"].as_array() {
-            flatten_doc_syms(children, &child_container, uri, out);
+            flatten_doc_syms(children, &child_container, out);
         }
     }
-}
-
-// ── Enclosing symbol lookup ───────────────────────────────────────────────────
-
-fn range_contains(r: &LspRange, line: u64, character: u64) -> bool {
-    let after_start =
-        line > r.start.line || (line == r.start.line && character >= r.start.character);
-    let before_end = line < r.end.line || (line == r.end.line && character <= r.end.character);
-    after_start && before_end
-}
-
-fn range_lines(r: &LspRange) -> u64 {
-    r.end.line.saturating_sub(r.start.line)
-}
-
-/// Return the most specific (smallest-range) symbol that contains `(line, character)`.
-fn find_enclosing<'a>(
-    sym_map: &'a HashMap<String, Vec<DocSym>>,
-    uri: &str,
-    line: u64,
-    character: u64,
-) -> Option<&'a DocSym> {
-    sym_map
-        .get(uri)?
-        .iter()
-        .filter(|s| range_contains(&s.range, line, character))
-        .min_by_key(|s| range_lines(&s.range))
 }
 
 // ── File walker ───────────────────────────────────────────────────────────────
@@ -559,9 +536,24 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     session.notify("initialized", json!({}))?;
 
     // 3. Wait for KLS to finish indexing (Maven/Gradle dep resolution happens here)
+    let progress_wait_secs = std::env::var("TRAVSR_KLS_PROGRESS_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(PROGRESS_WAIT_SECS);
     tracing::info!("waiting for KLS to index {} …", root.display());
-    session.wait_for_progress_end(Duration::from_secs(PROGRESS_WAIT_SECS))?;
-    tracing::info!("KLS ready");
+    if session.wait_for_progress_end(Duration::from_secs(progress_wait_secs))? {
+        tracing::info!("KLS ready");
+    } else {
+        // #299 F12: timed out while KLS was still indexing. documentSymbol /
+        // references below run against an incomplete index, so the reference
+        // counts may under-report. Surface it as a warning (not a silent debug)
+        // and let the user raise TRAVSR_KLS_PROGRESS_WAIT_SECS for cold Gradle builds.
+        tracing::warn!(
+            "KLS did not finish indexing within {progress_wait_secs}s; \
+             reference results may be incomplete for a cold/large Gradle project"
+        );
+    }
 
     // 4. Collect .kt files
     let kt_files = collect_kt_files(root);
@@ -599,7 +591,7 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
         let mut syms = Vec::new();
         if let Some(arr) = result.as_array() {
-            flatten_doc_syms(arr, "", &uri, &mut syms);
+            flatten_doc_syms(arr, "", &mut syms);
         }
         tracing::debug!("{}: {} symbols", rel_path, syms.len());
         sym_map.insert(uri.clone(), syms);
@@ -608,7 +600,13 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
     // 6. Build nodes + ref/call edges
     let mut nodes: Vec<Node> = Vec::new();
-    let mut edges: Vec<Edge> = Vec::new();
+    // R6: no structural RefCall edges are built here — every reference carries
+    // a ScipRef instead (see the loop below).
+    let edges: Vec<Edge> = Vec::new();
+    // #299 S1: occurrence records (path:line) so the daemon populates edge_sites
+    // and find_references works. The LSP already hands us each reference location;
+    // record it as a ScipRef instead of discarding the line into an edge.
+    let mut refs: Vec<ScipRef> = Vec::new();
 
     // Collect all (uri, sym) pairs first to avoid borrowing issues
     let all_syms: Vec<(String, DocSym)> = sym_map
@@ -656,26 +654,34 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
                     None => continue,
                 };
                 let ref_line = loc["range"]["start"]["line"].as_u64().unwrap_or(0);
-                let ref_char = loc["range"]["start"]["character"].as_u64().unwrap_or(0);
 
                 let ref_rel = match uri_to_rel(root, ref_uri) {
                     Some(r) => r,
                     None => continue,
                 };
 
-                let caller_id: NodeId = find_enclosing(&sym_map, ref_uri, ref_line, ref_char)
-                    .map(|enc| {
-                        let enc_rel = rel_map
-                            .get(&enc.uri)
-                            .map(|s| s.as_str())
-                            .unwrap_or(ref_rel.as_str());
-                        enc.node_id(corpus, enc_rel)
-                    })
-                    .unwrap_or_else(|| {
-                        VName::new(corpus, "", &ref_rel, "kotlin", format!("file:{}", ref_rel)).id()
-                    });
-
-                edges.push(Edge::new(caller_id, def_id, EdgeKind::RefCall));
+                // R6 (mirrors swift/scala on this branch): every reference from
+                // `textDocument/references` carries a real line, so a ScipRef is
+                // always produced here — there is no line-less fallback case for
+                // KLS. Emitting a structural edge from our own `find_enclosing`
+                // symbol-range heuristic alongside it would always be redundant,
+                // and the two are computed independently (KLS documentSymbol
+                // ranges here vs. the daemon's function/method-only span table
+                // in `write_scip_attributed_batch`), so they are not guaranteed
+                // to agree — confirmed producing real spurious duplicate callers
+                // on `travsr-test-fixtures/kotlin` (e.g. `class:Cat`, `class:Dog`,
+                // `sym:Zoo.animals` all also duplicated as `file`-attributed
+                // edges into `class:Animal`). The daemon's positional lookup
+                // re-homes the ScipRef to the enclosing function, or a file node
+                // when no enclosing function span exists.
+                refs.push(ScipRef {
+                    caller_path: ref_rel.clone(),
+                    caller_line: (ref_line as u32).saturating_add(1),
+                    callee_id: def_id,
+                    // is_call (#650): no call/non-call signal available here;
+                    // preserve prior behavior / wire default (default_true).
+                    is_call: true,
+                });
             }
         }
     }
@@ -686,7 +692,8 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     Ok(InvokeResponse {
         nodes,
         edges,
-        ..Default::default()
+        refs,
+        unresolved_calls: Vec::new(),
     })
 }
 

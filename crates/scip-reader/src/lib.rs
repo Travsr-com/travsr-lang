@@ -64,8 +64,36 @@ pub fn ingest_index(
     let mut nodes: Vec<Node> = Vec::new();
     let mut edges: Vec<Edge> = Vec::new();
 
+    // #299 C1: C and C++ share one indexer (scip-clang) and one compile database,
+    // so the `.h`-triggered C pass and the `.cpp`-triggered C++ pass both index the
+    // whole project and emit the SAME symbols — under two different language tags,
+    // producing duplicate nodes (`Animal#describe` as both `c` and `cpp`). Derive
+    // each node's language from its file extension instead of the pass, so both
+    // passes tag a given file identically and the duplicates collapse to one node
+    // (identical VName → identical NodeId → deduped downstream).
+    let c_family = matches!(language, Language::C | Language::Cpp);
+    let doc_language = |path: &str| -> &'static str {
+        if c_family {
+            path.rsplit('.')
+                .next()
+                .and_then(Language::from_extension)
+                .map(Language::as_str)
+                .unwrap_or(lang_str)
+        } else {
+            lang_str
+        }
+    };
+
     // symbol_string → NodeId; populated in pass 1, consumed in passes 2 & 3.
     let mut def_ids: HashMap<String, NodeId> = HashMap::new();
+    // Track which def_ids entries came from a header declaration so a later
+    // source-file definition of the same symbol can take precedence (C/C++:
+    // references must resolve to the definition, which carries the sites).
+    let mut def_from_header: HashMap<String, bool> = HashMap::new();
+    // #449: per-document definition spans (start_line, end_line, NodeId),
+    // 1-indexed, used by pass 3b to attribute a cross-language reference to
+    // its innermost enclosing definition.
+    let mut doc_def_spans: HashMap<String, Vec<(u32, u32, NodeId)>> = HashMap::new();
 
     // ── Pass 1: definition nodes ─────────────────────────────────────────────
     for doc in &index.documents {
@@ -116,9 +144,25 @@ pub fn ingest_index(
                 .unwrap_or_else(|| kind_from_symbol_string(&occ.symbol));
 
             let sig = format!("scip:{}:{}", path, occ.symbol);
-            let vname = VName::new(corpus, "", path, lang_str, &sig);
+            let node_lang = doc_language(path);
+            let vname = VName::new(corpus, "", path, node_lang, &sig);
             let node_id = vname.id();
-            def_ids.insert(occ.symbol.clone(), node_id);
+            // Prefer a source-file definition over a header declaration as the
+            // canonical target for references (C/C++). First non-header wins;
+            // otherwise first seen.
+            let is_header = is_header_path(path);
+            match def_from_header.get(&occ.symbol) {
+                Some(false) => {} // already have a source def — keep it
+                Some(true) if is_header => {}
+                _ => {
+                    def_ids.insert(occ.symbol.clone(), node_id);
+                    def_from_header.insert(occ.symbol.clone(), is_header);
+                }
+            }
+            doc_def_spans
+                .entry(path.clone())
+                .or_default()
+                .push((line, end_line, node_id));
             nodes.push(
                 Node::new(vname, &kind)
                     .with_line(line)
@@ -159,8 +203,26 @@ pub fn ingest_index(
     // uses to find the innermost enclosing function span and re-home the
     // ref/call edge from file → function (RFC-014 G2).
     let mut refs: Vec<ScipRef> = Vec::new();
+    // #449 pass 3b: cross-language references. An ObjC → Swift bridged call
+    // (`[Type registerEnvironments]`) references a symbol whose definition
+    // lives in the *Swift* index, so it can never appear in this index's
+    // def_ids. Instead of dropping it, hand it to the daemon as an
+    // `UnresolvedCall` (src = innermost enclosing definition, callee_sig =
+    // Phase A leading-keyword convention). `resolve_unresolved_calls` then
+    // emits the RefCall edge + edge_sites row against the store. Gated to
+    // ObjC: for go/java/c/c++ a ref without an in-index def is a dependency
+    // or stdlib symbol, and converting those would flood the resolver.
+    let cross_lang = matches!(language, Language::ObjectiveC);
+    let mut unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
     for doc in &index.documents {
         let path = &doc.relative_path;
+        // #299 C1: scip-clang emits a reference occurrence at a symbol's *header
+        // declaration* line (not a call site). Attributing those to a header
+        // pollutes find_references with a spurious "use" on the declaration.
+        // Header occurrences for C/C++ are declarations, not call sites — skip.
+        if c_family && is_header_path(path) {
+            continue;
+        }
         let mut count = 0usize;
 
         for occ in &doc.occurrences {
@@ -177,17 +239,49 @@ pub fn ingest_index(
             if count >= MAX_REF_EDGES_PER_DOC {
                 break;
             }
+            // #299 F4: a range-less occurrence (malformed / partial SCIP)
+            // carries no real position — skip it rather than fabricating a
+            // phantom `path:1` reference via `unwrap_or(1)`.
+            let Some(start) = occ.range.first().copied() else {
+                continue;
+            };
+            let caller_line = start as u32 + 1;
             if let Some(&callee_id) = def_ids.get(occ.symbol.as_str()) {
-                let caller_line = occ
-                    .range
-                    .first()
-                    .copied()
-                    .map(|l| l as u32 + 1)
-                    .unwrap_or(1);
                 refs.push(ScipRef {
                     caller_path: path.clone(),
                     caller_line,
                     callee_id,
+                    // travsr-core added is_call to separate real calls from
+                    // non-call refs (#650). SCIP occurrences carry no call/
+                    // non-call signal we can key off here, so preserve prior
+                    // behavior and match the wire default (default_true): every
+                    // ingested occurrence is treated as a call. Refining this per
+                    // symbol_role is a separate change.
+                    is_call: true,
+                });
+                count += 1;
+            } else if cross_lang {
+                let Some(callee_sig) = leading_keyword_sig(&occ.symbol) else {
+                    continue;
+                };
+                // Attribute to the innermost enclosing definition; a ref with
+                // no enclosing def (top-level) is skipped rather than pinned
+                // to the file.
+                let Some(src) = innermost_enclosing_def(doc_def_spans.get(path), caller_line)
+                else {
+                    continue;
+                };
+                unresolved.push(travsr_core::UnresolvedCall {
+                    src,
+                    callee_sig,
+                    hint_crate: None,
+                    caller_line,
+                    // SCIP cross-language refs carry no syntactic receiver type,
+                    // so the daemon's #529 receiver-resolution path does not
+                    // apply here. Neutral values keep the pre-#529 leaf-name
+                    // resolution behavior for these edges.
+                    is_method_call: false,
+                    recv_type: None,
                 });
                 count += 1;
             }
@@ -198,10 +292,46 @@ pub fn ingest_index(
         nodes = nodes.len(),
         structural_edges = edges.len(),
         refs = refs.len(),
+        unresolved_calls = unresolved.len(),
         "SCIP ingestion complete"
     );
 
-    Ok(InvokeResponse { nodes, edges, refs })
+    Ok(InvokeResponse {
+        nodes,
+        edges,
+        refs,
+        unresolved_calls: unresolved,
+    })
+}
+
+/// #449: Phase A leading-keyword signature for a SCIP *method* symbol whose
+/// definition is not in this index (cross-language target).
+///
+/// `objc . corp 0.0.0 ClassC#registerEnvironments().` → `fn:registerEnvironments`
+/// `objc . corp 0.0.0 Foo#setWidth:height:().`        → `fn:setWidth`
+///
+/// Returns `None` for non-method descriptors (classes, properties, modules),
+/// since only calls are worth an `UnresolvedCall`.
+fn leading_keyword_sig(symbol: &str) -> Option<String> {
+    let leaf = symbol.split_whitespace().last()?;
+    let body = leaf.strip_suffix("().")?;
+    let name = body.rsplit_once('#').map(|(_, n)| n).unwrap_or(body);
+    let leading = name.split(':').next().unwrap_or(name);
+    let leading = leading.trim_matches('`');
+    if leading.is_empty() {
+        return None;
+    }
+    Some(format!("fn:{leading}"))
+}
+
+/// #449: innermost (smallest-span) definition whose `[start, end]` line range
+/// contains `line`. Spans are 1-indexed inclusive.
+fn innermost_enclosing_def(spans: Option<&Vec<(u32, u32, NodeId)>>, line: u32) -> Option<NodeId> {
+    spans?
+        .iter()
+        .filter(|(start, end, _)| *start <= line && line <= *end)
+        .min_by_key(|(start, end, _)| end - start)
+        .map(|&(_, _, id)| id)
 }
 
 /// Map a SCIP `SymbolInformation.kind` field to a Travsr kind string.
@@ -270,6 +400,14 @@ fn kind_from_scip_kind(
         _ => "definition",
     }
     .into()
+}
+
+/// Whether a repo-relative path is a C/C++ header (declaration site). Used to
+/// prefer a source-file definition over a header declaration when resolving the
+/// canonical node for a symbol's references (#299 C1).
+fn is_header_path(path: &str) -> bool {
+    let p = path.to_ascii_lowercase();
+    p.ends_with(".h") || p.ends_with(".hpp") || p.ends_with(".hh") || p.ends_with(".hxx")
 }
 
 /// Fallback kind inference from the SCIP descriptor suffix when
@@ -418,6 +556,161 @@ mod tests {
         assert_eq!(resp.refs[0].caller_path, "cmd/main.go");
         assert_eq!(resp.refs[0].caller_line, 4); // 0-indexed line 3 → 1-indexed 4
         assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
+    }
+
+    #[test]
+    fn objc_ref_without_def_becomes_unresolved_call() {
+        // #449: a bridged ObjC → Swift call references a symbol with no def in
+        // the ObjC index. It must surface as an UnresolvedCall attributed to
+        // the innermost enclosing definition, with a leading-keyword sig.
+        let caller_sym = "objc . corp 0.0.0 Bridge#run().".to_string();
+        let bridged_sym = "objc . corp 0.0.0 ClassC#registerEnvironments().".to_string();
+
+        let def_occ = scip::types::Occurrence {
+            symbol: caller_sym.clone(),
+            symbol_roles: 1,
+            // name token range; enclosing_range covers the method body
+            range: vec![2, 0, 5],
+            enclosing_range: vec![2, 0, 8, 1],
+            ..Default::default()
+        };
+        let ref_occ = scip::types::Occurrence {
+            symbol: bridged_sym,
+            symbol_roles: 0,
+            range: vec![4, 4],
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "Bridge.m".into(),
+            occurrences: vec![def_occ, ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        assert!(resp.refs.is_empty(), "no in-index target, no ScipRef");
+        assert_eq!(resp.unresolved_calls.len(), 1);
+        let uc = &resp.unresolved_calls[0];
+        assert_eq!(uc.callee_sig, "fn:registerEnvironments");
+        assert_eq!(uc.caller_line, 5); // 0-indexed 4 → 1-indexed 5
+        assert_eq!(uc.src, resp.nodes[0].id, "attributed to enclosing method");
+        assert!(uc.hint_crate.is_none());
+    }
+
+    #[test]
+    fn objc_ref_without_enclosing_def_is_skipped() {
+        let ref_occ = scip::types::Occurrence {
+            symbol: "objc . corp 0.0.0 ClassC#registerEnvironments().".to_string(),
+            symbol_roles: 0,
+            range: vec![0, 0],
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "Bridge.m".into(),
+            occurrences: vec![ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        assert!(resp.unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn non_method_ref_without_def_is_not_unresolved() {
+        // Class refs (`ClassC#`) without defs are not calls, skip.
+        let def_occ = scip::types::Occurrence {
+            symbol: "objc . corp 0.0.0 Bridge#run().".to_string(),
+            symbol_roles: 1,
+            range: vec![0, 0, 3],
+            enclosing_range: vec![0, 0, 5, 1],
+            ..Default::default()
+        };
+        let ref_occ = scip::types::Occurrence {
+            symbol: "objc . corp 0.0.0 ClassC#".to_string(),
+            symbol_roles: 0,
+            range: vec![2, 4],
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "Bridge.m".into(),
+            occurrences: vec![def_occ, ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        assert!(resp.unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn go_ref_without_def_stays_dropped() {
+        // The cross-language pass is gated to ObjC: dependency/stdlib refs in
+        // other SCIP languages must not become UnresolvedCalls.
+        let def_occ = scip::types::Occurrence {
+            symbol: "go mod example.com 1.0.0 Caller().".to_string(),
+            symbol_roles: 1,
+            range: vec![0, 0, 6],
+            enclosing_range: vec![0, 0, 9, 1],
+            ..Default::default()
+        };
+        let ref_occ = scip::types::Occurrence {
+            symbol: "go mod fmt 1.0.0 Println().".to_string(),
+            symbol_roles: 0,
+            range: vec![3, 1],
+            ..Default::default()
+        };
+        let doc = scip::types::Document {
+            relative_path: "main.go".into(),
+            occurrences: vec![def_occ, ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc],
+            ..Default::default()
+        };
+        let resp = ingest_index(&index, "example.com", Language::Go).unwrap();
+        assert!(resp.unresolved_calls.is_empty());
+    }
+
+    #[test]
+    fn leading_keyword_sig_forms() {
+        assert_eq!(
+            leading_keyword_sig("objc . c 0.0.0 ClassC#registerEnvironments()."),
+            Some("fn:registerEnvironments".into())
+        );
+        assert_eq!(
+            leading_keyword_sig("objc . c 0.0.0 Foo#setWidth:height:()."),
+            Some("fn:setWidth".into())
+        );
+        // Non-method descriptors: class, property, protocol.
+        assert_eq!(leading_keyword_sig("objc . c 0.0.0 ClassC#"), None);
+        assert_eq!(leading_keyword_sig("objc . c 0.0.0 ClassC#prop."), None);
+        assert_eq!(leading_keyword_sig("objc . c 0.0.0 Proto/"), None);
+    }
+
+    #[test]
+    fn innermost_enclosing_def_picks_smaller_nested_span() {
+        // A class span (1..=20) and a method span nested inside it (5..=10):
+        // a line inside the method must resolve to the method, not the class,
+        // even though both spans contain it.
+        let class_id = NodeId(1);
+        let method_id = NodeId(2);
+        let spans = vec![(1, 20, class_id), (5, 10, method_id)];
+        assert_eq!(innermost_enclosing_def(Some(&spans), 7), Some(method_id));
+        // Outside the method but still inside the class: falls back to the class.
+        assert_eq!(innermost_enclosing_def(Some(&spans), 15), Some(class_id));
+        // Outside both: no enclosing definition.
+        assert_eq!(innermost_enclosing_def(Some(&spans), 25), None);
+        // No spans at all for the document.
+        assert_eq!(innermost_enclosing_def(None, 7), None);
     }
 
     #[test]
