@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+### Added
+
+- Windows (`x86_64-pc-windows-msvc`) release builds for every wrapper binary, published as `travsr-lang-<lang>-x86_64-pc-windows-msvc.exe` alongside a matching `.exe.sha256` (travsr#588). No tag had ever shipped a Windows asset. `travsr-lang-objectivec` stays macOS-only, since it links libclang and shells out to `xcrun`.
+
+  This publishes the assets; it does not by itself make `travsr lang install <lang>` work on Windows. The installer must request the `.exe` name and write it with the suffix, which lands separately in Travsr-com/travsr#704, and the target is only claimed there once a tag containing these assets exists. Until then Windows reports the analyzer as unavailable rather than 404ing.
+- `npm/postinstall.js` resolves `win32`/`x64` to `x86_64-pc-windows-msvc` and handles the `.exe` suffix on both the downloaded asset and the file it writes. Without it `npm i @travsr-plugin/<lang>` on Windows declined to fetch a binary the release now contains.
+- A Windows CI job that builds all twelve wrappers, runs the test suite, and rehearses the release packaging, so a Windows-only compile break or an asset-naming mistake surfaces on the PR rather than midway through publishing a tag.
+
+### Changed
+
+- The wrapper binary list and the release packaging rules moved into `.github/wrapper-bins.txt` and `.github/scripts/package-wrappers.sh`, shared by the release workflow and the Windows CI job. They were previously three hand-maintained copies of the same list, where a name added to one and missed in another would silently ship a release the installer expects and cannot find.
+
 ## [0.3.0] - 2026-07-12
 
 ### Added
