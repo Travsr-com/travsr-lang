@@ -91,6 +91,15 @@ fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<In
         _fallback_scratch.path()
     };
     let output_path = output_dir.join("index.scip");
+    // We run scip-ruby with `.current_dir(root)`, so a relative --index-file
+    // would land under `root` rather than the scratch dir we read back. The
+    // sandbox grant hands us an absolute scratch path in practice; guard it
+    // explicitly rather than silently write to the wrong place (review finding 4).
+    anyhow::ensure!(
+        output_path.is_absolute(),
+        "scip-ruby output path must be absolute under current_dir(root): {}",
+        output_path.display()
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
     // Derive a gem name from the corpus (last path segment) for scip-ruby metadata.
@@ -108,10 +117,26 @@ fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<In
         // with `.current_dir(root)`, so `.` indexes the whole checkout.
         .arg(".")
         .current_dir(root)
-        .stdout(std::process::Stdio::piped())
+        // travsr-lang#17: now that scip-ruby actually indexes the checkout it
+        // emits progress/diagnostics. Nothing reads stdout, so discard it —
+        // piping it unread would deadlock the child once its ~64KB pipe buffer
+        // fills on a large repo, surfacing as a spurious 300s timeout (review
+        // finding 4). stderr is piped but drained concurrently below.
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn scip-ruby")?;
+
+    // Drain stderr on a reader thread so the child never blocks on a full pipe
+    // while we poll for exit.
+    let stderr_reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
 
     let status = loop {
         match child.try_wait().context("polling scip-ruby")? {
@@ -124,11 +149,9 @@ fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<In
         }
     };
 
-    let mut stderr_out = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        use std::io::Read;
-        let _ = err.read_to_string(&mut stderr_out);
-    }
+    let stderr_out = stderr_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     anyhow::ensure!(
         status.success(),

@@ -414,6 +414,13 @@ mod tests {
         // travsr-lang#17: the ref must be flagged as a call so the daemon derives
         // a call edge (get_callers / blast radius). A ref with is_call=false is
         // recorded for find_references only and yields no caller edge.
+        //
+        // NOTE: `is_call` is currently a hardcoded `true` at the sole ScipRef
+        // construction site, so this is a change detector — it catches accidental
+        // removal of the field, not a semantic regression. When the follow-up
+        // that refines per-SCIP `symbol_role` lands (flagged in e7a48ac), this
+        // assertion will start failing for the *correct* reason and should be
+        // updated to feed a genuine non-call reference.
         assert!(resp.refs[0].is_call, "swift call-site ref must set is_call");
     }
 

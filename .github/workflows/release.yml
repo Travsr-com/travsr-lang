@@ -142,13 +142,16 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Locate libclang and set runtime paths
+      - name: Locate libclang and set runtime path
         run: |
+          # travsr-lang#17: the emitter dlopens libclang at runtime, so it needs
+          # only LIBCLANG_PATH. No DYLD_LIBRARY_PATH — there is no link-time
+          # dependency to satisfy, and the shipped binary must carry no libclang
+          # load command (enforced by check-no-buildhost-rpaths.sh below).
           CLANG_BIN=$(xcrun --find clang)
           CLANG_LIB=$(dirname "$CLANG_BIN")/../lib
           LIBCLANG_DIR=$(realpath "$CLANG_LIB")
           echo "LIBCLANG_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
-          echo "DYLD_LIBRARY_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
 
       - name: Build travsr-lang-objectivec
         run: cargo build --release --bin travsr-lang-objectivec --target ${{ matrix.target }}
