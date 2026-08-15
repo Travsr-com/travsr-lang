@@ -1,0 +1,13 @@
+# Shell scripts must check out with LF on every platform.
+#
+# The Windows CI job runs .github/scripts/package-wrappers.sh through Git Bash.
+# With git's default core.autocrlf=true on Windows, that script would arrive
+# with CRLF line endings and bash would fail on the trailing \r of every line,
+# for reasons that read as nothing to do with line endings. Pinning eol=lf here
+# is what keeps the shared release-packaging script runnable on the one
+# platform it was added for.
+*.sh text eol=lf
+
+# Same reasoning for the data file the scripts and both workflows read: a
+# trailing \r would become part of every binary name.
+.github/wrapper-bins.txt text eol=lf

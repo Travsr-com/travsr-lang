@@ -81,26 +81,48 @@ jobs:
         with:
           key: windows-msvc
 
+      # Debug, not --release: this job exists to catch compile breaks, which are
+      # profile-independent in practice, and a release build of twelve binaries
+      # on every PR is a poor trade for that. The release profile itself is only
+      # exercised at tag time, which is a known and accepted gap.
       - name: build every released wrapper
         shell: bash
         run: |
-          BINS=(
-            travsr-lang-c
-            travsr-lang-cpp
-            travsr-lang-csharp
-            travsr-lang-dart
-            travsr-lang-go
-            travsr-lang-java
-            travsr-lang-kotlin
-            travsr-lang-php
-            travsr-lang-python
-            travsr-lang-ruby
-            travsr-lang-scala
-            travsr-lang-swift
-          )
-          for bin in "${BINS[@]}"; do
+          for bin in $(grep -vE '^[[:space:]]*(#|$)' .github/wrapper-bins.txt); do
             cargo build --bin "$bin" --target x86_64-pc-windows-msvc
           done
+
+      # The packaging rules are the actual cross-repo contract: travsr's
+      # installer requests `<bin>-<target>.exe` and its `.exe.sha256` sidecar,
+      # and a mistake in that naming used to be undiscoverable until a tag had
+      # already published the wrong names. Run the real packaging script and
+      # assert the names it produces.
+      - name: rehearse release packaging
+        shell: bash
+        run: |
+          bash .github/scripts/package-wrappers.sh x86_64-pc-windows-msvc debug
+
+          fail=0
+          for bin in $(grep -vE '^[[:space:]]*(#|$)' .github/wrapper-bins.txt); do
+            for f in "dist/${bin}-x86_64-pc-windows-msvc.exe" \
+                     "dist/${bin}-x86_64-pc-windows-msvc.exe.sha256"; do
+              if [ ! -s "$f" ]; then
+                echo "MISSING or empty: $f"
+                fail=1
+              fi
+            done
+          done
+
+          # An extensionless asset means the .exe rule regressed. Windows would
+          # then publish names travsr's installer never asks for, which is the
+          # travsr#588 failure mode in the other direction.
+          if ls dist/ | grep -vE '\.exe(\.sha256)?$' | grep -q .; then
+            echo "unexpected extensionless asset(s):"
+            ls dist/ | grep -vE '\.exe(\.sha256)?$'
+            fail=1
+          fi
+
+          exit $fail
 
       - name: test
         shell: bash

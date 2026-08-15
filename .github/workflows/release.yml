@@ -45,8 +45,10 @@ jobs:
             tool: cross
           # travsr#588: every wrapper is pure Rust and builds on Windows, but no
           # tag ever shipped a Windows asset, so `travsr lang install <lang>` on
-          # Windows 404'd for every language. The CLI's expected asset name for
-          # this target carries `.exe` (see the packaging step below).
+          # Windows 404'd for every language. Assets for this target are named
+          # with `.exe` (see .github/scripts/package-wrappers.sh); the installer
+          # side that requests that name lands in Travsr-com/travsr#704, and its
+          # lang-release-drift check is what verifies the two agree.
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             tool: cargo
@@ -84,72 +86,20 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
+      # Binary list and packaging rules are shared with the Windows CI job via
+      # .github/wrapper-bins.txt and .github/scripts/package-wrappers.sh, so the
+      # asset naming that travsr's installer depends on is exercised on every
+      # PR rather than for the first time during a tag.
       - name: Build all language binaries
         shell: bash
         run: |
-          BINS=(
-            travsr-lang-c
-            travsr-lang-cpp
-            travsr-lang-csharp
-            travsr-lang-dart
-            travsr-lang-go
-            travsr-lang-java
-            travsr-lang-kotlin
-            travsr-lang-php
-            travsr-lang-python
-            travsr-lang-ruby
-            travsr-lang-scala
-            travsr-lang-swift
-          )
-          for bin in "${BINS[@]}"; do
+          for bin in $(grep -vE '^[[:space:]]*(#|$)' .github/wrapper-bins.txt); do
             ${{ matrix.tool }} build --release --bin "$bin" --target ${{ matrix.target }}
           done
 
       - name: Package binaries and compute SHA256
         shell: bash
-        run: |
-          TARGET=${{ matrix.target }}
-          # Windows executables carry `.exe`, and the sidecar is named after the
-          # full asset (`<bin>-<target>.exe.sha256`). travsr's installer builds
-          # the same name from its own target triple — the two must agree, or
-          # every Windows `lang install` 404s again (travsr#588).
-          case "$TARGET" in
-            *windows*) EXE=".exe" ;;
-            *)         EXE=""     ;;
-          esac
-          BINS=(
-            travsr-lang-c
-            travsr-lang-cpp
-            travsr-lang-csharp
-            travsr-lang-dart
-            travsr-lang-go
-            travsr-lang-java
-            travsr-lang-kotlin
-            travsr-lang-php
-            travsr-lang-python
-            travsr-lang-ruby
-            travsr-lang-scala
-            travsr-lang-swift
-          )
-          mkdir -p dist
-          for bin in "${BINS[@]}"; do
-            src="target/${TARGET}/release/${bin}${EXE}"
-            # strip reduces binary size; skip silently on cross-compiled targets
-            # where the host strip does not understand the target arch. Never run
-            # it on MSVC output: the MSYS strip in Git Bash mangles PE/COFF
-            # produced by link.exe rather than failing cleanly.
-            if [ -z "$EXE" ]; then
-              strip "$src" 2>/dev/null || true
-            fi
-            dst="dist/${bin}-${TARGET}${EXE}"
-            cp "$src" "$dst"
-            # SHA256: sha256sum on Linux, shasum on macOS
-            if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "$dst" | awk '{print $1}' > "${dst}.sha256"
-            else
-              shasum -a 256 "$dst" | awk '{print $1}' > "${dst}.sha256"
-            fi
-          done
+        run: bash .github/scripts/package-wrappers.sh ${{ matrix.target }} release
 
       - name: Upload binaries to GitHub Release
         uses: softprops/action-gh-release@v2

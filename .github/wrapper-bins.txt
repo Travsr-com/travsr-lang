@@ -1,0 +1,23 @@
+# Wrapper binaries built for every release target, one per line.
+#
+# Single source of truth for the release build, the release packaging step and
+# the Windows CI job. It previously existed as three separate bash arrays that
+# had to be kept identical by hand; a name added to one and missed in another
+# silently ships a release with a wrapper the installer expects and cannot find.
+#
+# travsr-lang-objectivec is deliberately absent: it links libclang and shells
+# out to xcrun, so it is built by its own macOS-only job. travsr's installer
+# encodes the same exception (MACOS_ONLY_WRAPPERS) and its lang-release-drift
+# check compares the two.
+travsr-lang-c
+travsr-lang-cpp
+travsr-lang-csharp
+travsr-lang-dart
+travsr-lang-go
+travsr-lang-java
+travsr-lang-kotlin
+travsr-lang-php
+travsr-lang-python
+travsr-lang-ruby
+travsr-lang-scala
+travsr-lang-swift
