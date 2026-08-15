@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-java"
-description = "Travsr Phase B — Java semantic analysis via scip-java"
+description = "Travsr Phase B: Java semantic analysis via scip-java"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

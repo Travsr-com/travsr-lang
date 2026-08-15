@@ -1,7 +1,7 @@
 {
   "name": "@travsr-plugin/dart",
-  "version": "0.3.0",
-  "description": "Travsr Phase B — Dart semantic analysis (travsr-lang-dart binary + dart emitter)",
+  "version": "0.4.0",
+  "description": "Travsr Phase B: Dart semantic analysis (travsr-lang-dart binary + dart emitter)",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

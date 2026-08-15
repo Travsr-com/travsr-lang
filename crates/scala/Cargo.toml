@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-scala"
-description = "Travsr Phase B — Scala semantic analysis via SemanticDB"
+description = "Travsr Phase B: Scala semantic analysis via SemanticDB"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

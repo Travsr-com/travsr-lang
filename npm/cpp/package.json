@@ -1,7 +1,7 @@
 {
   "name": "@travsr-plugin/cpp",
-  "version": "0.3.0",
-  "description": "Travsr Phase B — C++ semantic analysis (travsr-lang-cpp binary)",
+  "version": "0.4.0",
+  "description": "Travsr Phase B: C++ semantic analysis (travsr-lang-cpp binary)",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

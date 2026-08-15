@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-kotlin"
-description = "Travsr Phase B — Kotlin semantic analysis via scip-java"
+description = "Travsr Phase B: Kotlin semantic analysis via scip-java"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

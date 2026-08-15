@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-c"
-description = "Travsr Phase B — C semantic analysis via scip-clang"
+description = "Travsr Phase B: C semantic analysis via scip-clang"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

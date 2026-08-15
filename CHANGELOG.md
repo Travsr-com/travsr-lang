@@ -2,19 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased
+## [0.4.0] - 2026-08-15
 
 ### Added
 
-- Windows (`x86_64-pc-windows-msvc`) release builds for every wrapper binary, published as `travsr-lang-<lang>-x86_64-pc-windows-msvc.exe` alongside a matching `.exe.sha256` (travsr#588). No tag had ever shipped a Windows asset. `travsr-lang-objectivec` stays macOS-only, since it links libclang and shells out to `xcrun`.
+- Windows (`x86_64-pc-windows-msvc`) release builds for every wrapper binary, published as `travsr-lang-<lang>-x86_64-pc-windows-msvc.exe` alongside a matching `.exe.sha256` (travsr#588). No previous tag had shipped a Windows asset. `travsr-lang-objectivec` stays macOS-only, since it links libclang and shells out to `xcrun`.
 
-  This publishes the assets; it does not by itself make `travsr lang install <lang>` work on Windows. The installer must request the `.exe` name and write it with the suffix, which lands separately in Travsr-com/travsr#704, and the target is only claimed there once a tag containing these assets exists. Until then Windows reports the analyzer as unavailable rather than 404ing.
+  This release is what makes the assets exist. The CLI half landed in Travsr-com/travsr#704, which already builds the `.exe` name correctly but does not yet claim Windows as available, because no published tag carried the assets when it merged. Adding `x86_64-pc-windows-msvc` to its `WRAPPER_RELEASE_TARGETS` is the remaining step, and this tag is its prerequisite.
 - `npm/postinstall.js` resolves `win32`/`x64` to `x86_64-pc-windows-msvc` and handles the `.exe` suffix on both the downloaded asset and the file it writes. Without it `npm i @travsr-plugin/<lang>` on Windows declined to fetch a binary the release now contains.
 - A Windows CI job that builds all twelve wrappers, runs the test suite, and rehearses the release packaging, so a Windows-only compile break or an asset-naming mistake surfaces on the PR rather than midway through publishing a tag.
+- Dart: references from type positions and typedefs. The emitter previously recorded references only from method invocations, instance creations and prefixed identifiers, so a type used as a parameter, a generic argument, or in an `extends`/`implements`/`with`/`on` clause produced none.
+- Objective-C: C functions now carry the `.()` function suffix so they unify with Phase A `fn:<name>` nodes instead of surviving as duplicate term nodes, and clang-synthesized property getters and setters are skipped (#596).
 
 ### Changed
 
+- **Licence changed from MIT to Apache-2.0.** The repository previously declared MIT in its manifests but shipped no `LICENSE` file at all; this release adds the licence text and standardises every crate and npm package on Apache-2.0.
+- Swift and Objective-C emit `RefCall` edges for bare member accesses, not just calls, and Swift constructor calls target the type symbol directly rather than a synthetic `.init` member, so `find_references` resolves by class name (#449).
+- Kotlin, Swift and Scala no longer emit a redundant structural `RefCall` edge alongside the `ScipRef` for the same reference. The daemon wrote both, producing a spurious file-to-callee edge next to the correctly re-homed one.
 - The wrapper binary list and the release packaging rules moved into `.github/wrapper-bins.txt` and `.github/scripts/package-wrappers.sh`, shared by the release workflow and the Windows CI job. They were previously three hand-maintained copies of the same list, where a name added to one and missed in another would silently ship a release the installer expects and cannot find.
+
+### Fixed
+
+- `ScipRef.is_call` is now set at all four construction sites, matching the field travsr-core made required in #650. Without it `cargo check --workspace` failed to build.
 
 ## [0.3.0] - 2026-07-12
 
@@ -26,14 +35,14 @@ All notable changes to this project will be documented in this file.
 
 - Objective-C plugin: bake the libclang RPATH into the binary via `build.rs` so it resolves libclang at runtime instead of relying on a stale or absent library path.
 
-## [0.2.1] — 2026-06-11
+## [0.2.1] - 2026-06-11
 
 ### Fixed
 
 - Go plugin: changed `scip-go` invocation from `scip-go --output <f> <root>` to `scip-go index --output <f> ./...` (cwd=root). The old form loaded only the root package, producing zero semantic edges on multi-package repos. `./...` is the standard Go recursive package pattern.
 - Java plugin: removed spurious positional `<root>` argument from `scip-java index --output <f>`. scip-java uses cwd for project discovery; the extra argument caused an error on unknown trailing argument.
 
-## [0.2.0] — 2026-06-10
+## [0.2.0] - 2026-06-10
 
 ### Added
 
@@ -51,11 +60,11 @@ All notable changes to this project will be documented in this file.
 - Python plugin: improved install hint when `scip-python` is not found.
 - PATH probe exit code handling: non-zero exit from a probe no longer causes a spurious error.
 
-## [0.1.0] — 2026-05-31
+## [0.1.0] - 2026-05-31
 
 ### Added
 
-**Language crates** — SCIP-based semantic analysis binaries for ten languages:
+**Language crates**: SCIP-based semantic analysis binaries for ten languages:
 
 | Binary | Language |
 |---|---|
@@ -70,11 +79,11 @@ All notable changes to this project will be documented in this file.
 | `travsr-lang-ruby` | Ruby |
 | `travsr-lang-scala` | Scala |
 
-**SCIP binary ingestion** — `travsr-lang-scip-reader` crate reads `.scip` protobuf output and threads the symbol corpus into the Travsr indexing pipeline.
+**SCIP binary ingestion**: `travsr-lang-scip-reader` crate reads `.scip` protobuf output and threads the symbol corpus into the Travsr indexing pipeline.
 
-**npm distribution** — `@travsr-plugin/<lang>` packages for all ten languages. Each package downloads the correct pre-built binary for the host platform/arch on `npm install` via a shared `postinstall.js` script.
+**npm distribution**: `@travsr-plugin/<lang>` packages for all ten languages. Each package downloads the correct pre-built binary for the host platform/arch on `npm install` via a shared `postinstall.js` script.
 
-**GitHub Actions release workflow** — push a `v*.*.*` tag to:
+**GitHub Actions release workflow**: push a `v*.*.*` tag to:
 1. Create a GitHub Release with auto-generated notes.
 2. Build and upload binaries for `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, and `aarch64-unknown-linux-gnu`.
 3. Publish all `@travsr-plugin/*` packages to npm.
