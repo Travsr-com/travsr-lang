@@ -1,7 +1,7 @@
 {
   "name": "@travsr-plugin/ruby",
-  "version": "0.3.0",
-  "description": "Travsr Phase B — Ruby semantic analysis (travsr-lang-ruby binary)",
+  "version": "0.4.0",
+  "description": "Travsr Phase B: Ruby semantic analysis (travsr-lang-ruby binary)",
   "license": "Apache-2.0",
   "repository": {
     "type": "git",

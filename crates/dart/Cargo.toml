@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-dart"
-description = "Travsr Phase B — Dart semantic analysis via dart analyze (stub)"
+description = "Travsr Phase B: Dart semantic analysis via dart analyze (stub)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

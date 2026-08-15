@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-go"
-description = "Travsr Phase B — Go semantic analysis via scip-go"
+description = "Travsr Phase B: Go semantic analysis via scip-go"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

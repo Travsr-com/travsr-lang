@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-swift"
-description = "Travsr Phase B — Swift structural analysis via SwiftSyntax emitter"
+description = "Travsr Phase B: Swift structural analysis via SwiftSyntax emitter"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

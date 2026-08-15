@@ -1,6 +1,6 @@
 [package]
 name = "travsr-lang-python"
-description = "Travsr Phase B — Python semantic analysis via scip-python"
+description = "Travsr Phase B: Python semantic analysis via scip-python"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
