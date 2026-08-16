@@ -125,10 +125,12 @@ pub fn ingest_index(
             // token). Without the body span the enclosing-function lookup in
             // write_scip_attributed_batch can only match refs that sit on the
             // definition line itself.
-            let span: &[i32] = if occ.enclosing_range.len() >= 3 {
-                &occ.enclosing_range
+            let enclosing_range = scip_enclosing_range(occ);
+            let occ_range = scip_range(occ);
+            let span: &[i32] = if enclosing_range.len() >= 3 {
+                &enclosing_range
             } else {
-                &occ.range
+                &occ_range
             };
             let line = span.first().copied().unwrap_or(0) as u32 + 1;
             // SCIP range encoding: 3-element = [start_line, start_col, end_col] (single line);
@@ -242,7 +244,7 @@ pub fn ingest_index(
             // #299 F4: a range-less occurrence (malformed / partial SCIP)
             // carries no real position — skip it rather than fabricating a
             // phantom `path:1` reference via `unwrap_or(1)`.
-            let Some(start) = occ.range.first().copied() else {
+            let Some(start) = scip_range(occ).first().copied() else {
                 continue;
             };
             let caller_line = start as u32 + 1;
@@ -274,6 +276,7 @@ pub fn ingest_index(
                 unresolved.push(travsr_core::UnresolvedCall {
                     src,
                     callee_sig,
+                    alt_callee_sig: None,
                     hint_crate: None,
                     caller_line,
                     // SCIP cross-language refs carry no syntactic receiver type,
@@ -302,6 +305,104 @@ pub fn ingest_index(
         refs,
         unresolved_calls: unresolved,
     })
+}
+
+/// Occurrence `range` in the classic packed form (`[start_line, start_col,
+/// end_col]` or `[start_line, start_col, end_line, end_col]`), tolerant of the
+/// two SCIP wire encodings.
+///
+/// scip-go/scip-python/scip-ruby/scip-clang emit `range` as a packed `int32`
+/// array (proto field 1). scip-java 0.13.1 instead emits it as a structured
+/// sub-message at field 8, where field *i* carries packed-array element *i*.
+/// The `scip` 0.7 crate only decodes the packed field, so for scip-java
+/// `occ.range` is empty and every Java reference occurrence used to be dropped
+/// (issue #724). rust-protobuf retains the unrecognized field, so recover the
+/// packed form from it when the native field is empty.
+fn scip_range(occ: &scip::types::Occurrence) -> Vec<i32> {
+    if !occ.range.is_empty() {
+        return occ.range.clone();
+    }
+    decode_structured_range(occ, 8)
+}
+
+/// Occurrence `enclosing_range` with the same dual-encoding tolerance as
+/// [`scip_range`]: packed `int32` at proto field 7, or scip-java's structured
+/// sub-message at field 11.
+fn scip_enclosing_range(occ: &scip::types::Occurrence) -> Vec<i32> {
+    if !occ.enclosing_range.is_empty() {
+        return occ.enclosing_range.clone();
+    }
+    decode_structured_range(occ, 11)
+}
+
+/// Decode scip-java's structured range sub-message from the occurrence's
+/// unknown field `field` into the packed `int32` array the rest of the reader
+/// expects. The sub-message numbers each packed element sequentially
+/// (field 1 = start_line, 2 = start_col, 3 = end_line|end_col, 4 = end_col),
+/// all varints, so read fields 1..=4 in order and stop at the first gap.
+fn decode_structured_range(occ: &scip::types::Occurrence, field: u32) -> Vec<i32> {
+    for (num, value) in occ.special_fields.unknown_fields() {
+        if num != field {
+            continue;
+        }
+        if let protobuf::UnknownValueRef::LengthDelimited(bytes) = value {
+            return parse_packed_range_submessage(bytes);
+        }
+    }
+    Vec::new()
+}
+
+/// Parse the varint fields (numbered 1..=4) of a structured range sub-message
+/// into a packed array, preserving element order and stopping at the first
+/// missing field number so a 3-element range stays 3 elements.
+fn parse_packed_range_submessage(bytes: &[u8]) -> Vec<i32> {
+    let mut slots: [Option<i32>; 4] = [None; 4];
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let Some((tag, next)) = read_varint(bytes, i) else {
+            break;
+        };
+        i = next;
+        let field = (tag >> 3) as usize;
+        let wire = tag & 0x7;
+        if wire != 0 {
+            break; // range elements are all varints; anything else is malformed
+        }
+        let Some((val, next)) = read_varint(bytes, i) else {
+            break;
+        };
+        i = next;
+        if (1..=4).contains(&field) {
+            slots[field - 1] = Some(val as i32);
+        }
+    }
+    let mut out = Vec::with_capacity(4);
+    for slot in slots {
+        match slot {
+            Some(v) => out.push(v),
+            None => break,
+        }
+    }
+    out
+}
+
+/// Minimal protobuf varint reader: returns the decoded value and the index just
+/// past it, or `None` if the buffer ends mid-varint.
+fn read_varint(bytes: &[u8], mut i: usize) -> Option<(u64, usize)> {
+    let mut shift = 0u32;
+    let mut result = 0u64;
+    loop {
+        let byte = *bytes.get(i)?;
+        i += 1;
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Some((result, i));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None;
+        }
+    }
 }
 
 /// #449: Phase A leading-keyword signature for a SCIP *method* symbol whose
@@ -555,6 +656,95 @@ mod tests {
         assert_eq!(resp.refs.len(), 1, "one ScipRef from doc_b to def");
         assert_eq!(resp.refs[0].caller_path, "cmd/main.go");
         assert_eq!(resp.refs[0].caller_line, 4); // 0-indexed line 3 → 1-indexed 4
+        assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
+    }
+
+    /// Encode a packed range array as scip-java's structured sub-message: field
+    /// `i` (1-indexed) carries packed element `i-1`, all varints.
+    fn structured_range_submessage(elems: &[i32]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (idx, &v) in elems.iter().enumerate() {
+            out.push((((idx + 1) as u32) << 3) as u8); // tag: field number, wire type 0 (varint)
+            let mut val = v as u64;
+            loop {
+                let mut byte = (val & 0x7f) as u8;
+                val >>= 7;
+                if val != 0 {
+                    byte |= 0x80;
+                }
+                out.push(byte);
+                if val == 0 {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn scip_java_structured_range_ref_produces_edge() {
+        // Regression for #724: scip-java 0.13.1 emits occurrence ranges as a
+        // structured sub-message (field 8), not the packed `range` array, so
+        // `occ.range` is empty. The reader must recover the position from the
+        // retained unknown field, otherwise every Java reference occurrence is
+        // dropped and no call edges form. Mirrors
+        // `reference_occurrence_produces_edge` with the scip-java wire shape.
+        let def_sym = "scip-java maven m 1.0.0 com/example/Greeter#greet().".to_string();
+
+        let mut def_occ = scip::types::Occurrence {
+            symbol: def_sym.clone(),
+            symbol_roles: 1,
+            ..Default::default()
+        };
+        // def at line 4 (0-indexed 3): [start_line=3, start_col=4, end_col=9]
+        def_occ
+            .special_fields
+            .mut_unknown_fields()
+            .add_length_delimited(8, structured_range_submessage(&[3, 4, 9]));
+        let doc_a = scip::types::Document {
+            relative_path: "Greeter.java".into(),
+            occurrences: vec![def_occ],
+            ..Default::default()
+        };
+
+        let mut ref_occ = scip::types::Occurrence {
+            symbol: def_sym.clone(),
+            symbol_roles: 0,
+            ..Default::default()
+        };
+        // ref at line 6 (0-indexed 5): [start_line=5, start_col=8, end_col=13]
+        ref_occ
+            .special_fields
+            .mut_unknown_fields()
+            .add_length_delimited(8, structured_range_submessage(&[5, 8, 13]));
+        let doc_b = scip::types::Document {
+            relative_path: "App.java".into(),
+            occurrences: vec![ref_occ],
+            ..Default::default()
+        };
+        let index = scip::types::Index {
+            documents: vec![doc_a, doc_b],
+            ..Default::default()
+        };
+
+        let resp = ingest_index(&index, "m", Language::Java).unwrap();
+        assert_eq!(
+            resp.nodes.len(),
+            1,
+            "one definition node from structured range"
+        );
+        assert_eq!(
+            resp.nodes[0].line,
+            Some(4),
+            "def line recovered from field 8"
+        );
+        assert_eq!(
+            resp.refs.len(),
+            1,
+            "structured-range ref must not be dropped (#724)"
+        );
+        assert_eq!(resp.refs[0].caller_path, "App.java");
+        assert_eq!(resp.refs[0].caller_line, 6); // 0-indexed 5 → 1-indexed 6
         assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
     }
 
