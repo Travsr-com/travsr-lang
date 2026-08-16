@@ -25,6 +25,7 @@
 
 use anyhow::Context as _;
 use protobuf::Message as _;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
@@ -307,56 +308,76 @@ pub fn ingest_index(
     })
 }
 
-/// Occurrence `range` in the classic packed form (`[start_line, start_col,
-/// end_col]` or `[start_line, start_col, end_line, end_col]`), tolerant of the
-/// two SCIP wire encodings.
+/// Occurrence `range` as the packed `[start_line, start_col, end_col]` (single
+/// line) or `[start_line, start_col, end_line, end_col]` (multi-line) array the
+/// rest of the reader expects, tolerant of both SCIP wire encodings.
 ///
-/// scip-go/scip-python/scip-ruby/scip-clang emit `range` as a packed `int32`
-/// array (proto field 1). scip-java 0.13.1 instead emits it as a structured
-/// sub-message at field 8, where field *i* carries packed-array element *i*.
-/// The `scip` 0.7 crate only decodes the packed field, so for scip-java
-/// `occ.range` is empty and every Java reference occurrence used to be dropped
-/// (issue #724). rust-protobuf retains the unrecognized field, so recover the
-/// packed form from it when the native field is empty.
-fn scip_range(occ: &scip::types::Occurrence) -> Vec<i32> {
+/// scip-go/scip-python/scip-ruby/scip-clang emit `range` as the deprecated
+/// packed `int32` array (proto field 1). scip-java 0.13.1 (and any producer on
+/// a current `scip.proto`) instead sets the `typed_range` oneof: either
+/// `single_line_range` (field 8, a `SingleLineRange { line, start_character,
+/// end_character }`) or `multi_line_range` (field 9, a `MultiLineRange {
+/// start_line, start_character, end_line, end_character }`). The `scip` 0.7
+/// crate only knows fields 1..=7, so the typed arm lands in `unknown_fields`
+/// and `occ.range` is empty; without recovery every Java reference occurrence
+/// is dropped (issue #724).
+///
+/// Precedence: the spec says `typed_range` wins when both are set, but no known
+/// producer sets both (scip-java sets only typed, the packed producers only
+/// packed), so the packed field is taken first to borrow without allocating.
+fn scip_range(occ: &scip::types::Occurrence) -> Cow<'_, [i32]> {
     if !occ.range.is_empty() {
-        return occ.range.clone();
+        return Cow::Borrowed(&occ.range);
     }
-    decode_structured_range(occ, 8)
+    Cow::Owned(decode_typed_range(occ, 8, 9))
 }
 
 /// Occurrence `enclosing_range` with the same dual-encoding tolerance as
-/// [`scip_range`]: packed `int32` at proto field 7, or scip-java's structured
-/// sub-message at field 11.
-fn scip_enclosing_range(occ: &scip::types::Occurrence) -> Vec<i32> {
+/// [`scip_range`]: the deprecated packed `int32` array (field 7), or the
+/// `typed_enclosing_range` oneof — `single_line_enclosing_range` (field 10) or
+/// `multi_line_enclosing_range` (field 11).
+fn scip_enclosing_range(occ: &scip::types::Occurrence) -> Cow<'_, [i32]> {
     if !occ.enclosing_range.is_empty() {
-        return occ.enclosing_range.clone();
+        return Cow::Borrowed(&occ.enclosing_range);
     }
-    decode_structured_range(occ, 11)
+    Cow::Owned(decode_typed_range(occ, 10, 11))
 }
 
-/// Decode scip-java's structured range sub-message from the occurrence's
-/// unknown field `field` into the packed `int32` array the rest of the reader
-/// expects. The sub-message numbers each packed element sequentially
-/// (field 1 = start_line, 2 = start_col, 3 = end_line|end_col, 4 = end_col),
-/// all varints, so read fields 1..=4 in order and stop at the first gap.
-fn decode_structured_range(occ: &scip::types::Occurrence, field: u32) -> Vec<i32> {
+/// Decode a `typed_range` / `typed_enclosing_range` oneof arm from the
+/// occurrence's unknown fields into the packed `int32` array. `single` is the
+/// field number of the `SingleLineRange` arm (8 for range, 10 for enclosing),
+/// `multi` the `MultiLineRange` arm (9 / 11). Returns empty when neither arm is
+/// present (a genuinely range-less occurrence, handled by the caller's guard).
+fn decode_typed_range(occ: &scip::types::Occurrence, single: u32, multi: u32) -> Vec<i32> {
     for (num, value) in occ.special_fields.unknown_fields() {
-        if num != field {
+        // SingleLineRange packs to 3 elements, MultiLineRange to 4. Key the
+        // arity off which field number carried the message, not off how many
+        // fields the wire happened to contain (see zero-elision note below).
+        let arity = if num == single {
+            3
+        } else if num == multi {
+            4
+        } else {
             continue;
-        }
+        };
         if let protobuf::UnknownValueRef::LengthDelimited(bytes) = value {
-            return parse_packed_range_submessage(bytes);
+            return parse_range_submessage(bytes, arity);
         }
     }
     Vec::new()
 }
 
-/// Parse the varint fields (numbered 1..=4) of a structured range sub-message
-/// into a packed array, preserving element order and stopping at the first
-/// missing field number so a 3-element range stays 3 elements.
-fn parse_packed_range_submessage(bytes: &[u8]) -> Vec<i32> {
-    let mut slots: [Option<i32>; 4] = [None; 4];
+/// Parse a `SingleLineRange` (arity 3) or `MultiLineRange` (arity 4) sub-message
+/// into the packed array. Sub-message field `i` (1-based) is packed element
+/// `i-1`, all varints.
+///
+/// proto3 does not serialize zero-valued scalar fields, so a missing field
+/// number means that element is 0. Fill the fixed-arity slots (defaulting to 0)
+/// rather than truncating at the first gap — otherwise an occurrence on line 0
+/// (the first line of a file) or starting at column 0 (a top-level declaration)
+/// would decode short or empty and its reference would be dropped (#724).
+fn parse_range_submessage(bytes: &[u8], arity: usize) -> Vec<i32> {
+    let mut out = vec![0i32; arity];
     let mut i = 0usize;
     while i < bytes.len() {
         let Some((tag, next)) = read_varint(bytes, i) else {
@@ -372,15 +393,8 @@ fn parse_packed_range_submessage(bytes: &[u8]) -> Vec<i32> {
             break;
         };
         i = next;
-        if (1..=4).contains(&field) {
-            slots[field - 1] = Some(val as i32);
-        }
-    }
-    let mut out = Vec::with_capacity(4);
-    for slot in slots {
-        match slot {
-            Some(v) => out.push(v),
-            None => break,
+        if (1..=arity).contains(&field) {
+            out[field - 1] = val as i32;
         }
     }
     out
@@ -659,11 +673,17 @@ mod tests {
         assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
     }
 
-    /// Encode a packed range array as scip-java's structured sub-message: field
-    /// `i` (1-indexed) carries packed element `i-1`, all varints.
-    fn structured_range_submessage(elems: &[i32]) -> Vec<u8> {
+    /// Encode a `SingleLineRange` (3 elems) or `MultiLineRange` (4 elems) typed
+    /// oneof sub-message the way real protobuf does: field `i` (1-based) carries
+    /// packed element `i-1` as a varint, and proto3 OMITS any field whose value
+    /// is 0 (implicit-presence scalars are not serialized when zero). Emitting
+    /// explicit zeros here would hide the zero-elision decode path (#724).
+    fn typed_range_submessage(elems: &[i32]) -> Vec<u8> {
         let mut out = Vec::new();
         for (idx, &v) in elems.iter().enumerate() {
+            if v == 0 {
+                continue; // proto3 does not serialize zero-valued scalars
+            }
             out.push((((idx + 1) as u32) << 3) as u8); // tag: field number, wire type 0 (varint)
             let mut val = v as u64;
             loop {
@@ -681,58 +701,61 @@ mod tests {
         out
     }
 
+    /// Build a scip-java occurrence carrying its position in a typed-range oneof
+    /// arm (`field`), as scip-java 0.13.1 emits it, instead of the packed array.
+    fn java_occ(sym: &str, roles: i32, field: u32, elems: &[i32]) -> scip::types::Occurrence {
+        let mut occ = scip::types::Occurrence {
+            symbol: sym.to_string(),
+            symbol_roles: roles,
+            ..Default::default()
+        };
+        occ.special_fields
+            .mut_unknown_fields()
+            .add_length_delimited(field, typed_range_submessage(elems));
+        occ
+    }
+
+    /// Serialize the index to protobuf bytes and parse it back. `add_length_
+    /// delimited` installs the typed range directly into `unknown_fields`, so
+    /// only a real serialize + parse proves the encoding survives the wire — and
+    /// it guards against a future `scip` crate bump that promotes fields 8..=11
+    /// to known fields, at which point the bytes leave `unknown_fields` and this
+    /// test fails loudly instead of silently passing while prod breaks.
+    fn roundtrip(index: scip::types::Index) -> scip::types::Index {
+        let bytes = index.write_to_bytes().expect("serialize scip index");
+        scip::types::Index::parse_from_bytes(&bytes).expect("parse scip index")
+    }
+
     #[test]
-    fn scip_java_structured_range_ref_produces_edge() {
-        // Regression for #724: scip-java 0.13.1 emits occurrence ranges as a
-        // structured sub-message (field 8), not the packed `range` array, so
-        // `occ.range` is empty. The reader must recover the position from the
-        // retained unknown field, otherwise every Java reference occurrence is
-        // dropped and no call edges form. Mirrors
-        // `reference_occurrence_produces_edge` with the scip-java wire shape.
-        let def_sym = "scip-java maven m 1.0.0 com/example/Greeter#greet().".to_string();
-
-        let mut def_occ = scip::types::Occurrence {
-            symbol: def_sym.clone(),
-            symbol_roles: 1,
+    fn scip_java_typed_range_ref_produces_edge() {
+        // Regression for #724: scip-java 0.13.1 emits occurrence positions in
+        // the `typed_range` oneof (single_line_range = field 8), not the packed
+        // `range` array, so `occ.range` is empty. The reader must recover the
+        // position from the retained unknown field, otherwise every Java
+        // reference occurrence is dropped and no call edges form.
+        let sym = "scip-java maven m 1.0.0 com/example/Greeter#greet().";
+        // def at line 4 (0-indexed 3): SingleLineRange { line=3, start=4, end=9 }
+        let def = java_occ(sym, 1, 8, &[3, 4, 9]);
+        // ref at line 6 (0-indexed 5): SingleLineRange { line=5, start=8, end=13 }
+        let r = java_occ(sym, 0, 8, &[5, 8, 13]);
+        let index = roundtrip(scip::types::Index {
+            documents: vec![
+                scip::types::Document {
+                    relative_path: "Greeter.java".into(),
+                    occurrences: vec![def],
+                    ..Default::default()
+                },
+                scip::types::Document {
+                    relative_path: "App.java".into(),
+                    occurrences: vec![r],
+                    ..Default::default()
+                },
+            ],
             ..Default::default()
-        };
-        // def at line 4 (0-indexed 3): [start_line=3, start_col=4, end_col=9]
-        def_occ
-            .special_fields
-            .mut_unknown_fields()
-            .add_length_delimited(8, structured_range_submessage(&[3, 4, 9]));
-        let doc_a = scip::types::Document {
-            relative_path: "Greeter.java".into(),
-            occurrences: vec![def_occ],
-            ..Default::default()
-        };
-
-        let mut ref_occ = scip::types::Occurrence {
-            symbol: def_sym.clone(),
-            symbol_roles: 0,
-            ..Default::default()
-        };
-        // ref at line 6 (0-indexed 5): [start_line=5, start_col=8, end_col=13]
-        ref_occ
-            .special_fields
-            .mut_unknown_fields()
-            .add_length_delimited(8, structured_range_submessage(&[5, 8, 13]));
-        let doc_b = scip::types::Document {
-            relative_path: "App.java".into(),
-            occurrences: vec![ref_occ],
-            ..Default::default()
-        };
-        let index = scip::types::Index {
-            documents: vec![doc_a, doc_b],
-            ..Default::default()
-        };
+        });
 
         let resp = ingest_index(&index, "m", Language::Java).unwrap();
-        assert_eq!(
-            resp.nodes.len(),
-            1,
-            "one definition node from structured range"
-        );
+        assert_eq!(resp.nodes.len(), 1, "one definition node from typed range");
         assert_eq!(
             resp.nodes[0].line,
             Some(4),
@@ -741,11 +764,115 @@ mod tests {
         assert_eq!(
             resp.refs.len(),
             1,
-            "structured-range ref must not be dropped (#724)"
+            "typed-range ref must not be dropped (#724)"
         );
         assert_eq!(resp.refs[0].caller_path, "App.java");
         assert_eq!(resp.refs[0].caller_line, 6); // 0-indexed 5 → 1-indexed 6
         assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
+    }
+
+    #[test]
+    fn scip_java_ref_on_line_zero_survives_zero_elision() {
+        // #724 bug (a): proto3 does not serialize a zero-valued `line`, so a ref
+        // on the first line of a file (line 0) has field 1 absent on the wire.
+        // The decoder must read the fixed 3-element arity and default the
+        // missing element to 0, not truncate — otherwise the ref decodes to an
+        // empty range and is silently dropped, reproducing the #724 symptom.
+        let sym = "scip-java maven m 1.0.0 com/example/Greeter#greet().";
+        let def = java_occ(sym, 1, 8, &[3, 4, 9]);
+        // ref on line 0: SingleLineRange { line=0(elided), start=8, end=13 }
+        let r = java_occ(sym, 0, 8, &[0, 8, 13]);
+        let index = roundtrip(scip::types::Index {
+            documents: vec![
+                scip::types::Document {
+                    relative_path: "Greeter.java".into(),
+                    occurrences: vec![def],
+                    ..Default::default()
+                },
+                scip::types::Document {
+                    relative_path: "App.java".into(),
+                    occurrences: vec![r],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let resp = ingest_index(&index, "m", Language::Java).unwrap();
+        assert_eq!(
+            resp.refs.len(),
+            1,
+            "ref on line 0 must not be dropped (#724a)"
+        );
+        assert_eq!(resp.refs[0].caller_line, 1); // 0-indexed 0 → 1-indexed 1
+    }
+
+    #[test]
+    fn scip_java_multi_line_range_ref_produces_edge() {
+        // #724 bug (b): a reference carried in the multi_line_range arm (field 9,
+        // a 4-element MultiLineRange) must decode too, not just single_line_range
+        // (field 8). Before the fix, field 9 was never read and the ref dropped.
+        let sym = "scip-java maven m 1.0.0 com/example/Greeter#greet().";
+        let def = java_occ(sym, 1, 8, &[3, 4, 9]);
+        // ref: MultiLineRange { start_line=5, start=8, end_line=6, end=2 }
+        let r = java_occ(sym, 0, 9, &[5, 8, 6, 2]);
+        let index = roundtrip(scip::types::Index {
+            documents: vec![
+                scip::types::Document {
+                    relative_path: "Greeter.java".into(),
+                    occurrences: vec![def],
+                    ..Default::default()
+                },
+                scip::types::Document {
+                    relative_path: "App.java".into(),
+                    occurrences: vec![r],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        });
+
+        let resp = ingest_index(&index, "m", Language::Java).unwrap();
+        assert_eq!(
+            resp.refs.len(),
+            1,
+            "multi_line_range ref must not be dropped (#724b)"
+        );
+        assert_eq!(resp.refs[0].caller_line, 6); // start_line 5 → 1-indexed 6
+    }
+
+    #[test]
+    fn typed_range_helpers_decode_all_four_field_numbers() {
+        // All four typed-range field numbers must decode, with zero-elided
+        // elements defaulting to 0 (not truncating): single_line_range (8) and
+        // single_line_enclosing_range (10) are 3-element; multi_line_range (9)
+        // and multi_line_enclosing_range (11) are 4-element.
+        let mk = |field: u32, elems: &[i32]| java_occ("s", 0, field, elems);
+        assert_eq!(scip_range(&mk(8, &[5, 8, 13])).into_owned(), vec![5, 8, 13]);
+        assert_eq!(
+            scip_range(&mk(9, &[5, 8, 6, 2])).into_owned(),
+            vec![5, 8, 6, 2]
+        );
+        assert_eq!(
+            scip_enclosing_range(&mk(10, &[5, 8, 20])).into_owned(),
+            vec![5, 8, 20]
+        );
+        assert_eq!(
+            scip_enclosing_range(&mk(11, &[5, 8, 9, 2])).into_owned(),
+            vec![5, 8, 9, 2]
+        );
+        // zero elision: line 0 and column 0 must round-trip to 0, not truncate.
+        assert_eq!(scip_range(&mk(8, &[0, 0, 9])).into_owned(), vec![0, 0, 9]);
+        assert_eq!(
+            scip_range(&mk(9, &[0, 0, 0, 4])).into_owned(),
+            vec![0, 0, 0, 4]
+        );
+        // classic packed producers borrow their native field without allocating.
+        let packed = scip::types::Occurrence {
+            range: vec![1, 2, 3],
+            ..Default::default()
+        };
+        assert!(matches!(scip_range(&packed), Cow::Borrowed(_)));
     }
 
     #[test]
