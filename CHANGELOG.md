@@ -2,12 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.1] - 2026-08-16
 
 ### Fixed
 
 - Ruby: `travsr-lang-ruby` now passes the checkout directory (`.`) as scip-ruby's positional input. Without it scip-ruby exited 1 ("You must pass either `-e` or at least one folder or ruby file.") and wrote nothing, so every Ruby symbol carried only a `defines/binding` edge and `find_references` returned pending (travsr-lang#17).
 - Objective-C: `travsr-lang-objectivec` loads libclang dynamically at runtime (clang-sys `runtime` feature) instead of link-binding it. The release binary previously baked the build host's Xcode path into `LC_RPATH`, so dyld aborted the process before `main()` on any machine without that exact path, which also stalled the whole repo's Phase B on the host side. libclang is now resolved against the active toolchain (`LIBCLANG_PATH`, then `xcrun`, then well-known dirs) and a missing libclang is a catchable error, not a crash (travsr-lang#17).
+- Java: `travsr-lang-scip-reader` now decodes scip-java 0.13.1's structured `Range` sub-messages (proto fields 8 to 11), not just the classic packed int32 arrays at fields 1 and 7. Those ranges previously came back empty, every occurrence fell back to line 1, and the range guard dropped it, so Java Phase B produced definitions but zero call edges. The decoder handles both oneof arms (single-line and multi-line) and fills proto3's zero-elided fields instead of truncating on them. Ruby, Go, Python and TypeScript use the classic packed encoding and were unaffected (#724).
 
 ### Added
 
