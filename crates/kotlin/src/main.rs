@@ -57,29 +57,21 @@ const MAX_REFS_PER_SYMBOL: usize = 500;
 
 static KLS_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
+/// Resolve the installed `kotlin-language-server` launcher.
+///
+/// `travsr lang install kotlin` writes a platform-appropriate launcher into
+/// `~/.travsr/bin`: a `#!/bin/sh` script on unix, a `.cmd` on Windows (see
+/// `install_zip_binary` in travsr-cli). A bare `Path::exists()`/`Command::new`
+/// check on the extensionless name never finds the Windows `.cmd` — Windows
+/// only auto-resolves `.exe` implicitly, not `.cmd`/`.bat` — so this silently
+/// treated KLS as absent on every Windows machine, on both installed paths
+/// (~/.travsr/bin and PATH), and Phase B degraded to a clean 0-node response
+/// with no diagnostic. `travsr_core::exec::tool_path` is the shared,
+/// PATHEXT-aware resolver travsr's own CLI (`analyzer_command_present`) and
+/// sandbox layer already use for exactly this problem.
 fn kls_binary() -> Option<PathBuf> {
     KLS_BIN
-        .get_or_init(|| {
-            // 1. ~/.travsr/bin/kotlin-language-server
-            if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
-                let p = home.join(".travsr/bin/kotlin-language-server");
-                if p.exists() {
-                    return Some(p);
-                }
-            }
-            // 2. PATH — probe via --help (exits 1 but proves binary exists)
-            let ok = Command::new("kotlin-language-server")
-                .arg("--help")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok();
-            if ok {
-                Some(PathBuf::from("kotlin-language-server"))
-            } else {
-                None
-            }
-        })
+        .get_or_init(|| travsr_core::exec::tool_path("kotlin-language-server"))
         .clone()
 }
 
@@ -374,17 +366,70 @@ fn is_progress_end(msg: &Value) -> bool {
 
 // ── URI / path helpers ────────────────────────────────────────────────────────
 
-fn path_to_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+/// `path.display()` on Windows yields backslashes and no leading slash before
+/// the drive letter (e.g. `D:\repo\Foo.kt`). `file://` + that string is not a
+/// valid URI — `java.net.URI.create` on the KLS side rejects it with
+/// `Illegal character in authority`, since a bare backslash and an
+/// unescaped drive-letter colon right after `//` are both illegal there. KLS
+/// swallows the exception per-call (logs it, does not crash), so every
+/// `initialize`/`didOpen`/`documentSymbol` request against a malformed URI
+/// silently produced nothing — no error propagated back to this wrapper, no
+/// symbols, no references, on every Windows machine. Rewriting to forward
+/// slashes plus a leading `/` before the drive letter (`file:///D:/repo/Foo.kt`)
+/// is the standard `file://` form for Windows paths and is what KLS's own
+/// `documentSymbol`/`publishDiagnostics` responses come back as. A no-op on
+/// unix, where `path.display()` already starts with `/`.
+/// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`).
+/// `repo_root`/`InvokeRequest::root` on Windows come through canonicalized —
+/// confirmed live via a debug probe: `root` arrives as
+/// `\\?\D:\com.travsr\testing\kotlinrepo`, not a plain drive path — so every
+/// path built from it (and every path this wrapper walks under it) carries
+/// the prefix too. Left unstripped, `path_to_uri` turned it into
+/// `file:////?/D:/...` (four slashes, a literal `?`), which KLS's `initialize`
+/// rejects as an invalid `rootUri`, failing the whole session before a single
+/// file is ever opened. A no-op string when the prefix isn't present (unix,
+/// or a caller-constructed path that was never canonicalized).
+fn strip_windows_verbatim_prefix(s: &str) -> &str {
+    s.strip_prefix(r"\\?\UNC\")
+        .or_else(|| s.strip_prefix(r"\\?\"))
+        .unwrap_or(s)
 }
 
+fn path_to_uri(path: &Path) -> String {
+    let raw = path.display().to_string();
+    let mut s = strip_windows_verbatim_prefix(&raw).replace('\\', "/");
+    if starts_with_drive_letter(&s) {
+        s.insert(0, '/');
+    }
+    format!("file://{s}")
+}
+
+/// Inverse of `path_to_uri`: strips the same verbatim prefix from `root`
+/// (so it matches the un-prefixed form baked into every URI `path_to_uri`
+/// produced) and the leading `/` before a Windows drive letter, so
+/// `Path::new` parses `/D:/repo/Foo.kt` as the drive-rooted path
+/// `D:/repo/Foo.kt` — not a root-relative path with `D:` as an ordinary
+/// segment, which `strip_prefix(root)` would never match. A no-op on unix.
 fn uri_to_rel(root: &Path, uri: &str) -> Option<String> {
     let path_str = uri.strip_prefix("file://")?;
     let decoded = percent_decode(path_str);
-    let p = Path::new(&decoded);
-    p.strip_prefix(root)
+    let decoded = decoded
+        .strip_prefix('/')
+        .filter(|rest| starts_with_drive_letter(rest))
+        .unwrap_or(&decoded);
+    let p = Path::new(decoded);
+
+    let root_raw = root.display().to_string();
+    let root_stripped = strip_windows_verbatim_prefix(&root_raw).replace('\\', "/");
+
+    p.strip_prefix(Path::new(&root_stripped))
         .ok()
         .map(|rel| rel.to_string_lossy().into_owned())
+}
+
+fn starts_with_drive_letter(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
 fn percent_decode(s: &str) -> String {
@@ -709,4 +754,74 @@ fn main() {
         .init();
 
     run_plugin(KotlinPhaseB);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Regression test for the Windows `file://` URI bug: `path_to_uri` used to
+    // emit `file://D:\repo\Foo.kt` (backslashes, no leading slash before the
+    // drive letter), which `java.net.URI.create` rejects with "Illegal
+    // character in authority" on every LSP call — KLS swallowed the exception
+    // per-request and silently returned nothing, so `documentSymbol` /
+    // `references` never produced results on Windows even with a perfectly
+    // valid project. Verified against a live `kotlin-language-server` process:
+    // the pre-fix URI shape reproduced the exact exception; the post-fix shape
+    // round-trips cleanly and KLS's own responses come back in this same form.
+    #[cfg(windows)]
+    #[test]
+    fn path_to_uri_windows_drive_path_is_a_valid_file_uri() {
+        let uri = path_to_uri(Path::new(r"D:\repo\Foo.kt"));
+        assert_eq!(uri, "file:///D:/repo/Foo.kt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_rel_windows_round_trips_through_path_to_uri() {
+        let root = Path::new(r"D:\repo");
+        let uri = path_to_uri(Path::new(r"D:\repo\src\Foo.kt"));
+        assert_eq!(uri, "file:///D:/repo/src/Foo.kt");
+        assert_eq!(uri_to_rel(root, &uri).as_deref(), Some("src/Foo.kt"));
+    }
+
+    // Regression test for the extended-length verbatim prefix: `InvokeRequest::root`
+    // arrives as `\\?\D:\...` on Windows (confirmed live via a debug probe against
+    // the real sandboxed indexer, not a synthetic case). Without stripping it,
+    // `path_to_uri` produced `file:////?/D:/...` — KLS's `initialize` rejected this
+    // `rootUri` outright, failing the whole session before any file was opened, so
+    // even the prior (bare drive-letter) URI fix alone was not sufficient on a real
+    // repo root.
+    #[cfg(windows)]
+    #[test]
+    fn path_to_uri_strips_windows_verbatim_prefix() {
+        let uri = path_to_uri(Path::new(r"\\?\D:\repo\Foo.kt"));
+        assert_eq!(uri, "file:///D:/repo/Foo.kt");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_rel_strips_verbatim_prefix_from_root() {
+        // `root` still carries the verbatim prefix (as it does in production);
+        // `uri` is what `path_to_uri` actually produced for a file under it —
+        // already prefix-free, matching what KLS itself echoes back.
+        let root = Path::new(r"\\?\D:\repo");
+        let uri = "file:///D:/repo/src/Foo.kt";
+        assert_eq!(uri_to_rel(root, uri).as_deref(), Some("src/Foo.kt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_to_uri_unix_absolute_path_unchanged() {
+        let uri = path_to_uri(Path::new("/home/user/repo/Foo.kt"));
+        assert_eq!(uri, "file:///home/user/repo/Foo.kt");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uri_to_rel_unix_round_trips_through_path_to_uri() {
+        let root = Path::new("/home/user/repo");
+        let uri = path_to_uri(Path::new("/home/user/repo/src/Foo.kt"));
+        assert_eq!(uri_to_rel(root, &uri).as_deref(), Some("src/Foo.kt"));
+    }
 }
