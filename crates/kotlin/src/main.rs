@@ -34,6 +34,7 @@
 
 use anyhow::Context as _;
 use serde_json::{json, Value};
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -71,8 +72,46 @@ static KLS_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new(
 /// sandbox layer already use for exactly this problem.
 fn kls_binary() -> Option<PathBuf> {
     KLS_BIN
-        .get_or_init(|| travsr_core::exec::tool_path("kotlin-language-server"))
+        .get_or_init(|| {
+            managed_kls().or_else(|| travsr_core::exec::tool_path("kotlin-language-server"))
+        })
         .clone()
+}
+
+/// Prefer travsr's own managed install in `~/.travsr/bin` over a possibly-stale
+/// `kotlin-language-server` on `PATH`. `tool_path` searches `PATH` first, so
+/// without this a system KLS would shadow the exact launcher
+/// `travsr lang install kotlin` wrote (a `.cmd` on Windows, a shell script on
+/// unix). Returns `None` when no managed launcher is present, falling back to
+/// the PATHEXT-aware `tool_path` search.
+fn managed_kls() -> Option<PathBuf> {
+    let dir = travsr_home()?.join(".travsr").join("bin");
+    let candidates: &[&str] = if cfg!(windows) {
+        &[
+            "kotlin-language-server.cmd",
+            "kotlin-language-server.bat",
+            "kotlin-language-server.exe",
+        ]
+    } else {
+        &["kotlin-language-server"]
+    };
+    candidates
+        .iter()
+        .map(|name| dir.join(name))
+        .find(|p| p.is_file())
+}
+
+/// The user's home directory, matching `travsr_core::exec`'s own resolution
+/// (`USERPROFILE` first on Windows, `HOME` first elsewhere).
+fn travsr_home() -> Option<PathBuf> {
+    let (primary, secondary) = if cfg!(windows) {
+        ("USERPROFILE", "HOME")
+    } else {
+        ("HOME", "USERPROFILE")
+    };
+    std::env::var_os(primary)
+        .or_else(|| std::env::var_os(secondary))
+        .map(PathBuf::from)
 }
 
 // ── Plugin ────────────────────────────────────────────────────────────────────
@@ -389,10 +428,16 @@ fn is_progress_end(msg: &Value) -> bool {
 /// rejects as an invalid `rootUri`, failing the whole session before a single
 /// file is ever opened. A no-op string when the prefix isn't present (unix,
 /// or a caller-constructed path that was never canonicalized).
-fn strip_windows_verbatim_prefix(s: &str) -> &str {
-    s.strip_prefix(r"\\?\UNC\")
-        .or_else(|| s.strip_prefix(r"\\?\"))
-        .unwrap_or(s)
+fn strip_windows_verbatim_prefix(s: &str) -> Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` denotes the UNC path `\\server\share`; keep the
+        // leading `\\` rather than degrading it to a bare relative `server\share`.
+        Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(s)
+    }
 }
 
 fn path_to_uri(path: &Path) -> String {
@@ -401,7 +446,27 @@ fn path_to_uri(path: &Path) -> String {
     if starts_with_drive_letter(&s) {
         s.insert(0, '/');
     }
-    format!("file://{s}")
+    // Percent-encode so a path with spaces (e.g. `C:\Users\First Last\repo`) or
+    // other non-URI bytes produces a URI `java.net.URI` accepts; KLS otherwise
+    // throws `URISyntaxException` per call and the session completes empty. Path
+    // separators and the drive colon stay literal.
+    format!("file://{}", percent_encode_path(&s))
+}
+
+/// Percent-encode a file-URI path body: every byte except RFC 3986 unreserved
+/// characters and the path-structural `/` and `:` becomes `%XX` (uppercase hex).
+/// Non-ASCII UTF-8 bytes are encoded too, so the result is pure ASCII.
+fn percent_encode_path(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' | b':' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// Inverse of `path_to_uri`: strips the same verbatim prefix from `root`
@@ -417,12 +482,17 @@ fn uri_to_rel(root: &Path, uri: &str) -> Option<String> {
         .strip_prefix('/')
         .filter(|rest| starts_with_drive_letter(rest))
         .unwrap_or(&decoded);
-    let p = Path::new(decoded);
+    // Case-fold the drive letter: KLS may echo a lowercase drive (`file:///d:/…`)
+    // while `root` was sent with an uppercase one, and `strip_prefix` is
+    // exact-case — without this every location silently misses (nodes=0).
+    let decoded = normalize_drive_letter(decoded);
+    let p = Path::new(decoded.as_ref());
 
     let root_raw = root.display().to_string();
     let root_stripped = strip_windows_verbatim_prefix(&root_raw).replace('\\', "/");
+    let root_stripped = normalize_drive_letter(&root_stripped);
 
-    p.strip_prefix(Path::new(&root_stripped))
+    p.strip_prefix(Path::new(root_stripped.as_ref()))
         .ok()
         .map(|rel| rel.to_string_lossy().into_owned())
 }
@@ -432,25 +502,39 @@ fn starts_with_drive_letter(s: &str) -> bool {
     b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
 }
 
+/// Upper-case a leading Windows drive letter (`d:/…` → `D:/…`) so two spellings
+/// of the same drive compare equal; a no-op on paths without a drive letter.
+fn normalize_drive_letter(s: &str) -> Cow<'_, str> {
+    if starts_with_drive_letter(s) && s.as_bytes()[0].is_ascii_lowercase() {
+        let mut owned = s.to_string();
+        owned[..1].make_ascii_uppercase();
+        Cow::Owned(owned)
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
 fn percent_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // A `%XX` escape decodes to one byte; accumulate raw bytes and interpret
+        // the whole buffer as UTF-8 at the end so a multi-byte sequence like
+        // `%C3%A9` becomes `é` rather than two mojibake chars.
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(decoded) = u8::from_str_radix(
-                std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or("00"),
-                16,
-            ) {
-                out.push(decoded as char);
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
                 i += 3;
                 continue;
             }
         }
-        out.push(bytes[i] as char);
+        out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ── Parse helpers ─────────────────────────────────────────────────────────────
@@ -823,5 +907,37 @@ mod tests {
         let root = Path::new("/home/user/repo");
         let uri = path_to_uri(Path::new("/home/user/repo/src/Foo.kt"));
         assert_eq!(uri_to_rel(root, &uri).as_deref(), Some("src/Foo.kt"));
+    }
+
+    // A user-profile path with a space (`C:\Users\First Last\…`, the most common
+    // Windows layout) must percent-encode to a URI `java.net.URI` accepts, and
+    // still round-trip back to the correct relative path.
+    #[cfg(windows)]
+    #[test]
+    fn path_to_uri_percent_encodes_spaces_and_round_trips() {
+        let root = Path::new(r"D:\Users\First Last\repo");
+        let uri = path_to_uri(Path::new(r"D:\Users\First Last\repo\src\Foo.kt"));
+        assert_eq!(uri, "file:///D:/Users/First%20Last/repo/src/Foo.kt");
+        assert_eq!(uri_to_rel(root, &uri).as_deref(), Some("src/Foo.kt"));
+    }
+
+    // KLS may echo a lowercase drive letter while `root` carries an uppercase
+    // one; the match must be case-insensitive on the drive or every location is
+    // silently dropped.
+    #[cfg(windows)]
+    #[test]
+    fn uri_to_rel_case_folds_drive_letter() {
+        let root = Path::new(r"D:\repo");
+        let uri = "file:///d:/repo/src/Foo.kt";
+        assert_eq!(uri_to_rel(root, uri).as_deref(), Some("src/Foo.kt"));
+    }
+
+    #[test]
+    fn percent_decode_is_utf8_correct() {
+        assert_eq!(percent_decode("a%20b"), "a b");
+        // `%C3%A9` is the two-byte UTF-8 encoding of `é`, not two chars.
+        assert_eq!(percent_decode("caf%C3%A9"), "café");
+        // A malformed escape is left literal rather than decoded to NUL.
+        assert_eq!(percent_decode("100%zz"), "100%zz");
     }
 }
