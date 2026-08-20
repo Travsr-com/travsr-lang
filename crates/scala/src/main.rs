@@ -143,24 +143,6 @@ fn find_semanticdb_files(sbt_root: &Path) -> Vec<PathBuf> {
     found
 }
 
-fn debug_log(msg: &str) {
-    if let Some(home) = std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-    {
-        let dir = home.join(".sbt");
-        let _ = std::fs::create_dir_all(&dir);
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(dir.join("scala-wrapper-debug.log"))
-        {
-            let _ = writeln!(f, "{msg}");
-        }
-    }
-}
-
 /// `InvokeRequest::root` arrives on Windows already canonicalized with the
 /// extended-length verbatim prefix, e.g. `\\?\D:\repo`, not a plain drive
 /// path (same shape as the Kotlin wrapper's `strip_windows_verbatim_prefix`,
@@ -171,72 +153,54 @@ fn debug_log(msg: &str) {
 /// identity, and `WindowsLinkSupport.getRealPath` throws
 /// `AccessDeniedException` on a `\\?\`-prefixed path under the sandbox (empty
 /// stdout, no compile ever attempted). A no-op when the prefix isn't present.
-fn strip_windows_verbatim_prefix(s: &str) -> &str {
-    s.strip_prefix(r"\\?\UNC\")
-        .or_else(|| s.strip_prefix(r"\\?\"))
-        .unwrap_or(s)
+fn strip_windows_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` denotes the UNC path `\\server\share`; keep the
+        // leading `\\` rather than degrading it to a bare relative `server\share`.
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Terminate a spawned build process and its descendants. On Windows,
+/// `Child::kill` terminates only the immediate child (the launcher), leaving the
+/// sbt/JVM grandchildren running; `taskkill /T` kills the whole tree.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let root_str = root.display().to_string();
-    let root = Path::new(strip_windows_verbatim_prefix(&root_str));
-    debug_log("run_semanticdb: enter");
+    let root_stripped = strip_windows_verbatim_prefix(&root_str);
+    let root = Path::new(root_stripped.as_ref());
     let sbt_bin = find_sbt().ok_or_else(|| {
         anyhow::anyhow!(
             "sbt not found — install via SDKMAN! (sdk install sbt), \
              Coursier (cs install sbt), or Homebrew (brew install sbt)"
         )
     })?;
-    debug_log(&format!("sbt_bin={}", sbt_bin.display()));
 
     let sbt_root = find_sbt_root(root, 4)
         .ok_or_else(|| anyhow::anyhow!("no build.sbt found under {}", root.display()))?;
     tracing::info!(sbt_root = %sbt_root.display(), "found sbt project root");
-    debug_log(&format!("sbt_root={}", sbt_root.display()));
 
     let settings_path = sbt_root.join(SETTINGS_FILE);
-    if let Err(e) = std::fs::write(&settings_path, SETTINGS_CONTENT) {
-        debug_log(&format!("settings write failed: {e:?}"));
-        return Err(e).with_context(|| format!("writing {}", settings_path.display()));
-    }
-    debug_log("settings write OK");
-
-    debug_log(&format!(
-        "canonicalize(sbt_root) -> {:?}",
-        std::fs::canonicalize(&sbt_root)
-    ));
-    debug_log(&format!(
-        "env HOME={:?} USERPROFILE={:?} LOCALAPPDATA={:?} APPDATA={:?} TEMP={:?} TMP={:?} PATH={:?}",
-        std::env::var("HOME"),
-        std::env::var("USERPROFILE"),
-        std::env::var("LOCALAPPDATA"),
-        std::env::var("APPDATA"),
-        std::env::var("TEMP"),
-        std::env::var("TMP"),
-        std::env::var("PATH"),
-    ));
-    {
-        use std::net::ToSocketAddrs;
-        let resolved = "repo1.maven.org:443"
-            .to_socket_addrs()
-            .map(|it| it.collect::<Vec<_>>());
-        debug_log(&format!("dns resolve repo1.maven.org:443 -> {resolved:?}"));
-        if let Ok(addrs) = &resolved {
-            if let Some(addr) = addrs.first() {
-                let conn =
-                    std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(10));
-                debug_log(&format!(
-                    "tcp connect {addr} -> ok={} err={:?}",
-                    conn.is_ok(),
-                    conn.err()
-                ));
-            }
-        }
-    }
+    std::fs::write(&settings_path, SETTINGS_CONTENT)
+        .with_context(|| format!("writing {}", settings_path.display()))?;
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
     let result = run_sbt_compile(&sbt_root, sbt_bin, deadline);
-    debug_log(&format!("run_sbt_compile: {result:?}"));
 
     let _ = std::fs::remove_file(&settings_path);
 
@@ -247,11 +211,6 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     );
 
     let semanticdb_files = find_semanticdb_files(&sbt_root);
-    debug_log(&format!(
-        "find_semanticdb_files under {} -> {:?}",
-        sbt_root.join("target").display(),
-        semanticdb_files
-    ));
     tracing::info!("found {} .semanticdb files", semanticdb_files.len());
 
     let mut all_docs = Vec::new();
@@ -316,16 +275,17 @@ fn run_sbt_compile(
         match child.try_wait().context("polling sbt")? {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 anyhow::bail!("sbt compile timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(500)),
         }
     };
 
-    let stdout_out = out_h.join().unwrap_or_default();
+    // Join the stdout drain thread so its pipe is fully consumed (the drain is
+    // what prevents the pipe-buffer deadlock); the content itself is unused.
+    let _ = out_h.join();
     let stderr_out = err_h.join().unwrap_or_default();
-    debug_log(&format!("stdout=[{stdout_out}]"));
     Ok((status, stderr_out))
 }
 
@@ -786,6 +746,27 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strip_verbatim_prefix_handles_drive_unc_and_plain() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\D:\repo").as_ref(),
+            r"D:\repo"
+        );
+        // UNC verbatim form keeps its leading `\\`, not a relative `server\share`.
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo").as_ref(),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"D:\repo").as_ref(),
+            r"D:\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/home/u/repo").as_ref(),
+            "/home/u/repo"
+        );
+    }
 
     fn sym(symbol: &str, kind: u32) -> SymbolInfo {
         SymbolInfo {
