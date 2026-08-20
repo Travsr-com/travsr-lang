@@ -67,11 +67,13 @@ static SBT_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new(
 fn find_sbt() -> Option<&'static PathBuf> {
     SBT_BIN
         .get_or_init(|| {
-            // 1. PATH — filesystem scan avoids spawning sbt's JVM just for discovery
-            if std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .any(|d| d.join("sbt").exists())
-            {
-                return Some(PathBuf::from("sbt"));
+            // 1. PATH / ~/.travsr/bin, PATHEXT-aware — a bare `d.join("sbt").exists()`
+            // probe finds the POSIX shim sbt ships alongside `sbt.bat` on Windows (a
+            // `#!/usr/bin/env bash` script CreateProcess cannot run), the same bug
+            // shape as K6/#502. `tool_path` prefers `sbt.bat` there and degrades to
+            // the bare name on unix, with no JVM spawn either way.
+            if let Some(p) = travsr_core::exec::tool_path("sbt") {
+                return Some(p);
             }
             let home = std::env::var_os("HOME").map(PathBuf::from)?;
             // 2. SDKMAN! — sdk install sbt
@@ -141,24 +143,93 @@ fn find_semanticdb_files(sbt_root: &Path) -> Vec<PathBuf> {
     found
 }
 
+fn debug_log(msg: &str) {
+    if let Some(home) = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+    {
+        let dir = home.join(".sbt");
+        let _ = std::fs::create_dir_all(&dir);
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir.join("scala-wrapper-debug.log"))
+        {
+            let _ = writeln!(f, "{msg}");
+        }
+    }
+}
+
+/// `InvokeRequest::root` arrives on Windows already canonicalized with the
+/// extended-length verbatim prefix, e.g. `\\?\D:\repo`, not a plain drive
+/// path (same shape as the Kotlin wrapper's `strip_windows_verbatim_prefix`,
+/// see its doc comment for the general mechanism). Left unstripped and handed
+/// to `Command::current_dir`, sbt's own `bootServerSocket` — which even
+/// `--server` mode runs, to bind the IPC socket other clients could still
+/// attach to — calls `Path.toRealPath()` on the CWD to derive the socket's
+/// identity, and `WindowsLinkSupport.getRealPath` throws
+/// `AccessDeniedException` on a `\\?\`-prefixed path under the sandbox (empty
+/// stdout, no compile ever attempted). A no-op when the prefix isn't present.
+fn strip_windows_verbatim_prefix(s: &str) -> &str {
+    s.strip_prefix(r"\\?\UNC\")
+        .or_else(|| s.strip_prefix(r"\\?\"))
+        .unwrap_or(s)
+}
+
 fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+    let root_str = root.display().to_string();
+    let root = Path::new(strip_windows_verbatim_prefix(&root_str));
+    debug_log("run_semanticdb: enter");
     let sbt_bin = find_sbt().ok_or_else(|| {
         anyhow::anyhow!(
             "sbt not found — install via SDKMAN! (sdk install sbt), \
              Coursier (cs install sbt), or Homebrew (brew install sbt)"
         )
     })?;
+    debug_log(&format!("sbt_bin={}", sbt_bin.display()));
 
     let sbt_root = find_sbt_root(root, 4)
         .ok_or_else(|| anyhow::anyhow!("no build.sbt found under {}", root.display()))?;
     tracing::info!(sbt_root = %sbt_root.display(), "found sbt project root");
+    debug_log(&format!("sbt_root={}", sbt_root.display()));
 
     let settings_path = sbt_root.join(SETTINGS_FILE);
-    std::fs::write(&settings_path, SETTINGS_CONTENT)
-        .with_context(|| format!("writing {}", settings_path.display()))?;
+    if let Err(e) = std::fs::write(&settings_path, SETTINGS_CONTENT) {
+        debug_log(&format!("settings write failed: {e:?}"));
+        return Err(e).with_context(|| format!("writing {}", settings_path.display()));
+    }
+    debug_log("settings write OK");
+
+    debug_log(&format!(
+        "canonicalize(sbt_root) -> {:?}",
+        std::fs::canonicalize(&sbt_root)
+    ));
+    debug_log(&format!(
+        "env HOME={:?} USERPROFILE={:?} LOCALAPPDATA={:?} APPDATA={:?} TEMP={:?} TMP={:?} PATH={:?}",
+        std::env::var("HOME"),
+        std::env::var("USERPROFILE"),
+        std::env::var("LOCALAPPDATA"),
+        std::env::var("APPDATA"),
+        std::env::var("TEMP"),
+        std::env::var("TMP"),
+        std::env::var("PATH"),
+    ));
+    {
+        use std::net::ToSocketAddrs;
+        let resolved = "repo1.maven.org:443".to_socket_addrs().map(|it| it.collect::<Vec<_>>());
+        debug_log(&format!("dns resolve repo1.maven.org:443 -> {resolved:?}"));
+        if let Ok(addrs) = &resolved {
+            if let Some(addr) = addrs.first() {
+                let conn = std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(10));
+                debug_log(&format!("tcp connect {addr} -> ok={} err={:?}", conn.is_ok(), conn.err()));
+            }
+        }
+    }
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
     let result = run_sbt_compile(&sbt_root, sbt_bin, deadline);
+    debug_log(&format!("run_sbt_compile: {result:?}"));
 
     let _ = std::fs::remove_file(&settings_path);
 
@@ -169,6 +240,11 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     );
 
     let semanticdb_files = find_semanticdb_files(&sbt_root);
+    debug_log(&format!(
+        "find_semanticdb_files under {} -> {:?}",
+        sbt_root.join("target").display(),
+        semanticdb_files
+    ));
     tracing::info!("found {} .semanticdb files", semanticdb_files.len());
 
     let mut all_docs = Vec::new();
@@ -185,13 +261,49 @@ fn run_sbt_compile(
     sbt_bin: &Path,
     deadline: std::time::Instant,
 ) -> anyhow::Result<(std::process::ExitStatus, String)> {
+    // #S3: plain `sbt compile` uses sbt 2.x's thin-client/background-server
+    // split (`sbtn`), which talks to the server over a loopback socket. Windows
+    // AppContainer blocks loopback for a sandboxed process unless separately
+    // exempted via NetworkIsolationSetAppContainerConfig (a systemwide,
+    // admin-only setting travsr has no business changing per invoke) — the
+    // client's connect fails silently and it returns a false "success" in
+    // under a second with no compile ever run. `--server` runs sbt itself in
+    // the foreground as one process (no client/server IPC at all), so it works
+    // the same whether sandboxed or not; confirmed identical real compiles
+    // (real elapsed time, `.semanticdb` output) with and without the sandbox.
     let mut child = std::process::Command::new(sbt_bin)
-        .arg("compile")
+        .args(["--server", "compile"])
         .current_dir(sbt_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn sbt")?;
+
+    // Drain stdout/stderr on their own threads *while* sbt runs. sbt compile emits
+    // far more output than an OS pipe buffer holds; reading only after exit
+    // deadlocks (sbt blocks writing to a full pipe while we block waiting for it to
+    // exit). The reader threads finish at EOF, when sbt exits or is killed.
+    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut s) = stream {
+                let _ = s.read_to_string(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_h = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+    let err_h = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
 
     let status = loop {
         match child.try_wait().context("polling sbt")? {
@@ -204,10 +316,9 @@ fn run_sbt_compile(
         }
     };
 
-    let mut stderr_out = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_out);
-    }
+    let stdout_out = out_h.join().unwrap_or_default();
+    let stderr_out = err_h.join().unwrap_or_default();
+    debug_log(&format!("stdout=[{stdout_out}]"));
     Ok((status, stderr_out))
 }
 
