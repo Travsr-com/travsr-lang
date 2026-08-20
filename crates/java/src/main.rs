@@ -148,7 +148,8 @@ fn run_windows(req: &InvokeRequest) -> anyhow::Result<InvokeResponse> {
         .ok_or_else(|| anyhow::anyhow!("scip-java not found — run `travsr lang install java`"))?;
     let launcher = scip_java_launcher_jar(scip_java);
     let java = java_exe().context("no `java` found (set JAVA_HOME or put java on PATH)")?;
-    let jar = jar_exe().context("no `jar` found (need a JDK, not just a JRE, on JAVA_HOME/PATH)")?;
+    let jar =
+        jar_exe().context("no `jar` found (need a JDK, not just a JRE, on JAVA_HOME/PATH)")?;
 
     // Everything travsr writes goes under the sandbox-authorized scratch dir; on
     // Windows the sandbox forces TEMP/TMP there too, so a `tempdir()` fallback
@@ -354,7 +355,9 @@ fn extract_gradle_plugin_jars(
         .find(|n| {
             n.starts_with("coursier/bootstrap/launcher/jars/scip-java_2.13-") && n.ends_with(".jar")
         })
-        .context("scip-java_2.13 payload jar not found in the launcher — is this a 0.12.x scip-java?")?
+        .context(
+            "scip-java_2.13 payload jar not found in the launcher — is this a 0.12.x scip-java?",
+        )?
         .to_string();
 
     // `jar` extracts into the current directory, so run each step with cwd=dest.
@@ -520,7 +523,11 @@ fn run_to_completion(mut cmd: std::process::Command, what: &str) -> anyhow::Resu
 /// The last chunk of a subprocess's output for an error message: prefer stderr,
 /// fall back to stdout, and cap the length so a chatty build can't bloat the log.
 fn tail_lines(stderr: &str, stdout: &str) -> String {
-    let src = if stderr.trim().is_empty() { stdout } else { stderr };
+    let src = if stderr.trim().is_empty() {
+        stdout
+    } else {
+        stderr
+    };
     const MAX: usize = 4000;
     if src.len() <= MAX {
         src.to_string()
