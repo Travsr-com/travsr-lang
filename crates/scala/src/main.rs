@@ -217,12 +217,19 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     ));
     {
         use std::net::ToSocketAddrs;
-        let resolved = "repo1.maven.org:443".to_socket_addrs().map(|it| it.collect::<Vec<_>>());
+        let resolved = "repo1.maven.org:443"
+            .to_socket_addrs()
+            .map(|it| it.collect::<Vec<_>>());
         debug_log(&format!("dns resolve repo1.maven.org:443 -> {resolved:?}"));
         if let Ok(addrs) = &resolved {
             if let Some(addr) = addrs.first() {
-                let conn = std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(10));
-                debug_log(&format!("tcp connect {addr} -> ok={} err={:?}", conn.is_ok(), conn.err()));
+                let conn =
+                    std::net::TcpStream::connect_timeout(addr, std::time::Duration::from_secs(10));
+                debug_log(&format!(
+                    "tcp connect {addr} -> ok={} err={:?}",
+                    conn.is_ok(),
+                    conn.err()
+                ));
             }
         }
     }
@@ -590,6 +597,28 @@ fn is_stdlib_symbol(symbol: &str) -> bool {
         || symbol.starts_with("android/")
 }
 
+/// A SemanticDB anonymous local (`local0`, `local12`): intra-method noise with
+/// no navigable identity, like SCIP's `local N`. Dropped so it never surfaces
+/// as a graph node.
+fn is_local_symbol(symbol: &str) -> bool {
+    symbol
+        .strip_prefix("local")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A parameter descriptor (`…greet().(name)`, terminal `(name)` ending in `)`).
+/// Signature-local noise the scip-reader path already drops; mirror it here so
+/// scala matches the other languages and never emits a raw parameter node.
+fn is_parameter_descriptor(symbol: &str) -> bool {
+    symbol.ends_with(')')
+}
+
+/// Symbols that must not become graph nodes or edge endpoints: stdlib, anonymous
+/// locals, and parameter descriptors.
+fn is_noise_symbol(symbol: &str) -> bool {
+    is_stdlib_symbol(symbol) || is_local_symbol(symbol) || is_parameter_descriptor(symbol)
+}
+
 fn sdb_vname(symbol: &str, path: &str, corpus: &str) -> VName {
     VName::new(corpus, "", path, "scala", format!("sdb:{symbol}"))
 }
@@ -609,7 +638,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
     let mut def_ids: HashMap<String, NodeId> = HashMap::new();
     for doc in docs {
         for sym in &doc.symbols {
-            if is_stdlib_symbol(&sym.symbol) {
+            if is_noise_symbol(&sym.symbol) {
                 continue;
             }
             def_ids
@@ -643,7 +672,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
 
         // Emit a node for every user-defined symbol
         for sym in &doc.symbols {
-            if is_stdlib_symbol(&sym.symbol) {
+            if is_noise_symbol(&sym.symbol) {
                 continue;
             }
             let vname = sdb_vname(&sym.symbol, uri, corpus);
@@ -669,7 +698,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
             if occ.role != 1 {
                 continue; // only REFERENCEs
             }
-            if is_stdlib_symbol(&occ.symbol) {
+            if is_noise_symbol(&occ.symbol) {
                 continue;
             }
             // #299 F3: a range-less reference occurrence has no real position;
@@ -845,5 +874,50 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::RefCall));
+    }
+
+    #[test]
+    fn noise_symbol_classification() {
+        assert!(is_local_symbol("local0"));
+        assert!(is_local_symbol("local42"));
+        assert!(!is_local_symbol("locally")); // not a `local<digits>` symbol
+        assert!(!is_local_symbol("a/Caller#call()."));
+        assert!(is_parameter_descriptor("com/demo/Greeter#greet().(name)"));
+        assert!(!is_parameter_descriptor("com/demo/Greeter#greet()."));
+        assert!(!is_parameter_descriptor("com/demo/Greeter#"));
+    }
+
+    // A parameter descriptor and an anonymous local must not become nodes, refs,
+    // or edges — mirroring the scip-reader filtering so scala stops leaking raw
+    // `(name)` / `localN` symbols into the graph.
+    #[test]
+    fn parameter_and_local_symbols_are_dropped() {
+        let docs = vec![TextDocument {
+            uri: "Greeter.scala".to_string(),
+            symbols: vec![
+                sym("com/demo/Greeter#", KIND_CLASS),
+                sym("com/demo/Greeter#greet().", KIND_METHOD),
+                sym("com/demo/Greeter#greet().(name)", KIND_FIELD),
+                sym("local0", KIND_FIELD),
+            ],
+            occurrences: vec![
+                occ("com/demo/Greeter#", 0, 2),
+                occ("com/demo/Greeter#greet().", 1, 2),
+                // references to the parameter and to an anonymous local
+                occ("com/demo/Greeter#greet().(name)", 1, 1),
+                occ("local0", 1, 1),
+            ],
+        }];
+
+        let resp = build_edges(&docs, "testcorpus");
+
+        // Only the class and the method are nodes; no parameter / local node.
+        assert_eq!(resp.nodes.len(), 2);
+        assert!(resp.nodes.iter().all(
+            |n| !n.vname.signature.contains("(name)") && !n.vname.signature.contains("local0")
+        ));
+        // No ref or edge points at the dropped symbols.
+        assert!(resp.refs.is_empty());
+        assert!(resp.edges.iter().all(|e| e.kind != EdgeKind::RefCall));
     }
 }
