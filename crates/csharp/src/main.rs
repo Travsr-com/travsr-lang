@@ -24,6 +24,7 @@
 //! sidecar checks that location automatically.
 
 use anyhow::Context as _;
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use travsr_core::Language;
@@ -99,7 +100,7 @@ fn dotnet_root() -> Option<PathBuf> {
     // canonicalize resolves Homebrew's symlink but adds `\\?\` on Windows — strip
     // it, or scip-dotnet gets a `\\?\`-prefixed DOTNET_ROOT it cannot parse.
     let real = std::fs::canonicalize(&exe).unwrap_or(exe);
-    let real = PathBuf::from(strip_windows_verbatim_prefix(&real.to_string_lossy()));
+    let real = PathBuf::from(strip_windows_verbatim_prefix(&real.to_string_lossy()).as_ref());
     let dir = real.parent()?;
     // Require an actual `sdk/`: scip-dotnet runs restore/build, and Windows'
     // `C:\Program Files\dotnet` carries `host/` even when SDK-less.
@@ -168,10 +169,31 @@ fn find_project_file_bfs(root: &Path, max_depth: usize) -> Option<PathBuf> {
 /// `InvokeRequest::root` arrives canonicalized with this prefix on Windows;
 /// scip-dotnet passes `--working-directory` into `System.Uri`, which parses the
 /// `\\?\` as a UNC authority and throws `UriFormatException`. No-op elsewhere.
-fn strip_windows_verbatim_prefix(s: &str) -> &str {
-    s.strip_prefix(r"\\?\UNC\")
-        .or_else(|| s.strip_prefix(r"\\?\"))
-        .unwrap_or(s)
+fn strip_windows_verbatim_prefix(s: &str) -> Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` denotes the UNC path `\\server\share`; keep the
+        // leading `\\` rather than degrading it to a bare relative `server\share`.
+        Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Terminate a spawned build process and its descendants. On Windows,
+/// `Child::kill` terminates only the immediate child (the launcher), leaving the
+/// `dotnet`/msbuild grandchildren running; `taskkill /T` kills the whole tree.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn run_scip_dotnet(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
@@ -182,7 +204,7 @@ fn run_scip_dotnet(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> 
     // `UriFormatException: The hostname could not be parsed`. Strip it up front
     // so every path derived from `root` (the project file, the working dir) is
     // a plain drive path. No-op on unix and on already-clean paths.
-    let root_buf = PathBuf::from(strip_windows_verbatim_prefix(&root.to_string_lossy()));
+    let root_buf = PathBuf::from(strip_windows_verbatim_prefix(&root.to_string_lossy()).as_ref());
     let root = root_buf.as_path();
 
     let bin = scip_dotnet_binary().ok_or_else(|| {
@@ -217,21 +239,47 @@ fn run_scip_dotnet(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> 
 
     let mut child = cmd.spawn().context("failed to spawn scip-dotnet")?;
 
+    // Drain stdout/stderr on their own threads *while* scip-dotnet runs. It shells
+    // out to `dotnet restore`/msbuild, which emit far more than a 64 KiB OS pipe
+    // buffer holds; reading only after exit deadlocks (the child blocks writing to
+    // a full pipe while we block waiting for it to exit). The reader threads finish
+    // at EOF, when the child exits or is killed.
+    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut s) = stream {
+                let _ = s.read_to_string(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_h = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+    let err_h = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+
     let status = loop {
         match child.try_wait().context("polling scip-dotnet")? {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 anyhow::bail!("scip-dotnet timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
         }
     };
 
-    let mut stderr_out = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_out);
-    }
+    // Join the drain threads so the pipes are fully consumed.
+    let _ = out_h.join();
+    let stderr_out = err_h.join().unwrap_or_default();
 
     anyhow::ensure!(
         status.success(),
@@ -264,17 +312,25 @@ mod tests {
 
     #[test]
     fn strips_verbatim_drive_prefix() {
-        assert_eq!(strip(r"\\?\D:\com.travsr\repo"), r"D:\com.travsr\repo");
+        assert_eq!(
+            strip(r"\\?\D:\com.travsr\repo").as_ref(),
+            r"D:\com.travsr\repo"
+        );
     }
 
     #[test]
     fn strips_verbatim_unc_prefix() {
-        assert_eq!(strip(r"\\?\UNC\server\share\repo"), r"server\share\repo");
+        // `\\?\UNC\server\share` is the verbatim form of `\\server\share`; the
+        // leading `\\` must survive, not degrade to a relative `server\share`.
+        assert_eq!(
+            strip(r"\\?\UNC\server\share\repo").as_ref(),
+            r"\\server\share\repo"
+        );
     }
 
     #[test]
     fn no_op_on_plain_paths() {
-        assert_eq!(strip(r"D:\repo"), r"D:\repo");
-        assert_eq!(strip("/home/user/repo"), "/home/user/repo");
+        assert_eq!(strip(r"D:\repo").as_ref(), r"D:\repo");
+        assert_eq!(strip("/home/user/repo").as_ref(), "/home/user/repo");
     }
 }
