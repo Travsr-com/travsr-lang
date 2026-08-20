@@ -141,7 +141,7 @@ fn run_windows(req: &InvokeRequest) -> anyhow::Result<InvokeResponse> {
     // `InvokeRequest::root` arrives canonicalized with the extended-length
     // verbatim prefix (`\\?\D:\...`) on Windows. gradlew.bat and the Gradle
     // init-script cannot use a verbatim path, so strip it up front.
-    let root = PathBuf::from(strip_windows_verbatim_prefix(&req.root.to_string_lossy()));
+    let root = PathBuf::from(strip_windows_verbatim_prefix(&req.root.to_string_lossy()).as_ref());
     let root = root.as_path();
 
     let scip_java = find_scip_java()
@@ -501,7 +501,7 @@ fn run_to_completion(mut cmd: std::process::Command, what: &str) -> anyhow::Resu
         {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 anyhow::bail!("{what} timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
@@ -539,10 +539,31 @@ fn tail_lines(stderr: &str, stdout: &str) -> String {
 /// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`).
 /// `InvokeRequest::root` arrives canonicalized with this prefix on Windows;
 /// gradlew and the Gradle init-script cannot use a verbatim path. No-op elsewhere.
-fn strip_windows_verbatim_prefix(s: &str) -> &str {
-    s.strip_prefix(r"\\?\UNC\")
-        .or_else(|| s.strip_prefix(r"\\?\"))
-        .unwrap_or(s)
+fn strip_windows_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` denotes the UNC path `\\server\share`; keep the
+        // leading `\\` rather than degrading it to a bare relative `server\share`.
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Terminate a spawned build process and its descendants. On Windows,
+/// `Child::kill` terminates only the immediate child (the gradlew launcher),
+/// leaving the Gradle/JVM grandchildren running; `taskkill /T` kills the tree.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn main() {
@@ -564,24 +585,29 @@ mod tests {
     #[test]
     fn strips_verbatim_drive_prefix() {
         assert_eq!(
-            strip_windows_verbatim_prefix(r"\\?\D:\com.travsr\repo"),
+            strip_windows_verbatim_prefix(r"\\?\D:\com.travsr\repo").as_ref(),
             r"D:\com.travsr\repo"
         );
     }
 
     #[test]
     fn strips_verbatim_unc_prefix() {
+        // `\\?\UNC\server\share` is the verbatim form of `\\server\share`; the
+        // leading `\\` must survive, not degrade to a relative `server\share`.
         assert_eq!(
-            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo"),
-            r"server\share\repo"
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo").as_ref(),
+            r"\\server\share\repo"
         );
     }
 
     #[test]
     fn strip_is_noop_on_plain_paths() {
-        assert_eq!(strip_windows_verbatim_prefix(r"D:\repo"), r"D:\repo");
         assert_eq!(
-            strip_windows_verbatim_prefix("/home/u/repo"),
+            strip_windows_verbatim_prefix(r"D:\repo").as_ref(),
+            r"D:\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/home/u/repo").as_ref(),
             "/home/u/repo"
         );
     }
