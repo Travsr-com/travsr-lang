@@ -84,6 +84,10 @@ fn kls_binary() -> Option<PathBuf> {
 /// `travsr lang install kotlin` wrote (a `.cmd` on Windows, a shell script on
 /// unix). Returns `None` when no managed launcher is present, falling back to
 /// the PATHEXT-aware `tool_path` search.
+///
+/// Note (release): this makes the managed launcher win over a PATH one on unix
+/// too, where the previous bare-name lookup deferred to PATH — deliberate, so a
+/// stale system KLS cannot shadow the version travsr installed.
 fn managed_kls() -> Option<PathBuf> {
     let dir = travsr_home()?.join(".travsr").join("bin");
     let candidates: &[&str] = if cfg!(windows) {
@@ -98,7 +102,28 @@ fn managed_kls() -> Option<PathBuf> {
     candidates
         .iter()
         .map(|name| dir.join(name))
-        .find(|p| p.is_file())
+        .find(|p| is_runnable_file(p))
+}
+
+/// A regular file that is actually executable. On unix a launcher without the
+/// execute bit would be picked and then fail to spawn, so check the mode; on
+/// Windows executability is by extension (`.cmd`/`.bat`/`.exe`), so `is_file`
+/// is the right test.
+fn is_runnable_file(path: &Path) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        return std::fs::metadata(path)
+            .map(|m| m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false);
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 /// The user's home directory, matching `travsr_core::exec`'s own resolution
@@ -381,9 +406,28 @@ impl LspSession {
     fn shutdown(&mut self, deadline: Instant) {
         let _ = self.request("shutdown", json!(null), deadline);
         let _ = self.notify("exit", json!(null));
-        let _ = self.child.kill();
+        // The graceful `shutdown`/`exit` above normally lets KLS's own JVM exit;
+        // this is the hard fallback. `child.kill()` on Windows only terminates the
+        // `.cmd` shim, orphaning the java grandchild — tree-kill it so no JVM is
+        // left running.
+        kill_process_tree(&mut self.child);
         let _ = self.child.wait();
     }
+}
+
+/// Kill the launcher and its process tree. `Child::kill` terminates only the
+/// immediate child (the `.cmd`/shell launcher), leaving the KLS JVM grandchild
+/// running on Windows; `taskkill /T` kills the whole tree.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
 }
 
 fn extract_result(method: &str, msg: Value) -> anyhow::Result<Value> {
@@ -939,5 +983,35 @@ mod tests {
         assert_eq!(percent_decode("caf%C3%A9"), "café");
         // A malformed escape is left literal rather than decoded to NUL.
         assert_eq!(percent_decode("100%zz"), "100%zz");
+    }
+
+    // Encode side (not just decode): a non-ASCII path segment must be
+    // percent-encoded into a pure-ASCII URI and still round-trip back to the
+    // repo-relative path.
+    #[test]
+    fn path_to_uri_percent_encodes_non_ascii_and_round_trips() {
+        let root = Path::new(r"\\?\D:\Users\José\repo");
+        let uri = path_to_uri(Path::new(r"\\?\D:\Users\José\repo\src\Foo.kt"));
+        assert!(uri.is_ascii(), "URI must be pure ASCII, got {uri}");
+        assert!(
+            uri.contains("Jos%C3%A9"),
+            "é must be UTF-8 percent-encoded: {uri}"
+        );
+        assert_eq!(uri_to_rel(root, &uri).as_deref(), Some("src/Foo.kt"));
+    }
+
+    // A UNC repo (network mount): the `\\?\UNC\server\share` verbatim form must
+    // keep its `\\` authority and still round-trip a file under it back to the
+    // repo-relative path.
+    #[test]
+    fn uri_to_rel_unc_round_trips_through_path_to_uri() {
+        let root = Path::new(r"\\?\UNC\server\share\repo");
+        let uri = path_to_uri(Path::new(r"\\?\UNC\server\share\repo\src\Foo.kt"));
+        assert_eq!(uri_to_rel(root, &uri).as_deref(), Some("src/Foo.kt"));
+    }
+
+    #[test]
+    fn is_runnable_file_rejects_missing_path() {
+        assert!(!is_runnable_file(Path::new("/no/such/kls/launcher")));
     }
 }
