@@ -1,4 +1,4 @@
-//! Travsr Phase B — Dart semantic analysis.
+//! Travsr Phase B: Dart semantic analysis.
 //!
 //! Spawns the pre-built `travsr-dart-index-emitter` binary (compiled from
 //! `packages/dart-scip-emitter/bin/emit.dart` via `dart compile exe`) and
@@ -130,7 +130,7 @@ impl Plugin for DartPhaseB {
 
 fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let emitter = emitter_path().context(
-        "travsr-dart-index-emitter not found — \
+        "travsr-dart-index-emitter not found. \
          set $TRAVSR_DART_EMITTER or run `travsr lang install dart`",
     )?;
 
@@ -196,7 +196,7 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     );
 
     if bytes.is_empty() {
-        tracing::debug!("parse_emitter_output: output file is empty — returning default");
+        tracing::debug!("parse_emitter_output: output file is empty, returning default");
         return Ok(InvokeResponse::default());
     }
 
@@ -273,7 +273,7 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
             } else {
                 tracing::debug!(
                     sym,
-                    "parse_emitter_output: ref symbol not in def_ids — skipped"
+                    "parse_emitter_output: ref symbol not in def_ids, skipped"
                 );
             }
         }

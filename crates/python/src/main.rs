@@ -1,4 +1,4 @@
-//! Travsr Phase B — Python semantic analysis.
+//! Travsr Phase B: Python semantic analysis.
 //!
 //! Runs `scip-python index --project-name project --project-version 0.0.1 {root}`
 //! inside the ADR-017 sandbox (Standard policy) and returns call/reference edges
@@ -82,7 +82,7 @@ fn scip_python_available() -> bool {
 fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_python().ok_or_else(|| {
         anyhow::anyhow!(
-            "scip-python not found — install with: npm install -g @sourcegraph/scip-python"
+            "scip-python not found. Install with: npm install -g @sourcegraph/scip-python"
         )
     })?;
 

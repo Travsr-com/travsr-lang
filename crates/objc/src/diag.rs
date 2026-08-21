@@ -18,7 +18,7 @@ pub struct NormalizedDiagnostic {}
 /// `ObjcPhaseB::supports_inline_diagnostics()` to `true`, and update
 /// `InvokeResponse` to carry the result once RFC-016 Phase 1 merges.
 pub fn collect(
-    _tu: *mut std::ffi::c_void, // CXTranslationUnit — aliased as *mut c_void until RFC-016
+    _tu: *mut std::ffi::c_void, // CXTranslationUnit, aliased as *mut c_void until RFC-016
     _repo_root: &std::path::Path,
 ) -> Vec<NormalizedDiagnostic> {
     // TODO(RFC-016): implement when NormalizedDiagnostic lands in travsr-core.

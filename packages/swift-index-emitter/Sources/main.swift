@@ -1,4 +1,4 @@
-/// Travsr Phase B — Swift structural emitter using SwiftSyntax.
+/// Travsr Phase B: Swift structural emitter using SwiftSyntax.
 ///
 /// Parses every .swift file in <root> and emits a JSON index of definitions,
 /// call-site references, and type inheritance edges for Travsr's Phase B pipeline.
@@ -14,7 +14,7 @@
 ///   • Type inheritance / protocol conformance: class Dog: Animal, Serializable
 ///       → IsImplementation edges in Travsr graph for full blast radius.
 ///   • Unresolvable instance calls (inferred-type locals, chained calls) are
-///     omitted — a full IndexStore integration would be needed for those.
+///     omitted, since a full IndexStore integration would be needed for those.
 ///
 /// Usage:
 ///   swift-index-emitter <root-path> <output-json-path>
@@ -23,9 +23,9 @@
 ///   cd packages/swift-index-emitter && swift build -c release
 ///
 /// Symbol scheme:
-///   "swift::<TypeName>"               — class / struct / enum / protocol / actor
-///   "swift::<TypeName>.<memberName>"  — method, property, init, subscript, case
-///   "swift::<name>"                   — top-level function or variable
+///   "swift::<TypeName>"               : class / struct / enum / protocol / actor
+///   "swift::<TypeName>.<memberName>"  : method, property, init, subscript, case
+///   "swift::<name>"                   : top-level function or variable
 
 import Foundation
 import SwiftParser
@@ -170,7 +170,7 @@ final class ScipVisitor: SyntaxVisitor {
     // Scope stack for instance-call resolution.
     // Each frame maps a local name to its simple (unqualified) type name.
     // Pushed on function/init/closure entry, popped on exit.
-    // Only populated for explicitly type-annotated bindings — inferred types
+    // Only populated for explicitly type-annotated bindings. Inferred types
     // are left unresolved rather than guessed.
     private var scopeStack: [[String: String]] = []
 
@@ -261,7 +261,7 @@ final class ScipVisitor: SyntaxVisitor {
 
     /// Emit IsImplementation edges for all items in an inheritance clause.
     /// Both superclass inheritance (class Dog: Animal) and protocol conformance
-    /// (class Dog: Serializable) are emitted the same way — both make `child`
+    /// (class Dog: Serializable) are emitted the same way, since both make `child`
     /// depend on `parent` for blast radius purposes.
     private func emitInheritances(for childName: String, clause: InheritanceClauseSyntax?) {
         guard let clause = clause else { return }

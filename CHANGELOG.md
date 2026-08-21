@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] - 2026-08-22
+
+Windows Phase B for the JVM and .NET wrappers, which shipped binaries in v0.4.0 but produced nothing when run, plus graph noise-node cleanup. No API or protocol changes (#22).
+
+### Fixed
+
+- Kotlin: `travsr-lang-kotlin` produced zero symbols and zero edges on every Windows machine. Two bugs stacked. `kls_binary()` probed the bare `kotlin-language-server` name with `Path::exists()` and `Command::new`, neither of which resolves the `.cmd` launcher `travsr lang install kotlin` writes on Windows (a bare `Command::new` auto-resolves only `.exe`), so lookup always returned `None` and `run_kls()` failed silently before spawning the server. With the binary found, `path_to_uri` still built `file://` URIs with `format!("file://{}", path.display())`, which on Windows yields `file://D:\repo\Foo.kt`: backslashes and no leading slash before the drive letter, illegal in a URI authority. KLS caught the resulting `URISyntaxException` per call rather than crashing, so the session completed cleanly with nothing in it. Binary lookup now goes through `travsr_core::exec::tool_path` (the shared PATHEXT-aware resolver), and `path_to_uri`/`uri_to_rel` strip the `\\?\` verbatim prefix and normalize symmetrically to `file:///D:/...`.
+- Kotlin: `path_to_uri` percent-encodes non-unreserved bytes, so a path containing spaces produces a URI `java.net.URI` accepts instead of throwing per call. `uri_to_rel` case-folds the drive letter so a lowercase drive echoed back by KLS still matches the root, and `percent_decode` decodes into a byte buffer before `from_utf8_lossy` so multi-byte UTF-8 is not mangled and a malformed escape stays literal.
+- Kotlin: the managed `~/.travsr/bin` launcher is preferred over PATH on unix as well as Windows, so a stale system-wide KLS cannot shadow the installed version, and the launcher is now checked for the execute bit (`is_runnable_file`) instead of mere existence.
+- Java: Phase B on Windows produced zero edges regardless of whether Gradle was installed. The scip-java release travsr ships invokes the build tool by its extensionless name, which a Windows JVM's `ProcessBuilder` cannot run for `.cmd`/`.bat`, so `scip-java index` never drove the build. On Windows the wrapper now drives a Gradle build itself: it extracts scip-java's SemanticDB plugin jars from the launcher (through the JDK's own `jar` tool, since the coursier polyglot layout defeats the Rust `zip` reader's end-of-central-directory scan), runs the repo's `gradlew.bat` with a travsr-generated init script that applies the plugin and redirects build output out of the repo, converts the emitted `.semanticdb` files with `index-semanticdb`, and ingests the result. The unix path is unchanged.
+- C#: `travsr-lang-csharp` forwarded the daemon's `\\?\`-prefixed `InvokeRequest::root` straight to scip-dotnet as the project path and `--working-directory`. scip-dotnet builds a `file://` URI from it and `System.Uri` reads the `\\?\` as a UNC authority, aborting the whole index with `UriFormatException` before `dotnet restore` ran. The verbatim prefix is now stripped at the top of `run_scip_dotnet`. `scip_dotnet_binary` and `dotnet_root` also moved to `travsr_core::exec::tool_path`, replacing hand-rolled lookups that never matched a `.exe`; `dotnet_root` requires a real `sdk/` directory and falls back to `~/.dotnet` when the `dotnet` on PATH is a runtime-only host.
+- Java, C#, Scala: the wrappers read the child process's piped stdout and stderr only after it exited, so a chatty build filled the OS pipe buffer (64 KiB), the child blocked writing, and the wrapper blocked waiting for it to exit. This surfaced as a multi-minute "slow build" that the daemon watchdog then killed. All three now drain both pipes on dedicated threads while the process runs. The Java driver also drops `--debug`, which filled the buffer in about a second on its own.
+- Java, Scala, C#, Kotlin: on timeout the wrappers killed only the direct child, orphaning the Gradle, sbt, dotnet/msbuild and KLS JVM grandchildren while the drain threads waited on them. All four now kill the whole process tree (`taskkill /F /T` on Windows).
+- Java, Scala, C#, Kotlin: `strip_windows_verbatim_prefix` degraded a `\\?\UNC\server\share\...` path into a relative one by removing the leading backslashes. It now keeps them and returns `Cow`, avoiding an allocation on the common no-prefix path. Tests that asserted the degraded form were corrected.
+- Scala: parameter descriptors (`com/demo/Greeter#greet().(name)`) and anonymous locals (`localN`) leaked into the graph as raw nodes with their own ref and call edges. The scip-reader path already filtered both; the SemanticDB reader did not, so a Scala parameter showed up as a bare `(name)` node where every other language hid it. `is_local_symbol` and `is_parameter_descriptor` join the existing stdlib check in `is_noise_symbol`, applied everywhere `build_edges` previously checked `is_stdlib_symbol`.
+- scip-reader: SCIP `Parameter` descriptors (terminal `(name)`) are dropped from both the definition and the reference pass, the same treatment `local N` already got. scip-dotnet emits parameters as definitions where scip-go and scip-java do not, so they surfaced as raw `scip:...(name)` graph nodes.
+
+### Changed
+
+- Scala: removed debug scaffolding from the per-invoke path, a DNS and TCP probe to `repo1.maven.org` and an unbounded dump of the environment, PATH and build stdout to `~/.sbt/scala-wrapper-debug.log`.
+- Removed every em-dash from the repository (134 across 28 files: Rust doc comments and inline comments, the Swift and Dart emitter sources, the objc fixtures, `npm/postinstall.js`, the CI and release workflows, and the rpath guard script), per the Travsr-com house style. Each was rewritten in place with a colon, comma, period or parentheses rather than mechanically substituted. Most are comments, but the wrapper "tool not found" messages are user-facing, so their wording changes slightly (for example, `scip-go not found - install with: ...` now reads `scip-go not found. Install with: ...`). No behavior change.
+- Java: dropped the isolation-era Gradle workarounds (`--project-dir`, `--no-watch-fs`, the `GRADLE_USER_HOME` temp redirect and the jvmargs tmpdir override) and the `dbg_log` scratch logging, now that this path runs with the user's own privileges. The driver is trimmed to the minimal recipe run from the repo root.
+
 ## [0.4.1] - 2026-08-16
 
 ### Fixed
@@ -106,6 +129,10 @@ All notable changes to this project will be documented in this file.
 - Removed redundant `travsr-lang-rust`, `travsr-lang-typescript`, and `travsr-lang-lsif` crates (replaced by SCIP-native pipeline).
 - `travsr-lang-php`: pass `--output` flag explicitly to `scip-php`.
 
+[0.4.2]: https://github.com/Travsr-com/travsr-lang/compare/v0.4.1...v0.4.2
+[0.4.1]: https://github.com/Travsr-com/travsr-lang/compare/v0.4.0...v0.4.1
+[0.4.0]: https://github.com/Travsr-com/travsr-lang/compare/v0.3.0...v0.4.0
+[0.3.0]: https://github.com/Travsr-com/travsr-lang/compare/v0.2.1...v0.3.0
 [0.2.1]: https://github.com/Travsr-com/travsr-lang/compare/v0.2.0...v0.2.1
 [0.2.0]: https://github.com/Travsr-com/travsr-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/Travsr-com/travsr-lang/releases/tag/v0.1.0

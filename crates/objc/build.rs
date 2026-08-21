@@ -1,5 +1,5 @@
 // travsr-lang#17: libclang is now loaded dynamically at runtime (clang-sys
-// `runtime` feature — see Cargo.toml and src/main.rs), so the binary no longer
+// `runtime` feature, see Cargo.toml and src/main.rs), so the binary no longer
 // links against libclang.dylib and needs no baked-in RPATH.
 //
 // The previous build script emitted `-Wl,-rpath,<build-host libclang dir>`,

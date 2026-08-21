@@ -1,4 +1,4 @@
-// Category fixture — verifies that category methods map to the base class symbol.
+// Category fixture: verifies that category methods map to the base class symbol.
 // Methods here must emit `objc . . 0.0.0 NSString#...` NOT `NSString(Util)#...`.
 #import <Foundation/Foundation.h>
 

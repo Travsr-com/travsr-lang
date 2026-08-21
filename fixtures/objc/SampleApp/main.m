@@ -1,4 +1,4 @@
-// Entry-point fixture — exercises Dog, Animal, and NSString+Util.
+// Entry-point fixture: exercises Dog, Animal, and NSString+Util.
 // Verifies: C function definition (main) + cross-method call edges.
 #import <Foundation/Foundation.h>
 #import "Dog.h"

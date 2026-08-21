@@ -9,7 +9,7 @@
 //!   C function                          → `functionName().`
 //!   Property                            → `ClassName#propertyName.`
 //!
-//! Category methods always resolve to the *base class* symbol — the caller is
+//! Category methods always resolve to the *base class* symbol. The caller is
 //! responsible for passing the base class name, not the category name.
 
 /// SCIP symbol for an ObjC @interface / @implementation declaration.

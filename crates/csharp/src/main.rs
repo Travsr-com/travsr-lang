@@ -1,4 +1,4 @@
-//! Travsr Phase B — C# semantic analysis.
+//! Travsr Phase B: C# semantic analysis.
 //!
 //! Runs `scip-dotnet index <project> --output {scratch}/index.scip
 //!      --working-directory {root}` and returns call/reference edges to the
@@ -20,7 +20,7 @@
 //! ```
 //!
 //! Install: `dotnet tool install --global scip-dotnet`
-//! The binary lands in `~/.dotnet/tools/` which may not be on PATH — this
+//! The binary lands in `~/.dotnet/tools/` which may not be on PATH, so this
 //! sidecar checks that location automatically.
 
 use anyhow::Context as _;
@@ -69,7 +69,7 @@ static SCIP_DOTNET_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLo
 /// `~/.dotnet/tools/`, which is often not on PATH on non-interactive shells (CI,
 /// daemon invocations). `travsr_core::exec::tool_path` resolves PATH (PATHEXT-
 /// aware on Windows, so it matches `scip-dotnet.exe`) AND `~/.dotnet/tools`, so
-/// it finds the tool whether or not that dir is on PATH — the hand-rolled
+/// it finds the tool whether or not that dir is on PATH. The hand-rolled
 /// fallback used to check `~/.dotnet/tools/scip-dotnet` with no `.exe` and so
 /// always missed on Windows.
 fn scip_dotnet_binary() -> Option<&'static PathBuf> {
@@ -97,7 +97,7 @@ fn dotnet_root() -> Option<PathBuf> {
     // PATHEXT-aware resolve so `dotnet.exe` is found on Windows (the old
     // `dir.join("dotnet")` never matched there); also checks `~/.dotnet/tools`.
     let exe = travsr_core::exec::tool_path("dotnet")?;
-    // canonicalize resolves Homebrew's symlink but adds `\\?\` on Windows — strip
+    // canonicalize resolves Homebrew's symlink but adds `\\?\` on Windows, so strip
     // it, or scip-dotnet gets a `\\?\`-prefixed DOTNET_ROOT it cannot parse.
     let real = std::fs::canonicalize(&exe).unwrap_or(exe);
     let real = PathBuf::from(strip_windows_verbatim_prefix(&real.to_string_lossy()).as_ref());
@@ -157,7 +157,7 @@ fn find_project_file_bfs(root: &Path, max_depth: usize) -> Option<PathBuf> {
                 queue.push_back((path, depth + 1));
             }
         }
-        // Early-exit once we have a solution file — no need to search deeper.
+        // Early-exit once we have a solution file, no need to search deeper.
         if sln.is_some() {
             break;
         }
@@ -209,7 +209,7 @@ fn run_scip_dotnet(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> 
 
     let bin = scip_dotnet_binary().ok_or_else(|| {
         anyhow::anyhow!(
-            "scip-dotnet not found — install with: dotnet tool install --global scip-dotnet"
+            "scip-dotnet not found. Install with: dotnet tool install --global scip-dotnet"
         )
     })?;
 

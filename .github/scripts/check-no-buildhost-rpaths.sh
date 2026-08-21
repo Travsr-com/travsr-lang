@@ -40,7 +40,7 @@ check_macho() {
   while IFS= read -r rp; do
     [ -z "$rp" ] && continue
     case "$rp" in
-      @*) : ;; # relocatable — OK
+      @*) : ;; # relocatable, OK
       /Applications/Xcode*|/Users/*|/Library/Developer/*|/opt/homebrew/Cellar/*|/usr/local/Cellar/*)
         echo "FAIL: $bin carries a build-host absolute rpath: $rp" >&2
         this_fail=1 ;;
@@ -61,7 +61,7 @@ check_elf() {
   local this_fail=0
   command -v readelf >/dev/null 2>&1 || { echo "note: readelf missing, skipping $bin" >&2; return; }
 
-  # 1. No DT_NEEDED dependency on libclang — the Linux analogue of the otool -L
+  # 1. No DT_NEEDED dependency on libclang, the Linux analogue of the otool -L
   #    check, so the script's headline claim ("fails on a link-time libclang
   #    dependency") holds on Linux too, not only Darwin (review finding 6).
   local needed
@@ -80,7 +80,7 @@ check_elf() {
   while IFS= read -r rp; do
     [ -z "$rp" ] && continue
     case "$rp" in
-      *'$ORIGIN'*) : ;; # relocatable — OK
+      *'$ORIGIN'*) : ;; # relocatable, OK
       /home/*|/opt/*|/root/*|/Users/*)
         echo "FAIL: $bin carries a build-host absolute rpath: $rp" >&2
         this_fail=1 ;;

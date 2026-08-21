@@ -74,7 +74,7 @@ async function main() {
   const target = platformTarget();
   if (!target) {
     console.warn(
-      `travsr-plugin: ${binaryName} has no binary for ${process.platform}/${process.arch} — Phase B unavailable on this platform`
+      `travsr-plugin: ${binaryName} has no binary for ${process.platform}/${process.arch}, Phase B unavailable on this platform`
     );
     return;
   }
@@ -124,7 +124,7 @@ async function main() {
         execSync('dart pub get', { cwd: shareTarget, stdio: 'pipe' });
         console.log(`travsr-plugin: dart pub get completed in ${shareTarget}`);
       } catch (_) {
-        console.warn('travsr-plugin: dart pub get failed — dart emitter requires dart on PATH at runtime');
+        console.warn('travsr-plugin: dart pub get failed. The dart emitter requires dart on PATH at runtime');
       }
     }
   }
