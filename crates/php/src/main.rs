@@ -1,4 +1,4 @@
-//! Travsr Phase B — PHP semantic analysis.
+//! Travsr Phase B: PHP semantic analysis.
 //!
 //! Runs `scip-php {root}` inside the ADR-017 sandbox (Standard policy) and
 //! returns call/reference edges to the Travsr daemon via the plugin protocol.
@@ -84,7 +84,7 @@ fn scip_php_available() -> bool {
 fn run_scip_php(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_php().ok_or_else(|| {
         anyhow::anyhow!(
-            "scip-php not found — see https://github.com/davidrjenni/scip-php \
+            "scip-php not found. See https://github.com/davidrjenni/scip-php \
              (composer require --dev davidrjenni/scip-php, then place vendor/bin/scip-php in ~/.travsr/bin/)"
         )
     })?;

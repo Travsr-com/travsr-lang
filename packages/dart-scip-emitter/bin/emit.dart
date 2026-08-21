@@ -1,4 +1,4 @@
-/// Travsr Phase B — Dart semantic emitter.
+/// Travsr Phase B: Dart semantic emitter.
 ///
 /// Walks every .dart file under <root-path> using package:analyzer (the same
 /// engine that powers `dart analyze`) and emits a JSON document that travsr's
@@ -105,7 +105,7 @@ Future<void> main(List<String> args) async {
   );
 }
 
-/// Skip generated files — they bloat the graph with synthetic symbols.
+/// Skip generated files: they bloat the graph with synthetic symbols.
 bool _isGenerated(String path) {
   final base = p.basename(path);
   return base.endsWith('.g.dart') ||
@@ -292,7 +292,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   @override
   void visitNamedType(NamedType node) {
-    // Type-position references — the dominant way a typed library's public API
+    // Type-position references, the dominant way a typed library's public API
     // is used: `Request request`, `FutureOr<Response>`, `Middleware m`, generic
     // arguments, and `extends`/`implements`/`with`/`on` clauses. Without this
     // every type used in type position had zero references (the C1 root cause).

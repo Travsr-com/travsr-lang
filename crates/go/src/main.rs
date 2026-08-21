@@ -1,4 +1,4 @@
-//! Travsr Phase B — Go semantic analysis.
+//! Travsr Phase B: Go semantic analysis.
 //!
 //! Runs `scip-go index --output {scratch}/index.scip ./...` (cwd = root) inside
 //! the ADR-017 sandbox (Standard policy) and returns call/reference edges to the
@@ -85,7 +85,7 @@ fn scip_go_available() -> bool {
 fn run_scip_go(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_go().ok_or_else(|| {
         anyhow::anyhow!(
-            "scip-go not found — install with: go install github.com/scip-code/scip-go/cmd/scip-go@latest"
+            "scip-go not found. Install with: go install github.com/scip-code/scip-go/cmd/scip-go@latest"
         )
     })?;
 

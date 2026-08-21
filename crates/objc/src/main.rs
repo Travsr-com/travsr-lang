@@ -1,10 +1,10 @@
-//! Travsr Phase B — Objective-C semantic analysis via libclang.
+//! Travsr Phase B: Objective-C semantic analysis via libclang.
 //!
 //! Uses libclang directly (via `clang-sys`) to parse `.m` / `.mm` / `.h` files,
 //! builds a SCIP protobuf index in memory, writes it to the sandbox-granted
 //! scratch dir, and ingests it via the shared `travsr-lang-scip-reader`.
 //!
-//! No external tool is required — the emitter is self-contained as long as
+//! No external tool is required: the emitter is self-contained as long as
 //! Xcode Command Line Tools are installed (macOS only; returns `false` from
 //! `supports_phase_b` on other platforms).
 //!
@@ -82,13 +82,13 @@ impl Plugin for ObjcPhaseB {
 
 /// Directory containing this machine's active `libclang.dylib`.
 ///
-/// Resolved at runtime — never from the build host. Order: `LIBCLANG_PATH`,
+/// Resolved at runtime, never from the build host. Order: `LIBCLANG_PATH`,
 /// then the active toolchain via `xcrun --find clang` (works for both Command
 /// Line Tools and a full Xcode.app, wherever installed), then well-known
 /// fallbacks.
 #[cfg(target_os = "macos")]
 fn active_libclang_dir() -> Option<std::path::PathBuf> {
-    // 1. Explicit override — a file path or a directory.
+    // 1. Explicit override, either a file path or a directory.
     if let Some(p) = std::env::var_os("LIBCLANG_PATH") {
         let raw = std::path::PathBuf::from(p);
         let dir = if raw.is_file() {
@@ -144,7 +144,7 @@ fn active_libclang_dir() -> Option<std::path::PathBuf> {
 /// clang-sys's `load_manually` honors `LIBCLANG_PATH`; we set it from the
 /// resolved toolchain dir when the user has not set it explicitly. Called once
 /// from `main()` before any thread is spawned, so this process-global env
-/// mutation is race-free (travsr-lang#17, review finding 3 — `set_var` races
+/// mutation is race-free (travsr-lang#17, review finding 3: `set_var` races
 /// with concurrent `getenv` and is `unsafe` from edition 2024 onward).
 #[cfg(target_os = "macos")]
 fn init_libclang_env() {
@@ -216,7 +216,7 @@ fn run_emitter(
 
     // travsr-lang#17: dlopen libclang before any FFI. clang-sys stores the
     // handle in thread-local storage, so it must be installed on the visitor
-    // thread itself (review finding 1) — loading it here would leave the spawned
+    // thread itself (review finding 1). Loading it here would leave the spawned
     // thread's TLS empty and panic on its first `clang_*` call.
     let lib = shared_libclang()?;
 
@@ -248,7 +248,7 @@ fn run_emitter(
 
     if bytes.is_empty() {
         tracing::info!(
-            "empty SCIP index — no ObjC symbols found under {}",
+            "empty SCIP index, no ObjC symbols found under {}",
             root.display()
         );
         return Ok(InvokeResponse::default());
@@ -286,8 +286,8 @@ fn main() {
 // ── Tests ───────────────────────────────────────────────────────────────────
 //
 // travsr-lang#17, review finding 2: every line of the libclang load path is
-// behind `#[cfg(target_os = "macos")]`, so it is only ever compiled — let alone
-// run — on macOS. This test drives the full `run_emitter` path (including the
+// behind `#[cfg(target_os = "macos")]`, so it is only ever compiled (let alone
+// run) on macOS. This test drives the full `run_emitter` path (including the
 // spawned visitor thread that performs the FFI) over a real `.m` fixture and
 // asserts a nonzero symbol count. It is the guard that would have caught the
 // original cross-thread bug, where libclang was loaded on the calling thread
@@ -335,7 +335,7 @@ mod tests {
         // produced symbols. Under the cross-thread bug this would be empty.
         assert!(
             !resp.nodes.is_empty(),
-            "objc emitter produced zero symbols over a real .m file — the \
+            "objc emitter produced zero symbols over a real .m file, the \
              libclang load path is broken (likely loaded on the wrong thread)"
         );
     }

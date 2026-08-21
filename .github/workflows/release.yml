@@ -145,7 +145,7 @@ jobs:
       - name: Locate libclang and set runtime path
         run: |
           # travsr-lang#17: the emitter dlopens libclang at runtime, so it needs
-          # only LIBCLANG_PATH. No DYLD_LIBRARY_PATH — there is no link-time
+          # only LIBCLANG_PATH. No DYLD_LIBRARY_PATH: there is no link-time
           # dependency to satisfy, and the shipped binary must carry no libclang
           # load command (enforced by check-no-buildhost-rpaths.sh below).
           CLANG_BIN=$(xcrun --find clang)

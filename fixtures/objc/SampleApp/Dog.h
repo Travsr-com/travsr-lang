@@ -1,4 +1,4 @@
-// Subclass fixture — inherits Animal, conforms to Speakable.
+// Subclass fixture: inherits Animal, conforms to Speakable.
 // Verifies: IsImplementation(Animal#) + IsImplementation(Speakable/).
 #import "Animal.h"
 #import "Speakable.h"

@@ -1,8 +1,8 @@
-//! Travsr Phase B — Kotlin semantic analysis via kotlin-language-server (KLS).
+//! Travsr Phase B: Kotlin semantic analysis via kotlin-language-server (KLS).
 //!
 //! Instead of wrapping Maven/Gradle directly, this sidecar drives KLS over
 //! stdio using LSP.  KLS auto-detects the build system, resolves the
-//! classpath, and answers full symbol + reference queries — regardless of
+//! classpath, and answers full symbol + reference queries, regardless of
 //! whether the project uses Maven or Gradle.
 //!
 //! ## Protocol flow
@@ -27,7 +27,7 @@
 //!
 //! ```text
 //! travsr lang approve kotlin --approved-by <pse> \
-//!   --reason "KLS semantic analysis — build-system agnostic" \
+//!   --reason "KLS semantic analysis, build-system agnostic" \
 //!   --permitted-hosts repo1.maven.org,plugins.gradle.org
 //! travsr lang add kotlin
 //! ```
@@ -63,8 +63,8 @@ static KLS_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new(
 /// `travsr lang install kotlin` writes a platform-appropriate launcher into
 /// `~/.travsr/bin`: a `#!/bin/sh` script on unix, a `.cmd` on Windows (see
 /// `install_zip_binary` in travsr-cli). A bare `Path::exists()`/`Command::new`
-/// check on the extensionless name never finds the Windows `.cmd` — Windows
-/// only auto-resolves `.exe` implicitly, not `.cmd`/`.bat` — so this silently
+/// check on the extensionless name never finds the Windows `.cmd` (Windows
+/// only auto-resolves `.exe` implicitly, not `.cmd`/`.bat`), so this silently
 /// treated KLS as absent on every Windows machine, on both installed paths
 /// (~/.travsr/bin and PATH), and Phase B degraded to a clean 0-node response
 /// with no diagnostic. `travsr_core::exec::tool_path` is the shared,
@@ -86,7 +86,7 @@ fn kls_binary() -> Option<PathBuf> {
 /// the PATHEXT-aware `tool_path` search.
 ///
 /// Note (release): this makes the managed launcher win over a PATH one on unix
-/// too, where the previous bare-name lookup deferred to PATH — deliberate, so a
+/// too, where the previous bare-name lookup deferred to PATH. This is deliberate, so a
 /// stale system KLS cannot shadow the version travsr installed.
 fn managed_kls() -> Option<PathBuf> {
     let dir = travsr_home()?.join(".travsr").join("bin");
@@ -368,7 +368,7 @@ impl LspSession {
     /// Drain `$/progress` notifications until begin+end pair or timeout.
     /// Wait for KLS indexing to finish. Returns `Ok(true)` when the project's
     /// progress notifications ended cleanly, `Ok(false)` when the wait timed out
-    /// (KLS still indexing) so the caller can warn — references gathered against a
+    /// (KLS still indexing) so the caller can warn: references gathered against a
     /// half-built index would silently under-count (#299 F12).
     fn wait_for_progress_end(&mut self, timeout: Duration) -> anyhow::Result<bool> {
         let deadline = Instant::now() + timeout;
@@ -408,7 +408,7 @@ impl LspSession {
         let _ = self.notify("exit", json!(null));
         // The graceful `shutdown`/`exit` above normally lets KLS's own JVM exit;
         // this is the hard fallback. `child.kill()` on Windows only terminates the
-        // `.cmd` shim, orphaning the java grandchild — tree-kill it so no JVM is
+        // `.cmd` shim, orphaning the java grandchild. Tree-kill it so no JVM is
         // left running.
         kill_process_tree(&mut self.child);
         let _ = self.child.wait();
@@ -451,21 +451,21 @@ fn is_progress_end(msg: &Value) -> bool {
 
 /// `path.display()` on Windows yields backslashes and no leading slash before
 /// the drive letter (e.g. `D:\repo\Foo.kt`). `file://` + that string is not a
-/// valid URI — `java.net.URI.create` on the KLS side rejects it with
+/// valid URI. `java.net.URI.create` on the KLS side rejects it with
 /// `Illegal character in authority`, since a bare backslash and an
 /// unescaped drive-letter colon right after `//` are both illegal there. KLS
 /// swallows the exception per-call (logs it, does not crash), so every
 /// `initialize`/`didOpen`/`documentSymbol` request against a malformed URI
-/// silently produced nothing — no error propagated back to this wrapper, no
+/// silently produced nothing: no error propagated back to this wrapper, no
 /// symbols, no references, on every Windows machine. Rewriting to forward
 /// slashes plus a leading `/` before the drive letter (`file:///D:/repo/Foo.kt`)
 /// is the standard `file://` form for Windows paths and is what KLS's own
 /// `documentSymbol`/`publishDiagnostics` responses come back as. A no-op on
 /// unix, where `path.display()` already starts with `/`.
 /// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`).
-/// `repo_root`/`InvokeRequest::root` on Windows come through canonicalized —
+/// `repo_root`/`InvokeRequest::root` on Windows come through canonicalized,
 /// confirmed live via a debug probe: `root` arrives as
-/// `\\?\D:\com.travsr\testing\kotlinrepo`, not a plain drive path — so every
+/// `\\?\D:\com.travsr\testing\kotlinrepo`, not a plain drive path, so every
 /// path built from it (and every path this wrapper walks under it) carries
 /// the prefix too. Left unstripped, `path_to_uri` turned it into
 /// `file:////?/D:/...` (four slashes, a literal `?`), which KLS's `initialize`
@@ -517,7 +517,7 @@ fn percent_encode_path(s: &str) -> String {
 /// (so it matches the un-prefixed form baked into every URI `path_to_uri`
 /// produced) and the leading `/` before a Windows drive letter, so
 /// `Path::new` parses `/D:/repo/Foo.kt` as the drive-rooted path
-/// `D:/repo/Foo.kt` — not a root-relative path with `D:` as an ordinary
+/// `D:/repo/Foo.kt`, not a root-relative path with `D:` as an ordinary
 /// segment, which `strip_prefix(root)` would never match. A no-op on unix.
 fn uri_to_rel(root: &Path, uri: &str) -> Option<String> {
     let path_str = uri.strip_prefix("file://")?;
@@ -528,7 +528,7 @@ fn uri_to_rel(root: &Path, uri: &str) -> Option<String> {
         .unwrap_or(&decoded);
     // Case-fold the drive letter: KLS may echo a lowercase drive (`file:///d:/…`)
     // while `root` was sent with an uppercase one, and `strip_prefix` is
-    // exact-case — without this every location silently misses (nodes=0).
+    // exact-case, so without this every location silently misses (nodes=0).
     let decoded = normalize_drive_letter(decoded);
     let p = Path::new(decoded.as_ref());
 
@@ -670,7 +670,7 @@ fn collect_kt_recursive(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)
 
 fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let kls = kls_binary().context(
-        "kotlin-language-server not found — install at ~/.travsr/bin/kotlin-language-server",
+        "kotlin-language-server not found. Install at ~/.travsr/bin/kotlin-language-server",
     )?;
 
     let child = Command::new(&kls)
@@ -705,7 +705,7 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         deadline,
     )?;
 
-    // 2. Notify initialized — triggers KLS to start indexing the project
+    // 2. Notify initialized, which triggers KLS to start indexing the project
     session.notify("initialized", json!({}))?;
 
     // 3. Wait for KLS to finish indexing (Maven/Gradle dep resolution happens here)
@@ -773,7 +773,7 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
     // 6. Build nodes + ref/call edges
     let mut nodes: Vec<Node> = Vec::new();
-    // R6: no structural RefCall edges are built here — every reference carries
+    // R6: no structural RefCall edges are built here: every reference carries
     // a ScipRef instead (see the loop below).
     let edges: Vec<Edge> = Vec::new();
     // #299 S1: occurrence records (path:line) so the daemon populates edge_sites
@@ -835,13 +835,13 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
                 // R6 (mirrors swift/scala on this branch): every reference from
                 // `textDocument/references` carries a real line, so a ScipRef is
-                // always produced here — there is no line-less fallback case for
+                // always produced here, and there is no line-less fallback case for
                 // KLS. Emitting a structural edge from our own `find_enclosing`
                 // symbol-range heuristic alongside it would always be redundant,
                 // and the two are computed independently (KLS documentSymbol
                 // ranges here vs. the daemon's function/method-only span table
                 // in `write_scip_attributed_batch`), so they are not guaranteed
-                // to agree — confirmed producing real spurious duplicate callers
+                // to agree, confirmed producing real spurious duplicate callers
                 // on `travsr-test-fixtures/kotlin` (e.g. `class:Cat`, `class:Dog`,
                 // `sym:Zoo.animals` all also duplicated as `file`-attributed
                 // edges into `class:Animal`). The daemon's positional lookup
@@ -891,7 +891,7 @@ mod tests {
     // Regression test for the Windows `file://` URI bug: `path_to_uri` used to
     // emit `file://D:\repo\Foo.kt` (backslashes, no leading slash before the
     // drive letter), which `java.net.URI.create` rejects with "Illegal
-    // character in authority" on every LSP call — KLS swallowed the exception
+    // character in authority" on every LSP call. KLS swallowed the exception
     // per-request and silently returned nothing, so `documentSymbol` /
     // `references` never produced results on Windows even with a perfectly
     // valid project. Verified against a live `kotlin-language-server` process:
@@ -916,7 +916,7 @@ mod tests {
     // Regression test for the extended-length verbatim prefix: `InvokeRequest::root`
     // arrives as `\\?\D:\...` on Windows (confirmed live via a debug probe against
     // the real sandboxed indexer, not a synthetic case). Without stripping it,
-    // `path_to_uri` produced `file:////?/D:/...` — KLS's `initialize` rejected this
+    // `path_to_uri` produced `file:////?/D:/...`, and KLS's `initialize` rejected this
     // `rootUri` outright, failing the whole session before any file was opened, so
     // even the prior (bare drive-letter) URI fix alone was not sufficient on a real
     // repo root.
@@ -931,7 +931,7 @@ mod tests {
     #[test]
     fn uri_to_rel_strips_verbatim_prefix_from_root() {
         // `root` still carries the verbatim prefix (as it does in production);
-        // `uri` is what `path_to_uri` actually produced for a file under it —
+        // `uri` is what `path_to_uri` actually produced for a file under it,
         // already prefix-free, matching what KLS itself echoes back.
         let root = Path::new(r"\\?\D:\repo");
         let uri = "file:///D:/repo/src/Foo.kt";

@@ -22,7 +22,7 @@ Phase B is opt-in per language and per repository. Install only what you need.
 
 ## Available Language Packages
 
-All 10 external languages have working Phase B support. Install any of them via `travsr lang add <lang>` (see [Installation](#installation)).
+All 13 external languages have working Phase B support. Install any of them via `travsr lang add <lang>` (see [Installation](#installation)).
 
 | npm Package | Language(s) | Underlying Tool | Sandbox |
 |---|---|---|---|
@@ -30,17 +30,21 @@ All 10 external languages have working Phase B support. Install any of them via 
 | `@travsr-plugin/python` | Python `.py` | `scip-python` | Standard |
 | `@travsr-plugin/ruby` | Ruby `.rb` | `scip-ruby` | Standard |
 | `@travsr-plugin/php` | PHP `.php` | `scip-php` | Standard |
-| `@travsr-plugin/cpp` | C++ `.cpp .cc .cxx .hpp` | `scip-clang` | Standard |
-| `@travsr-plugin/c` | C `.c .h` | `scip-clang` | Standard |
+| `@travsr-plugin/swift` | Swift `.swift` | bundled `travsr-swift-index-emitter` (SwiftSyntax) | Standard |
+| `@travsr-plugin/objectivec` | Objective-C `.m .mm` | libclang (bundled, macOS only) | Standard |
+| `@travsr-plugin/cpp` | C++ `.cpp .cc .cxx .hpp` | `scip-clang` | NativeIpc |
+| `@travsr-plugin/c` | C `.c .h` | `scip-clang` | NativeIpc |
+| `@travsr-plugin/dart` | Dart `.dart` | bundled `travsr-dart-index-emitter` | NativeIpc |
 | `@travsr-plugin/java` | Java `.java` | `scip-java` | **RequiresElevated** |
-| `@travsr-plugin/kotlin` | Kotlin `.kt` | `scip-java` | **RequiresElevated** |
+| `@travsr-plugin/kotlin` | Kotlin `.kt .kts` | `kotlin-language-server` | **RequiresElevated** |
 | `@travsr-plugin/csharp` | C# `.cs` | `scip-dotnet` | **RequiresElevated** |
-| `@travsr-plugin/scala` | Scala `.scala` | `scip-scala` | **RequiresElevated** |
+| `@travsr-plugin/scala` | Scala `.scala .sbt` | SemanticDB via `sbt` | **RequiresElevated** |
 
 > **Built-in languages (not in this repo):** Rust and TypeScript/JavaScript Phase B is compiled into the core `travsr` binary and runs automatically, no additional install needed.
 
 **Sandbox classes:**
 - **Standard**: no network access, no dependency downloads. Enabled with a corpus trust grant.
+- **NativeIpc**: no network either, but the tool needs POSIX IPC queues or shared memory (scip-clang's parallel workers) or reads its own binary at startup (the Dart AOT emitter), neither of which macOS Seatbelt can express. This policy skips `sandbox-exec` and applies resource caps only. No PSE approval required.
 - **RequiresElevated**: build tool (Maven, Gradle, NuGet, sbt) downloads dependencies at analysis time. Requires corpus trust grant **and** explicit PSE sign-off via `travsr lang approve` (ADR-017 Rule 1).
 
 ---
@@ -58,6 +62,13 @@ travsr lang add php
 travsr lang add ruby
 travsr lang add cpp
 travsr lang add c
+travsr lang add dart
+
+# Swift and Objective-C bundle their own emitter, so there is no separate
+# underlying tool to install. Objective-C is macOS-only (it uses libclang and
+# needs Xcode Command Line Tools).
+travsr lang add swift
+travsr lang add objectivec
 ```
 
 `travsr lang add` runs `npm install -g @travsr-plugin/<lang>` automatically if the wrapper is not on PATH. After the npm install, it checks whether the underlying tool (`scip-go`, `scip-python`, etc.) is also present and prints the install command if it is not:
@@ -113,8 +124,11 @@ scala        @travsr-plugin/scala       Elevated   needs PSE approval (travsr la
 ruby         @travsr-plugin/ruby        Standard   not installed: npm install -g @travsr-plugin/ruby (experimental)
 php          @travsr-plugin/php         Standard   not installed: npm install -g @travsr-plugin/php
 csharp       @travsr-plugin/csharp      Elevated   needs PSE approval (travsr lang approve)
-cpp          @travsr-plugin/cpp         Standard   not installed: npm install -g @travsr-plugin/cpp (requires compile_commands.json)
-c            @travsr-plugin/c           Standard   not installed: npm install -g @travsr-plugin/c (requires compile_commands.json)
+cpp          @travsr-plugin/cpp         NativeIpc  not installed: npm install -g @travsr-plugin/cpp (requires compile_commands.json)
+c            @travsr-plugin/c           NativeIpc  not installed: npm install -g @travsr-plugin/c (requires compile_commands.json)
+swift        @travsr-plugin/swift       Standard   not installed: npm install -g @travsr-plugin/swift
+objectivec   @travsr-plugin/objectivec  Standard   not installed: npm install -g @travsr-plugin/objectivec (macOS only)
+dart         @travsr-plugin/dart        NativeIpc  not installed: npm install -g @travsr-plugin/dart
 ```
 
 **Three status states:**
@@ -133,10 +147,10 @@ Each language is distributed as an npm package under the `@travsr-plugin` scope.
 
 1. Detects your platform (`process.platform`) and architecture (`process.arch`)
 2. Resolves the matching pre-built Rust target triple
-3. Downloads the `travsr-lang-go-{target}` binary from the tagged GitHub Release
+3. Downloads the `travsr-lang-go-{target}` binary from the tagged GitHub Release (with an `.exe` suffix on Windows)
 4. Downloads the corresponding `.sha256` sidecar file
 5. Verifies the SHA256, aborting if the hash does not match
-6. Writes the binary to `<package>/bin/travsr-lang-go` with `chmod 0o755`
+6. Writes the binary to `<package>/bin/travsr-lang-go` (`.exe` on Windows) with `chmod 0o755`
 7. npm's `bin` field wires `travsr-lang-go` onto your PATH
 
 **Supported platforms:**
@@ -147,7 +161,10 @@ Each language is distributed as an npm package under the `@travsr-plugin` scope.
 | macOS | Apple Silicon (arm64) | `aarch64-apple-darwin` |
 | Linux | x86_64 | `x86_64-unknown-linux-gnu` |
 | Linux | arm64 | `aarch64-unknown-linux-gnu` |
-| Windows | any | Not supported: Phase B unavailable (exits gracefully) |
+| Windows | x64 | `x86_64-pc-windows-msvc` (since 0.4.0) |
+| Windows | arm64 | Not supported: Phase B unavailable (exits gracefully) |
+
+> `@travsr-plugin/objectivec` is macOS-only: it links libclang and shells out to `xcrun`, so it publishes only the two `*-apple-darwin` assets and exits gracefully everywhere else.
 
 > The `@travsr-plugin/<lang>` package installs **only the `travsr-lang-*` wrapper**. The underlying indexer (`scip-go`, `scip-python`, etc.) must be installed separately. `travsr lang add` tells you exactly what is missing.
 
@@ -182,13 +199,15 @@ Framing: 4-byte big-endian length prefix + JSON payload. Version incompatibility
 
 ### Dependencies
 
-Every package depends only on published crates, with no `[patch.crates-io]` or local path hacks:
+Every crate declares only published versions:
 
 ```toml
 [dependencies]
 travsr-plugin-sdk = "0.7.0"
 travsr-core       = "0.7.0"
 ```
+
+The workspace root carries a `[patch.crates-io]` section pointing at a sibling `../travsr` checkout, so a change to `travsr-core` or the plugin SDK can be developed and tested here before it is published. CI and the release workflow check out `Travsr-com/travsr` into `_travsr/` and rewrite those paths, so a release always builds against the pinned core, never against whatever happens to be in a contributor's sibling directory. Nothing in `crates/` depends on the patch: drop it and the workspace still resolves from crates.io.
 
 ---
 
@@ -201,11 +220,17 @@ git tag v0.1.0
 git push origin v0.1.0
 ```
 
-The release workflow (`.github/workflows/release.yml`) runs three jobs:
+The release workflow (`.github/workflows/release.yml`) runs five jobs:
 
 1. **`create-release`**: creates the GitHub Release immediately
-2. **`build` (4 parallel jobs)**: builds all 10 `travsr-lang-*` binaries for each target, strips them, computes SHA256, uploads 40 files (10 binaries + 10 `.sha256` sidecars) to the release
-3. **`publish-npm`**: after all builds complete, bumps each `package.json` version from the git tag and publishes all 10 `@travsr-plugin/<lang>` packages to npm with `--access public`
+2. **`build` (5 parallel jobs, one per target)**: builds the 12 cross-platform `travsr-lang-*` wrappers listed in `.github/wrapper-bins.txt`, strips them, computes SHA256, and uploads 24 files per target (12 binaries + 12 `.sha256` sidecars)
+3. **`build-objc-emitter` (macOS only)**: builds `travsr-lang-objectivec` separately, since it links libclang and shells out to `xcrun`. `.github/scripts/check-no-buildhost-rpaths.sh` fails the build if the binary carries a build-host absolute rpath or a link-time libclang dependency
+4. **`build-swift-emitter` / `build-dart-emitter`**: build the bundled `travsr-swift-index-emitter` and `travsr-dart-index-emitter` share artifacts
+5. **`publish-npm`**: after all builds complete, bumps each `package.json` version from the git tag and publishes all 13 `@travsr-plugin/<lang>` packages to npm with `--access public`
+
+Targets: `x86_64-apple-darwin`, `aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`.
+
+`.github/wrapper-bins.txt` is the single source of truth for the wrapper list, shared by the release build, the packaging script (`.github/scripts/package-wrappers.sh`) and the Windows CI job. It used to be three hand-synchronised bash arrays, where a name added to one and missed in another silently shipped a release the installer expects and cannot find.
 
 ---
 
@@ -325,7 +350,7 @@ PhaseBEntry {
 },
 ```
 
-Add the language binary to the build matrix in `.github/workflows/release.yml` (`BINS` arrays in `build` and `publish-npm` jobs).
+Add the wrapper binary name to `.github/wrapper-bins.txt` and the npm package to the `publish-npm` job in `.github/workflows/release.yml`. A macOS-only wrapper does not belong in `wrapper-bins.txt`; give it its own job, as `travsr-lang-objectivec` has.
 
 ### 4. Open a PR
 
@@ -339,11 +364,17 @@ Add the language binary to the build matrix in `.github/workflows/release.yml` (
 ```
 travsr-lang/
 ├── .github/
+│   ├── wrapper-bins.txt   ← single source of truth for the wrapper binary list
+│   ├── scripts/
+│   │   ├── package-wrappers.sh           ← per-target packaging + SHA256
+│   │   └── check-no-buildhost-rpaths.sh  ← objc release guard
 │   └── workflows/
-│       ├── ci.yml         ← fmt + clippy + check + test on every PR
+│       ├── ci.yml         ← fmt + clippy + check + test on every PR (incl. Windows)
 │       └── release.yml    ← cross-platform build + npm publish on v* tags
 ├── Cargo.toml             ← workspace root (travsr-plugin-sdk = "0.7.0")
+├── CHANGELOG.md
 ├── README.md
+├── packages/              ← bundled emitter sources (Swift, Dart, Obj-C)
 ├── npm/
 │   ├── postinstall.js     ← shared download/SHA256-verify/install script
 │   ├── go/                ← @travsr-plugin/go
@@ -355,7 +386,10 @@ travsr-lang/
 │   ├── php/               ← @travsr-plugin/php
 │   ├── csharp/            ← @travsr-plugin/csharp
 │   ├── cpp/               ← @travsr-plugin/cpp
-│   └── c/                 ← @travsr-plugin/c
+│   ├── c/                 ← @travsr-plugin/c
+│   ├── swift/             ← @travsr-plugin/swift
+│   ├── objectivec/        ← @travsr-plugin/objectivec
+│   └── dart/              ← @travsr-plugin/dart
 └── crates/
     ├── scip-reader/       ← shared SCIP binary-format ingestion library
     ├── go/                ← Go      (scip-go)      · Standard
@@ -363,11 +397,14 @@ travsr-lang/
     ├── php/               ← PHP     (scip-php)     · Standard
     ├── ruby/              ← Ruby    (scip-ruby)    · Standard
     ├── java/              ← Java    (scip-java)    · RequiresElevated
-    ├── kotlin/            ← Kotlin  (scip-java)    · RequiresElevated
+    ├── kotlin/            ← Kotlin  (kotlin-lsp)   · RequiresElevated
     ├── csharp/            ← C#      (scip-dotnet)  · RequiresElevated
-    ├── scala/             ← Scala   (scip-scala)   · RequiresElevated
-    ├── cpp/               ← C++     (scip-clang)   · Standard
-    └── c/                 ← C       (scip-clang)   · Standard
+    ├── scala/             ← Scala   (SemanticDB)   · RequiresElevated
+    ├── cpp/               ← C++     (scip-clang)   · NativeIpc
+    ├── c/                 ← C       (scip-clang)   · NativeIpc
+    ├── swift/             ← Swift   (SwiftSyntax)  · Standard
+    ├── objc/              ← Obj-C   (libclang)     · Standard (macOS only)
+    └── dart/              ← Dart    (dart emitter) · NativeIpc
 ```
 
 > **Note:** Rust and TypeScript/JavaScript Phase B are compiled into the core `travsr` binary, so those crates do not live in this repo.
@@ -378,7 +415,7 @@ travsr-lang/
 
 | travsr-lang | travsr-plugin-sdk | travsr-core | Protocol version |
 |---|---|---|---|
-| 0.1.x | 0.7.0 | 0.7.0 | 1 |
+| 0.1.x to 0.4.x | 0.7.0 | 0.7.0 | 1 |
 
 The plugin protocol version is checked at handshake. If the daemon and package have incompatible versions, the binary is refused at registration with a clear error, never silently mismatched.
 

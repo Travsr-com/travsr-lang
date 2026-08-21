@@ -1,4 +1,4 @@
-//! Travsr Phase B — Swift structural analysis.
+//! Travsr Phase B: Swift structural analysis.
 //!
 //! Spawns the pre-built `swift-index-emitter` binary (from
 //! `packages/swift-index-emitter`), which uses SwiftSyntax to walk all .swift
@@ -142,7 +142,7 @@ impl Plugin for SwiftPhaseB {
 
 fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let emitter = emitter_path().context(
-        "swift-index-emitter not found — run \
+        "swift-index-emitter not found. Run \
          `cd packages/swift-index-emitter && swift build -c release` \
          or set $TRAVSR_SWIFT_EMITTER",
     )?;
@@ -209,7 +209,7 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     );
 
     if bytes.is_empty() {
-        tracing::debug!("parse_emitter_output: output file is empty — returning default");
+        tracing::debug!("parse_emitter_output: output file is empty, returning default");
         return Ok(InvokeResponse::default());
     }
 
@@ -262,7 +262,7 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     // Pass 2: resolve references → RefCall edges; inheritances → IsImplementation edges.
     let mut edges: Vec<Edge> = Vec::new();
     // #299 S1: occurrence records (path:line) so the daemon populates edge_sites
-    // and find_references works — the emitter already gives us each ref's line.
+    // and find_references works, since the emitter already gives us each ref's line.
     let mut refs_out: Vec<ScipRef> = Vec::new();
 
     for doc in docs {
@@ -307,14 +307,14 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                 } else {
                     tracing::debug!(
                         sym,
-                        "parse_emitter_output: ref symbol not in def_ids — skipped"
+                        "parse_emitter_output: ref symbol not in def_ids, skipped"
                     );
                 }
             }
         }
 
         // Inheritance / protocol conformance → IsImplementation edges (child → parent).
-        // Absent in JSON produced by older emitter versions — silently skipped.
+        // Absent in JSON produced by older emitter versions, silently skipped.
         if let Some(inhs) = doc["inheritances"].as_array() {
             tracing::debug!(
                 path,
@@ -335,7 +335,7 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                         tracing::debug!(
                             child_sym,
                             parent_sym,
-                            "parse_emitter_output: inheritance parent not in def_ids — skipped"
+                            "parse_emitter_output: inheritance parent not in def_ids, skipped"
                         );
                     }
                 }
@@ -416,7 +416,7 @@ mod tests {
         // recorded for find_references only and yields no caller edge.
         //
         // NOTE: `is_call` is currently a hardcoded `true` at the sole ScipRef
-        // construction site, so this is a change detector — it catches accidental
+        // construction site, so this is a change detector: it catches accidental
         // removal of the field, not a semantic regression. When the follow-up
         // that refines per-SCIP `symbol_role` lands (flagged in e7a48ac), this
         // assertion will start failing for the *correct* reason and should be

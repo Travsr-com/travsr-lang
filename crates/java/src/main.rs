@@ -1,4 +1,4 @@
-//! Travsr Phase B — Java semantic analysis.
+//! Travsr Phase B: Java semantic analysis.
 //!
 //! On unix, runs `scip-java index --output {scratch}/index.scip {root}` and
 //! returns call/reference edges to the Travsr daemon via the plugin protocol.
@@ -88,7 +88,7 @@ static SCIP_JAVA_BIN: std::sync::OnceLock<Option<std::path::PathBuf>> = std::syn
 fn find_scip_java() -> Option<&'static std::path::PathBuf> {
     // Resolve through the shared PATHEXT-aware resolver: it checks PATH and the
     // toolchain-managed dirs (including ~/.travsr/bin, where `travsr lang install
-    // java` writes the launcher) and, on Windows, finds `scip-java.cmd` — the
+    // java` writes the launcher) and, on Windows, finds `scip-java.cmd`, the
     // generated `java -jar <asset>` launcher, since scip-java has no native
     // Windows exe. The old hand-rolled lookup checked only the extensionless
     // name: `Command::new("scip-java")` auto-resolves `.exe` but never `.cmd`,
@@ -109,7 +109,7 @@ fn scip_java_available() -> bool {
 fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_java().ok_or_else(|| {
         anyhow::anyhow!(
-            "scip-java not found — download from https://github.com/sourcegraph/scip-java/releases \
+            "scip-java not found. Download from https://github.com/sourcegraph/scip-java/releases \
              and place in ~/.travsr/bin/scip-java"
         )
     })?;
@@ -145,7 +145,7 @@ fn run_windows(req: &InvokeRequest) -> anyhow::Result<InvokeResponse> {
     let root = root.as_path();
 
     let scip_java = find_scip_java()
-        .ok_or_else(|| anyhow::anyhow!("scip-java not found — run `travsr lang install java`"))?;
+        .ok_or_else(|| anyhow::anyhow!("scip-java not found. Run `travsr lang install java`"))?;
     let launcher = scip_java_launcher_jar(scip_java);
     let java = java_exe().context("no `java` found (set JAVA_HOME or put java on PATH)")?;
     let jar =
@@ -169,7 +169,7 @@ fn run_windows(req: &InvokeRequest) -> anyhow::Result<InvokeResponse> {
              on Windows; convert the project to Gradle, or run on macOS/Linux"
         ),
         None => anyhow::bail!(
-            "no Gradle or Maven build file found under {} — cannot build for \
+            "no Gradle or Maven build file found under {}, cannot build for \
              semantic analysis",
             root.display()
         ),
@@ -282,7 +282,7 @@ fn build_gradle(
 }
 
 /// Render the SemanticDB init-script. All paths are emitted with forward slashes
-/// and no verbatim prefix — a backslash in a Groovy string literal is an escape,
+/// and no verbatim prefix: a backslash in a Groovy string literal is an escape,
 /// which is exactly what breaks scip-java's own generated init-script on Windows.
 /// `buildDir` is redirected out of the repo so the build needs no repo-write
 /// grant (the sandbox binds the repo read-only).
@@ -335,7 +335,7 @@ const PLUGIN_JAR_NAMES: [&str; 3] = [
 /// The launcher is a coursier polyglot jar (a shell preamble in front of a zip
 /// whose payload jars are STORED uncompressed). That layout defeats the Rust
 /// `zip` reader's end-of-central-directory scan, so extraction goes through the
-/// JDK's own `jar` tool — the same java.util.zip that runs the launcher — which
+/// JDK's own `jar` tool (the same java.util.zip that runs the launcher), which
 /// reads it correctly and supports selective entry extraction.
 fn extract_gradle_plugin_jars(
     jar: &Path,
@@ -356,7 +356,7 @@ fn extract_gradle_plugin_jars(
             n.starts_with("coursier/bootstrap/launcher/jars/scip-java_2.13-") && n.ends_with(".jar")
         })
         .context(
-            "scip-java_2.13 payload jar not found in the launcher — is this a 0.12.x scip-java?",
+            "scip-java_2.13 payload jar not found in the launcher. Is this a 0.12.x scip-java?",
         )?
         .to_string();
 

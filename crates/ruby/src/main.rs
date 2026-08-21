@@ -1,4 +1,4 @@
-//! Travsr Phase B — Ruby semantic analysis.
+//! Travsr Phase B: Ruby semantic analysis.
 //!
 //! Runs `scip-ruby {root}` inside the ADR-017 sandbox (Standard policy) and
 //! returns call/reference edges to the Travsr daemon via the plugin protocol.
@@ -78,7 +78,7 @@ fn scip_ruby_available() -> bool {
 fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_ruby().ok_or_else(|| {
         anyhow::anyhow!(
-            "scip-ruby not found — see https://github.com/sourcegraph/scip-ruby/releases \
+            "scip-ruby not found. See https://github.com/sourcegraph/scip-ruby/releases \
              or run: travsr lang install ruby"
         )
     })?;
@@ -118,7 +118,7 @@ fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<In
         .arg(".")
         .current_dir(root)
         // travsr-lang#17: now that scip-ruby actually indexes the checkout it
-        // emits progress/diagnostics. Nothing reads stdout, so discard it —
+        // emits progress/diagnostics. Nothing reads stdout, so discard it:
         // piping it unread would deadlock the child once its ~64KB pipe buffer
         // fills on a large repo, surfacing as a spurious 300s timeout (review
         // finding 4). stderr is piped but drained concurrently below.

@@ -12,15 +12,15 @@
 //!
 //! # What gets extracted
 //!
-//! **Nodes** — one per definition occurrence (where `symbol_roles & 1 != 0`).
+//! **Nodes**: one per definition occurrence (where `symbol_roles & 1 != 0`).
 //! Kind is inferred from `SymbolInformation.kind` (the SCIP `SymbolKind` enum)
 //! with a descriptor-suffix fallback for symbols that lack `SymbolInformation`.
 //!
-//! **Edges** — two sources:
-//! 1. `SymbolInformation.relationships` — explicit symbol-to-symbol edges
+//! **Edges**: two sources:
+//! 1. `SymbolInformation.relationships`: explicit symbol-to-symbol edges
 //!    (`is_reference` → `ref/call`, `is_implementation` → `is-implementation`).
 //! 2. Reference occurrences (`symbol_roles & 1 == 0`) resolved against the
-//!    definition table — emitted as `ref/call` edges from a synthetic file node
+//!    definition table, emitted as `ref/call` edges from a synthetic file node
 //!    to the definition node. Capped at [`MAX_REF_EDGES_PER_DOC`] per document.
 
 use anyhow::Context as _;
@@ -67,7 +67,7 @@ pub fn ingest_index(
 
     // #299 C1: C and C++ share one indexer (scip-clang) and one compile database,
     // so the `.h`-triggered C pass and the `.cpp`-triggered C++ pass both index the
-    // whole project and emit the SAME symbols — under two different language tags,
+    // whole project and emit the SAME symbols, under two different language tags,
     // producing duplicate nodes (`Animal#describe` as both `c` and `cpp`). Derive
     // each node's language from its file extension instead of the pass, so both
     // passes tag a given file identically and the duplicates collapse to one node
@@ -115,7 +115,7 @@ pub fn ingest_index(
             if (occ.symbol_roles & 1) == 0 {
                 continue;
             }
-            // G3: SCIP anonymous locals (`local N`) are intra-function noise —
+            // G3: SCIP anonymous locals (`local N`) are intra-function noise:
             // on kubernetes they are 77% of all definitions. Drop at ingest.
             if occ.symbol.starts_with("local ") {
                 continue;
@@ -162,7 +162,7 @@ pub fn ingest_index(
             // otherwise first seen.
             let is_header = is_header_path(path);
             match def_from_header.get(&occ.symbol) {
-                Some(false) => {} // already have a source def — keep it
+                Some(false) => {} // already have a source def, keep it
                 Some(true) if is_header => {}
                 _ => {
                     def_ids.insert(occ.symbol.clone(), node_id);
@@ -229,7 +229,7 @@ pub fn ingest_index(
         // #299 C1: scip-clang emits a reference occurrence at a symbol's *header
         // declaration* line (not a call site). Attributing those to a header
         // pollutes find_references with a spurious "use" on the declaration.
-        // Header occurrences for C/C++ are declarations, not call sites — skip.
+        // Header occurrences for C/C++ are declarations, not call sites, so skip.
         if c_family && is_header_path(path) {
             continue;
         }
@@ -254,7 +254,7 @@ pub fn ingest_index(
                 break;
             }
             // #299 F4: a range-less occurrence (malformed / partial SCIP)
-            // carries no real position — skip it rather than fabricating a
+            // carries no real position, so skip it rather than fabricating a
             // phantom `path:1` reference via `unwrap_or(1)`.
             let Some(start) = scip_range(occ).first().copied() else {
                 continue;
@@ -345,7 +345,7 @@ fn scip_range(occ: &scip::types::Occurrence) -> Cow<'_, [i32]> {
 
 /// Occurrence `enclosing_range` with the same dual-encoding tolerance as
 /// [`scip_range`]: the deprecated packed `int32` array (field 7), or the
-/// `typed_enclosing_range` oneof — `single_line_enclosing_range` (field 10) or
+/// `typed_enclosing_range` oneof: `single_line_enclosing_range` (field 10) or
 /// `multi_line_enclosing_range` (field 11).
 fn scip_enclosing_range(occ: &scip::types::Occurrence) -> Cow<'_, [i32]> {
     if !occ.enclosing_range.is_empty() {
@@ -384,7 +384,7 @@ fn decode_typed_range(occ: &scip::types::Occurrence, single: u32, multi: u32) ->
 ///
 /// proto3 does not serialize zero-valued scalar fields, so a missing field
 /// number means that element is 0. Fill the fixed-arity slots (defaulting to 0)
-/// rather than truncating at the first gap — otherwise an occurrence on line 0
+/// rather than truncating at the first gap. Otherwise an occurrence on line 0
 /// (the first line of a file) or starting at column 0 (a top-level declaration)
 /// would decode short or empty and its reference would be dropped (#724).
 fn parse_range_submessage(bytes: &[u8], arity: usize) -> Vec<i32> {
@@ -753,7 +753,7 @@ mod tests {
 
     /// Serialize the index to protobuf bytes and parse it back. `add_length_
     /// delimited` installs the typed range directly into `unknown_fields`, so
-    /// only a real serialize + parse proves the encoding survives the wire — and
+    /// only a real serialize + parse proves the encoding survives the wire, and
     /// it guards against a future `scip` crate bump that promotes fields 8..=11
     /// to known fields, at which point the bytes leave `unknown_fields` and this
     /// test fails loudly instead of silently passing while prod breaks.
@@ -812,7 +812,7 @@ mod tests {
         // #724 bug (a): proto3 does not serialize a zero-valued `line`, so a ref
         // on the first line of a file (line 0) has field 1 absent on the wire.
         // The decoder must read the fixed 3-element arity and default the
-        // missing element to 0, not truncate — otherwise the ref decodes to an
+        // missing element to 0, not truncate. Otherwise the ref decodes to an
         // empty range and is silently dropped, reproducing the #724 symptom.
         let sym = "scip-java maven m 1.0.0 com/example/Greeter#greet().";
         let def = java_occ(sym, 1, 8, &[3, 4, 9]);
@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(resp.refs.len(), 1, "one ScipRef");
         assert_eq!(resp.refs[0].caller_path, path);
         assert_eq!(resp.refs[0].caller_line, 3); // 0-indexed line 2 → 1-indexed 3
-                                                 // callee_id must be the definition node — the daemon resolves src at write time.
+                                                 // callee_id must be the definition node, the daemon resolves src at write time.
         assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
     }
 }

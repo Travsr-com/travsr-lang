@@ -12,7 +12,7 @@
 //!
 //! Safety contract: all `unsafe` blocks in this module cross the FFI boundary
 //! to libclang only. No raw pointer is stored beyond the scope of a single
-//! `clang_visitChildren` call chain — the client_data pointers are stack-
+//! `clang_visitChildren` call chain: the client_data pointers are stack-
 //! allocated and their lifetimes are bounded by the visit.
 
 use clang_sys::*;
@@ -117,11 +117,11 @@ pub fn build_index(root: &Path, corpus: &str, files: Option<&[String]>) -> anyho
     // could not read a required path, or no SDK resolves), not a repo that
     // legitimately has no Objective-C symbols. Returning Ok(empty) here is
     // indistinguishable from "nothing to index" and produced a silent zero-node
-    // result upstream — surface it as an error so the cause is diagnosable
+    // result upstream, so surface it as an error and the cause is diagnosable
     // (the host forwards the sidecar's stderr on a zero-node/failed invoke).
     if parsed_ok == 0 {
         anyhow::bail!(
-            "all {} Objective-C translation unit(s) failed to parse — libclang could \
+            "all {} Objective-C translation unit(s) failed to parse. libclang could \
              not process any source file; check the active toolchain/SDK and the \
              sandbox read grants",
             entries.len()
@@ -182,7 +182,7 @@ fn process_tu(
         clang_visitChildren(root_cursor, visit_top_level, &mut ctx as *mut _ as _);
     }
 
-    // Diag stub: diag::collect(tu as *mut c_void, &builder.root) — called
+    // Diag stub: diag::collect(tu as *mut c_void, &builder.root), called
     // here when RFC-016 Phase 1 lands. Currently a no-op.
 
     unsafe { clang_disposeTranslationUnit(tu) };
@@ -193,7 +193,7 @@ fn process_tu(
 
 struct VisitorCtx<'a> {
     builder: &'a mut IndexBuilder,
-    // `tu` is reserved for RFC-016 diag::collect() — held here so we can pass
+    // `tu` is reserved for RFC-016 diag::collect(), held here so we can pass
     // it without changing the callback signatures when the stub is activated.
     #[allow(dead_code)]
     tu: CXTranslationUnit,
@@ -294,7 +294,7 @@ fn handle_implementation(cursor: CXCursor, ctx: &mut VisitorCtx) {
 
     // Emit definition occurrence for the implementation too (same symbol as the
     // interface). The scip-reader last-writer-wins, so the impl line becomes the
-    // canonical node line — both definitions refer to the same NodeId.
+    // canonical node line, and both definitions refer to the same NodeId.
     if let Some((rel_path, occ)) = make_def_occurrence(cursor, &sym, &ctx.builder.root) {
         ctx.builder.add_occurrence(&rel_path, occ);
         // SymbolInformation already emitted by the @interface pass; skip here to
@@ -311,7 +311,7 @@ fn handle_category(cursor: CXCursor, kind: CXCursorKind, ctx: &mut VisitorCtx) {
     // the category name.
     let base_class = category_base_class(cursor);
     if base_class.is_empty() {
-        tracing::debug!("category cursor has no ObjCClassRef child — skipping");
+        tracing::debug!("category cursor has no ObjCClassRef child, skipping");
         return;
     }
 
@@ -344,7 +344,7 @@ fn handle_protocol(cursor: CXCursor, ctx: &mut VisitorCtx) {
         ctx.builder.add_symbol_info(&rel_path, si);
     }
 
-    // Protocol methods are ObjCMethodDecl children — emit them under the
+    // Protocol methods are ObjCMethodDecl children, emitted under the
     // protocol name (used as the "class_name" for selector scoping).
     walk_members(cursor, proto_name, ctx.builder);
 }
@@ -352,7 +352,7 @@ fn handle_protocol(cursor: CXCursor, ctx: &mut VisitorCtx) {
 // ── Member visitor (methods + properties inside a type) ───────────────────────
 
 /// Collect the `(line, col)` of every `@property` declaration under `container`,
-/// then walk its members (skipping synthesized property accessors — #596).
+/// then walk its members (skipping synthesized property accessors, #596).
 fn walk_members(container: CXCursor, class_name: String, builder: &mut IndexBuilder) {
     let mut property_locs: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
     unsafe {

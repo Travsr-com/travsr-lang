@@ -1,4 +1,4 @@
-//! Travsr Phase B — C++ semantic analysis.
+//! Travsr Phase B: C++ semantic analysis.
 //!
 //! Runs `scip-clang --compdb-path {root}/compile_commands.json --output
 //! {scratch}/index.scip` and returns call/reference edges to the Travsr daemon
@@ -89,7 +89,7 @@ fn scip_clang_available() -> bool {
 fn run_scip_clang(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_clang().ok_or_else(|| {
         anyhow::anyhow!(
-            "scip-clang not found — run: travsr lang install cpp \
+            "scip-clang not found. Run: travsr lang install cpp \
              (downloads to ~/.travsr/bin/scip-clang)"
         )
     })?;
@@ -97,7 +97,7 @@ fn run_scip_clang(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<I
     let compdb = root.join("compile_commands.json");
     if !compdb.exists() {
         tracing::info!(
-            "no compile_commands.json in {} — skipping C++ Phase B (generate with \
+            "no compile_commands.json in {}, skipping C++ Phase B (generate with \
              CMAKE_EXPORT_COMPILE_COMMANDS=ON or Bear)",
             root.display()
         );
