@@ -24,6 +24,7 @@
 //! sidecar checks that location automatically.
 
 use anyhow::Context as _;
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use travsr_core::Language;
@@ -64,33 +65,16 @@ impl Plugin for CsharpPhaseB {
 
 static SCIP_DOTNET_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 
-/// Find the scip-dotnet binary: check PATH first, then `~/.dotnet/tools/`.
-/// `dotnet tool install --global` places binaries in `~/.dotnet/tools/` which is
-/// often not added to PATH on non-interactive shells (CI, daemon invocations).
+/// Find the scip-dotnet binary. `dotnet tool install --global` places it in
+/// `~/.dotnet/tools/`, which is often not on PATH on non-interactive shells (CI,
+/// daemon invocations). `travsr_core::exec::tool_path` resolves PATH (PATHEXT-
+/// aware on Windows, so it matches `scip-dotnet.exe`) AND `~/.dotnet/tools`, so
+/// it finds the tool whether or not that dir is on PATH — the hand-rolled
+/// fallback used to check `~/.dotnet/tools/scip-dotnet` with no `.exe` and so
+/// always missed on Windows.
 fn scip_dotnet_binary() -> Option<&'static PathBuf> {
     SCIP_DOTNET_BIN
-        .get_or_init(|| {
-            if std::process::Command::new("scip-dotnet")
-                .arg("--version")
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false)
-            {
-                return Some(PathBuf::from("scip-dotnet"));
-            }
-            let candidate = std::env::var_os("HOME")
-                .map(PathBuf::from)?
-                .join(".dotnet")
-                .join("tools")
-                .join("scip-dotnet");
-            if candidate.exists() {
-                Some(candidate)
-            } else {
-                None
-            }
-        })
+        .get_or_init(|| travsr_core::exec::tool_path("scip-dotnet"))
         .as_ref()
 }
 
@@ -110,23 +94,36 @@ fn dotnet_root() -> Option<PathBuf> {
     if let Ok(v) = std::env::var("DOTNET_ROOT") {
         return Some(PathBuf::from(v));
     }
-    let exe = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|d| d.join("dotnet"))
-        .find(|p| p.is_file())?;
+    // PATHEXT-aware resolve so `dotnet.exe` is found on Windows (the old
+    // `dir.join("dotnet")` never matched there); also checks `~/.dotnet/tools`.
+    let exe = travsr_core::exec::tool_path("dotnet")?;
+    // canonicalize resolves Homebrew's symlink but adds `\\?\` on Windows — strip
+    // it, or scip-dotnet gets a `\\?\`-prefixed DOTNET_ROOT it cannot parse.
     let real = std::fs::canonicalize(&exe).unwrap_or(exe);
-    // real = …/Cellar/dotnet/<ver>/bin/dotnet
-    // parent       → …/Cellar/dotnet/<ver>/bin
-    // parent again → …/Cellar/dotnet/<ver>          (install root)
-    // join libexec → …/Cellar/dotnet/<ver>/libexec  (contains host/, sdk/, shared/)
-    let libexec = real.parent()?.parent()?.join("libexec");
-    if libexec.is_dir() {
-        Some(libexec)
-    } else {
-        // Fallback: just use the bin dir's parent — works for some distro layouts.
-        real.parent()
-            .and_then(|b| b.parent())
-            .map(|p| p.to_path_buf())
+    let real = PathBuf::from(strip_windows_verbatim_prefix(&real.to_string_lossy()).as_ref());
+    let dir = real.parent()?;
+    // Require an actual `sdk/`: scip-dotnet runs restore/build, and Windows'
+    // `C:\Program Files\dotnet` carries `host/` even when SDK-less.
+    if dir.join("sdk").is_dir() {
+        return Some(dir.to_path_buf());
     }
+    // Homebrew macOS: …/Cellar/dotnet/<ver>/bin/dotnet → …/libexec holds the SDK.
+    if let Some(libexec) = dir.parent().map(|p| p.join("libexec")) {
+        if libexec.join("sdk").is_dir() {
+            return Some(libexec);
+        }
+    }
+    // `dotnet` on PATH is a runtime-only host (no SDK): fall back to the per-user
+    // dotnet-install default that actually carries an SDK.
+    if let Some(d) = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|h| h.join(".dotnet"))
+    {
+        if d.join("sdk").is_dir() {
+            return Some(d);
+        }
+    }
+    None
 }
 
 /// Find the first `.sln` or `.csproj` under `root`, searching up to `depth` levels.
@@ -168,7 +165,48 @@ fn find_project_file_bfs(root: &Path, max_depth: usize) -> Option<PathBuf> {
     sln.or(csproj)
 }
 
+/// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`).
+/// `InvokeRequest::root` arrives canonicalized with this prefix on Windows;
+/// scip-dotnet passes `--working-directory` into `System.Uri`, which parses the
+/// `\\?\` as a UNC authority and throws `UriFormatException`. No-op elsewhere.
+fn strip_windows_verbatim_prefix(s: &str) -> Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` denotes the UNC path `\\server\share`; keep the
+        // leading `\\` rather than degrading it to a bare relative `server\share`.
+        Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        Cow::Borrowed(rest)
+    } else {
+        Cow::Borrowed(s)
+    }
+}
+
+/// Terminate a spawned build process and its descendants. On Windows,
+/// `Child::kill` terminates only the immediate child (the launcher), leaving the
+/// `dotnet`/msbuild grandchildren running; `taskkill /T` kills the whole tree.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 fn run_scip_dotnet(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+    // On Windows, `InvokeRequest::root` arrives canonicalized with the
+    // extended-length verbatim prefix (`\\?\D:\...`). scip-dotnet feeds the
+    // project / `--working-directory` path into `System.Uri`, which reads the
+    // `\\?\` as a UNC authority and aborts the whole index with
+    // `UriFormatException: The hostname could not be parsed`. Strip it up front
+    // so every path derived from `root` (the project file, the working dir) is
+    // a plain drive path. No-op on unix and on already-clean paths.
+    let root_buf = PathBuf::from(strip_windows_verbatim_prefix(&root.to_string_lossy()).as_ref());
+    let root = root_buf.as_path();
+
     let bin = scip_dotnet_binary().ok_or_else(|| {
         anyhow::anyhow!(
             "scip-dotnet not found — install with: dotnet tool install --global scip-dotnet"
@@ -201,21 +239,47 @@ fn run_scip_dotnet(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> 
 
     let mut child = cmd.spawn().context("failed to spawn scip-dotnet")?;
 
+    // Drain stdout/stderr on their own threads *while* scip-dotnet runs. It shells
+    // out to `dotnet restore`/msbuild, which emit far more than a 64 KiB OS pipe
+    // buffer holds; reading only after exit deadlocks (the child blocks writing to
+    // a full pipe while we block waiting for it to exit). The reader threads finish
+    // at EOF, when the child exits or is killed.
+    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut s) = stream {
+                let _ = s.read_to_string(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_h = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+    let err_h = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+
     let status = loop {
         match child.try_wait().context("polling scip-dotnet")? {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 anyhow::bail!("scip-dotnet timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
         }
     };
 
-    let mut stderr_out = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_out);
-    }
+    // Join the drain threads so the pipes are fully consumed.
+    let _ = out_h.join();
+    let stderr_out = err_h.join().unwrap_or_default();
 
     anyhow::ensure!(
         status.success(),
@@ -240,4 +304,33 @@ fn main() {
         .init();
 
     run_plugin(CsharpPhaseB);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_windows_verbatim_prefix as strip;
+
+    #[test]
+    fn strips_verbatim_drive_prefix() {
+        assert_eq!(
+            strip(r"\\?\D:\com.travsr\repo").as_ref(),
+            r"D:\com.travsr\repo"
+        );
+    }
+
+    #[test]
+    fn strips_verbatim_unc_prefix() {
+        // `\\?\UNC\server\share` is the verbatim form of `\\server\share`; the
+        // leading `\\` must survive, not degrade to a relative `server\share`.
+        assert_eq!(
+            strip(r"\\?\UNC\server\share\repo").as_ref(),
+            r"\\server\share\repo"
+        );
+    }
+
+    #[test]
+    fn no_op_on_plain_paths() {
+        assert_eq!(strip(r"D:\repo").as_ref(), r"D:\repo");
+        assert_eq!(strip("/home/user/repo").as_ref(), "/home/user/repo");
+    }
 }

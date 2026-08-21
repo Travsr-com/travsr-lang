@@ -67,11 +67,13 @@ static SBT_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new(
 fn find_sbt() -> Option<&'static PathBuf> {
     SBT_BIN
         .get_or_init(|| {
-            // 1. PATH — filesystem scan avoids spawning sbt's JVM just for discovery
-            if std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-                .any(|d| d.join("sbt").exists())
-            {
-                return Some(PathBuf::from("sbt"));
+            // 1. PATH / ~/.travsr/bin, PATHEXT-aware — a bare `d.join("sbt").exists()`
+            // probe finds the POSIX shim sbt ships alongside `sbt.bat` on Windows (a
+            // `#!/usr/bin/env bash` script CreateProcess cannot run), the same bug
+            // shape as K6/#502. `tool_path` prefers `sbt.bat` there and degrades to
+            // the bare name on unix, with no JVM spawn either way.
+            if let Some(p) = travsr_core::exec::tool_path("sbt") {
+                return Some(p);
             }
             let home = std::env::var_os("HOME").map(PathBuf::from)?;
             // 2. SDKMAN! — sdk install sbt
@@ -141,7 +143,47 @@ fn find_semanticdb_files(sbt_root: &Path) -> Vec<PathBuf> {
     found
 }
 
+/// `InvokeRequest::root` arrives on Windows already canonicalized with the
+/// extended-length verbatim prefix, e.g. `\\?\D:\repo`, not a plain drive
+/// path (same shape as the Kotlin wrapper's `strip_windows_verbatim_prefix`,
+/// see its doc comment for the general mechanism). Left unstripped and handed
+/// to `Command::current_dir`, sbt's own `bootServerSocket` — which even
+/// `--server` mode runs, to bind the IPC socket other clients could still
+/// attach to — calls `Path.toRealPath()` on the CWD to derive the socket's
+/// identity, and `WindowsLinkSupport.getRealPath` throws
+/// `AccessDeniedException` on a `\\?\`-prefixed path under the sandbox (empty
+/// stdout, no compile ever attempted). A no-op when the prefix isn't present.
+fn strip_windows_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        // `\\?\UNC\server\share` denotes the UNC path `\\server\share`; keep the
+        // leading `\\` rather than degrading it to a bare relative `server\share`.
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
+/// Terminate a spawned build process and its descendants. On Windows,
+/// `Child::kill` terminates only the immediate child (the launcher), leaving the
+/// sbt/JVM grandchildren running; `taskkill /T` kills the whole tree.
+fn kill_process_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("taskkill")
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+    let root_str = root.display().to_string();
+    let root_stripped = strip_windows_verbatim_prefix(&root_str);
+    let root = Path::new(root_stripped.as_ref());
     let sbt_bin = find_sbt().ok_or_else(|| {
         anyhow::anyhow!(
             "sbt not found — install via SDKMAN! (sdk install sbt), \
@@ -185,29 +227,65 @@ fn run_sbt_compile(
     sbt_bin: &Path,
     deadline: std::time::Instant,
 ) -> anyhow::Result<(std::process::ExitStatus, String)> {
+    // #S3: plain `sbt compile` uses sbt 2.x's thin-client/background-server
+    // split (`sbtn`), which talks to the server over a loopback socket. Windows
+    // AppContainer blocks loopback for a sandboxed process unless separately
+    // exempted via NetworkIsolationSetAppContainerConfig (a systemwide,
+    // admin-only setting travsr has no business changing per invoke) — the
+    // client's connect fails silently and it returns a false "success" in
+    // under a second with no compile ever run. `--server` runs sbt itself in
+    // the foreground as one process (no client/server IPC at all), so it works
+    // the same whether sandboxed or not; confirmed identical real compiles
+    // (real elapsed time, `.semanticdb` output) with and without the sandbox.
     let mut child = std::process::Command::new(sbt_bin)
-        .arg("compile")
+        .args(["--server", "compile"])
         .current_dir(sbt_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn sbt")?;
 
+    // Drain stdout/stderr on their own threads *while* sbt runs. sbt compile emits
+    // far more output than an OS pipe buffer holds; reading only after exit
+    // deadlocks (sbt blocks writing to a full pipe while we block waiting for it to
+    // exit). The reader threads finish at EOF, when sbt exits or is killed.
+    let drain = |stream: Option<Box<dyn std::io::Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            if let Some(mut s) = stream {
+                let _ = s.read_to_string(&mut buf);
+            }
+            buf
+        })
+    };
+    let out_h = drain(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+    let err_h = drain(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn std::io::Read + Send>),
+    );
+
     let status = loop {
         match child.try_wait().context("polling sbt")? {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
-                let _ = child.kill();
+                kill_process_tree(&mut child);
                 anyhow::bail!("sbt compile timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(500)),
         }
     };
 
-    let mut stderr_out = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_out);
-    }
+    // Join the stdout drain thread so its pipe is fully consumed (the drain is
+    // what prevents the pipe-buffer deadlock); the content itself is unused.
+    let _ = out_h.join();
+    let stderr_out = err_h.join().unwrap_or_default();
     Ok((status, stderr_out))
 }
 
@@ -479,6 +557,28 @@ fn is_stdlib_symbol(symbol: &str) -> bool {
         || symbol.starts_with("android/")
 }
 
+/// A SemanticDB anonymous local (`local0`, `local12`): intra-method noise with
+/// no navigable identity, like SCIP's `local N`. Dropped so it never surfaces
+/// as a graph node.
+fn is_local_symbol(symbol: &str) -> bool {
+    symbol
+        .strip_prefix("local")
+        .is_some_and(|rest| !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// A parameter descriptor (`…greet().(name)`, terminal `(name)` ending in `)`).
+/// Signature-local noise the scip-reader path already drops; mirror it here so
+/// scala matches the other languages and never emits a raw parameter node.
+fn is_parameter_descriptor(symbol: &str) -> bool {
+    symbol.ends_with(')')
+}
+
+/// Symbols that must not become graph nodes or edge endpoints: stdlib, anonymous
+/// locals, and parameter descriptors.
+fn is_noise_symbol(symbol: &str) -> bool {
+    is_stdlib_symbol(symbol) || is_local_symbol(symbol) || is_parameter_descriptor(symbol)
+}
+
 fn sdb_vname(symbol: &str, path: &str, corpus: &str) -> VName {
     VName::new(corpus, "", path, "scala", format!("sdb:{symbol}"))
 }
@@ -498,7 +598,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
     let mut def_ids: HashMap<String, NodeId> = HashMap::new();
     for doc in docs {
         for sym in &doc.symbols {
-            if is_stdlib_symbol(&sym.symbol) {
+            if is_noise_symbol(&sym.symbol) {
                 continue;
             }
             def_ids
@@ -532,7 +632,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
 
         // Emit a node for every user-defined symbol
         for sym in &doc.symbols {
-            if is_stdlib_symbol(&sym.symbol) {
+            if is_noise_symbol(&sym.symbol) {
                 continue;
             }
             let vname = sdb_vname(&sym.symbol, uri, corpus);
@@ -558,7 +658,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
             if occ.role != 1 {
                 continue; // only REFERENCEs
             }
-            if is_stdlib_symbol(&occ.symbol) {
+            if is_noise_symbol(&occ.symbol) {
                 continue;
             }
             // #299 F3: a range-less reference occurrence has no real position;
@@ -647,6 +747,27 @@ fn main() {
 mod tests {
     use super::*;
 
+    #[test]
+    fn strip_verbatim_prefix_handles_drive_unc_and_plain() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\D:\repo").as_ref(),
+            r"D:\repo"
+        );
+        // UNC verbatim form keeps its leading `\\`, not a relative `server\share`.
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo").as_ref(),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"D:\repo").as_ref(),
+            r"D:\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/home/u/repo").as_ref(),
+            "/home/u/repo"
+        );
+    }
+
     fn sym(symbol: &str, kind: u32) -> SymbolInfo {
         SymbolInfo {
             symbol: symbol.to_string(),
@@ -734,5 +855,50 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::RefCall));
+    }
+
+    #[test]
+    fn noise_symbol_classification() {
+        assert!(is_local_symbol("local0"));
+        assert!(is_local_symbol("local42"));
+        assert!(!is_local_symbol("locally")); // not a `local<digits>` symbol
+        assert!(!is_local_symbol("a/Caller#call()."));
+        assert!(is_parameter_descriptor("com/demo/Greeter#greet().(name)"));
+        assert!(!is_parameter_descriptor("com/demo/Greeter#greet()."));
+        assert!(!is_parameter_descriptor("com/demo/Greeter#"));
+    }
+
+    // A parameter descriptor and an anonymous local must not become nodes, refs,
+    // or edges — mirroring the scip-reader filtering so scala stops leaking raw
+    // `(name)` / `localN` symbols into the graph.
+    #[test]
+    fn parameter_and_local_symbols_are_dropped() {
+        let docs = vec![TextDocument {
+            uri: "Greeter.scala".to_string(),
+            symbols: vec![
+                sym("com/demo/Greeter#", KIND_CLASS),
+                sym("com/demo/Greeter#greet().", KIND_METHOD),
+                sym("com/demo/Greeter#greet().(name)", KIND_FIELD),
+                sym("local0", KIND_FIELD),
+            ],
+            occurrences: vec![
+                occ("com/demo/Greeter#", 0, 2),
+                occ("com/demo/Greeter#greet().", 1, 2),
+                // references to the parameter and to an anonymous local
+                occ("com/demo/Greeter#greet().(name)", 1, 1),
+                occ("local0", 1, 1),
+            ],
+        }];
+
+        let resp = build_edges(&docs, "testcorpus");
+
+        // Only the class and the method are nodes; no parameter / local node.
+        assert_eq!(resp.nodes.len(), 2);
+        assert!(resp.nodes.iter().all(
+            |n| !n.vname.signature.contains("(name)") && !n.vname.signature.contains("local0")
+        ));
+        // No ref or edge points at the dropped symbols.
+        assert!(resp.refs.is_empty());
+        assert!(resp.edges.iter().all(|e| e.kind != EdgeKind::RefCall));
     }
 }

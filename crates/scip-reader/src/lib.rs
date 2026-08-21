@@ -120,6 +120,13 @@ pub fn ingest_index(
             if occ.symbol.starts_with("local ") {
                 continue;
             }
+            // Parameter descriptors (`…#Greet().(name)`, terminal `(…)`) are the
+            // same class of signature-local noise as `local N`: scip-dotnet emits
+            // them as definitions (scip-go/scip-java do not), and without this
+            // they surface as raw `scip:…(name)` graph nodes. Drop at ingest.
+            if is_parameter_descriptor(&occ.symbol) {
+                continue;
+            }
 
             // G2: prefer `enclosing_range` (the full declaration body span,
             // e.g. a Go function's `{ … }` block) over `range` (just the name
@@ -237,6 +244,10 @@ pub fn ingest_index(
             }
             // G3: references to anonymous locals are dropped with their defs.
             if occ.symbol.starts_with("local ") {
+                continue;
+            }
+            // …and to parameters, dropped with their defs above.
+            if is_parameter_descriptor(&occ.symbol) {
                 continue;
             }
             if count >= MAX_REF_EDGES_PER_DOC {
@@ -525,6 +536,15 @@ fn is_header_path(path: &str) -> bool {
     p.ends_with(".h") || p.ends_with(".hpp") || p.ends_with(".hh") || p.ends_with(".hxx")
 }
 
+/// A SCIP symbol whose terminal descriptor is a Parameter (`…().(name)`, ending
+/// in `)`). These are signature-local, like `local N`, and are dropped from the
+/// graph so they don't surface as raw `scip:` nodes. Method descriptors
+/// terminate with `.` (`Greet().`), types with `#`, modules with `/`, so only a
+/// Parameter descriptor ends with `)`.
+fn is_parameter_descriptor(symbol: &str) -> bool {
+    symbol.ends_with(')')
+}
+
 /// Fallback kind inference from the SCIP descriptor suffix when
 /// `SymbolInformation.kind == 0` (UnspecifiedKind).
 fn kind_from_symbol_string(symbol: &str) -> String {
@@ -544,6 +564,22 @@ fn kind_from_symbol_string(symbol: &str) -> String {
 mod tests {
     use super::*;
     use travsr_core::Language;
+
+    #[test]
+    fn parameter_descriptor_detection() {
+        // scip-dotnet parameter symbol (terminal `(name)`) → dropped.
+        assert!(is_parameter_descriptor(
+            "scip-dotnet nuget . . Demo/Greeter#Greet().(name)"
+        ));
+        // real navigable symbols are kept: method (`.`), type (`#`), module (`/`).
+        assert!(!is_parameter_descriptor(
+            "scip-dotnet nuget . . Demo/Greeter#Greet()."
+        ));
+        assert!(!is_parameter_descriptor(
+            "scip-dotnet nuget . . Demo/Greeter#"
+        ));
+        assert!(!is_parameter_descriptor("scip-dotnet nuget . . Demo/"));
+    }
 
     #[test]
     fn empty_index_returns_empty_response() {
