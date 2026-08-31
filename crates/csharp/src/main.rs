@@ -158,8 +158,8 @@ fn dotnet_root_from_binary(exe: &Path) -> Option<PathBuf> {
     }
     // A runtime-only host: fall back to the per-user dotnet-install root that
     // actually carries an SDK.
-    if let Some(home) = std::env::var_os("HOME") {
-        let d = PathBuf::from(home).join(".dotnet");
+    if let Some(home) = user_home() {
+        let d = home.join(".dotnet");
         if d.join("sdk").is_dir() {
             return Some(d);
         }
@@ -167,11 +167,56 @@ fn dotnet_root_from_binary(exe: &Path) -> Option<PathBuf> {
     None
 }
 
+/// The user's home directory, on every platform this ships to.
+///
+/// `HOME` alone is not enough: Windows sets `USERPROFILE` and normally leaves
+/// `HOME` unset, so every `~/.dotnet` candidate below silently vanished there —
+/// which meant the whole off-PATH fallback resolved to nothing on Windows, not
+/// merely to less. Scoped to this file's dotnet lookups rather than made a
+/// general helper, matching `phase_b_dart`'s precedent in the main repo.
+fn user_home() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
+/// The machine-wide dotnet install directories on Windows.
+///
+/// `dotnet_root_from_binary` already reasons about `C:\Program Files\dotnet`
+/// carrying an SDK-less `host/`, yet no candidate list named that path, so on
+/// Windows this fallback covered only a per-user install. `ProgramFiles` /
+/// `ProgramFiles(x86)` are honoured first so a non-default system drive or a
+/// 32-bit install still resolves; the literals are the fallback for when the
+/// variables are unset. The `sdk/` requirement at both call sites is what keeps
+/// a runtime-only root from being picked.
+///
+/// Empty off Windows, where these paths do not exist and probing them would only
+/// cost a stat.
+fn windows_dotnet_roots() -> Vec<PathBuf> {
+    if !cfg!(windows) {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(base) = std::env::var_os(var) {
+            out.push(PathBuf::from(base).join("dotnet"));
+        }
+    }
+    for literal in [r"C:\Program Files\dotnet", r"C:\Program Files (x86)\dotnet"] {
+        let p = PathBuf::from(literal);
+        if !out.contains(&p) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// `dotnet` launcher locations off PATH to try when PATH carries no `dotnet`:
 /// the well-known installs a sandboxed or GUI-launched PATH omits — Homebrew's
 /// version-independent `opt/` symlink on Apple silicon and Intel, the official
-/// installer directory (launcher in the install root), and a user-local
-/// `~/.dotnet`. PATH itself is already covered by `tool_path`.
+/// installer directory (launcher in the install root), the Windows machine-wide
+/// install, and a user-local `~/.dotnet`. PATH itself is already covered by
+/// `tool_path`.
 fn well_known_dotnet_binaries() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = [
         "/opt/homebrew/opt/dotnet/bin/dotnet",
@@ -182,8 +227,13 @@ fn well_known_dotnet_binaries() -> Vec<PathBuf> {
     .into_iter()
     .map(PathBuf::from)
     .collect();
-    if let Some(home) = std::env::var_os("HOME") {
-        out.push(PathBuf::from(home).join(".dotnet").join("dotnet"));
+    out.extend(
+        windows_dotnet_roots()
+            .into_iter()
+            .map(|r| r.join("dotnet.exe")),
+    );
+    if let Some(home) = user_home() {
+        out.push(home.join(".dotnet").join("dotnet"));
     }
     out
 }
@@ -201,8 +251,9 @@ fn well_known_dotnet_roots() -> Vec<PathBuf> {
     .into_iter()
     .map(PathBuf::from)
     .collect();
-    if let Some(home) = std::env::var_os("HOME") {
-        out.push(PathBuf::from(home).join(".dotnet"));
+    out.extend(windows_dotnet_roots());
+    if let Some(home) = user_home() {
+        out.push(home.join(".dotnet"));
     }
     out
 }
@@ -464,5 +515,41 @@ mod tests {
         assert!(well_known_dotnet_roots()
             .iter()
             .any(|p| p.ends_with("opt/homebrew/opt/dotnet/libexec")));
+    }
+
+    /// The candidate lists were POSIX-only apart from `~/.dotnet`, so on Windows
+    /// the machine-wide install — the one `dotnet_root_from_binary`'s own
+    /// docstring reasons about — was never probed.
+    #[test]
+    #[cfg_attr(not(windows), ignore = "windows-only install locations")]
+    fn candidates_cover_the_windows_machine_wide_install() {
+        assert!(
+            well_known_dotnet_roots()
+                .iter()
+                .any(|p| p.ends_with("dotnet") && p.to_string_lossy().contains("Program Files")),
+            "the machine-wide Program Files root must be probed"
+        );
+        assert!(
+            well_known_dotnet_binaries()
+                .iter()
+                .any(|p| p.ends_with("dotnet.exe")),
+            "and its launcher must be tried"
+        );
+    }
+
+    /// Windows sets `USERPROFILE` and leaves `HOME` unset, so keying the
+    /// per-user candidate on `HOME` alone dropped it entirely there.
+    #[test]
+    fn user_home_falls_back_to_userprofile() {
+        // Both unset is the only case that may yield None; otherwise either
+        // variable must resolve. Read whatever this environment provides rather
+        // than mutating process env, which is not safe across parallel tests.
+        let has_home = std::env::var_os("HOME").is_some();
+        let has_profile = std::env::var_os("USERPROFILE").is_some();
+        assert_eq!(
+            user_home().is_some(),
+            has_home || has_profile,
+            "user_home must honour USERPROFILE as well as HOME"
+        );
     }
 }
