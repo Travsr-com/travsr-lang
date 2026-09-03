@@ -688,6 +688,9 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
                     // is_call (#650): no call/non-call signal available here;
                     // preserve prior behavior / wire default (default_true).
                     is_call: true,
+                    // #813: no byte column available here; the daemon
+                    // name-searches the line (no regression).
+                    caller_col: None,
                 });
                 continue;
             }

@@ -300,6 +300,9 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                             // is_call (#650): no call/non-call signal available
                             // here; preserve prior behavior / wire default.
                             is_call: true,
+                            // #813: the emitter output carries only a line, no
+                            // byte column; the daemon name-searches the line.
+                            caller_col: None,
                         });
                     } else {
                         edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
