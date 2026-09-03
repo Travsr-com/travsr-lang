@@ -237,10 +237,74 @@ final class ScipVisitor: SyntaxVisitor {
         return ""
     }
 
+    // ── Type-position references (#830) ─────────────────────────────────────────
+
+    /// Language builtins that never resolve to a user definition. Emitting a
+    /// reference to one would simply be dropped by Travsr's ingestion (no
+    /// matching def), so skipping them keeps the index lean without losing recall.
+    private static let builtinTypes: Set<String> = [
+        "Int", "Int8", "Int16", "Int32", "Int64",
+        "UInt", "UInt8", "UInt16", "UInt32", "UInt64",
+        "Float", "Float16", "Float32", "Float64", "Double",
+        "Bool", "String", "Substring", "Character",
+        "Void", "Any", "AnyObject", "AnyClass", "Never", "Self",
+    ]
+
+    /// Emit a reference for every named type used in `type` (#830). Type
+    /// annotations, parameter and return types, generic arguments, and the
+    /// element types of optionals/arrays/dictionaries were previously invisible:
+    /// a file that only *uses* a type in these positions produced a
+    /// definition-only document with zero references, so `find_references` on the
+    /// most-used API types returned a confident zero. Mirrors the Dart emitter's
+    /// type-position capture (travsr-lang #14).
+    ///
+    /// Syntactic only: the rightmost name of a qualified type (`Module.Foo` → Foo)
+    /// is what Travsr's `swift::` scheme keys on. Function/metatype shapes are
+    /// intentionally not descended into, to avoid emitting noise from `() -> Void`.
+    private func recordTypeReference(_ type: TypeSyntax?) {
+        guard let type = type else { return }
+        if let id = type.as(IdentifierTypeSyntax.self) {
+            let name = id.name.text
+            if !name.isEmpty, !Self.builtinTypes.contains(name) {
+                references.append(Reference(symbol: "swift::\(name)", line: lineOf(id.name)))
+            }
+            if let generics = id.genericArgumentClause {
+                for arg in generics.arguments { recordTypeReference(arg.argument) }
+            }
+        } else if let member = type.as(MemberTypeSyntax.self) {
+            let name = member.name.text
+            if !name.isEmpty, !Self.builtinTypes.contains(name) {
+                references.append(Reference(symbol: "swift::\(name)", line: lineOf(member.name)))
+            }
+            if let generics = member.genericArgumentClause {
+                for arg in generics.arguments { recordTypeReference(arg.argument) }
+            }
+        } else if let opt = type.as(OptionalTypeSyntax.self) {
+            recordTypeReference(opt.wrappedType)
+        } else if let iuo = type.as(ImplicitlyUnwrappedOptionalTypeSyntax.self) {
+            recordTypeReference(iuo.wrappedType)
+        } else if let arr = type.as(ArrayTypeSyntax.self) {
+            recordTypeReference(arr.element)
+        } else if let dict = type.as(DictionaryTypeSyntax.self) {
+            recordTypeReference(dict.key)
+            recordTypeReference(dict.value)
+        } else if let tuple = type.as(TupleTypeSyntax.self) {
+            for el in tuple.elements { recordTypeReference(el.type) }
+        } else if let attributed = type.as(AttributedTypeSyntax.self) {
+            recordTypeReference(attributed.baseType)
+        } else if let someOrAny = type.as(SomeOrAnyTypeSyntax.self) {
+            recordTypeReference(someOrAny.constraint)
+        }
+    }
+
     // ── Parameter binding ──────────────────────────────────────────────────────
 
     private func bindParameters(_ params: FunctionParameterListSyntax) {
         for param in params {
+            // #830: the parameter type is referenced regardless of the parameter
+            // name, so emit the reference before the `_`-name guard that only
+            // governs local binding for instance-call resolution.
+            recordTypeReference(param.type)
             // Use the internal (second) name when present, else the first name.
             // func foo(_ val: T) → firstName="_", secondName="val" → bind "val"
             // func foo(with val: T) → firstName="with", secondName="val" → bind "val"
@@ -272,6 +336,9 @@ final class ScipVisitor: SyntaxVisitor {
                 child: "swift::\(childName)",
                 parent: "swift::\(parentName)"
             ))
+            // #830: a base class or conformed protocol is also referenced here,
+            // so find_references on the parent type includes the conformance site.
+            recordTypeReference(inh.type)
         }
     }
 
@@ -354,6 +421,8 @@ final class ScipVisitor: SyntaxVisitor {
         pushScope()
         if let t = currentType { bindLocal("self", type: t) }
         bindParameters(node.signature.parameterClause.parameters)
+        // #830: the declared return type is a use of that type.
+        recordTypeReference(node.signature.returnClause?.type)
         return .visitChildren
     }
     override func visitPost(_ node: FunctionDeclSyntax) { popScope() }
@@ -386,6 +455,9 @@ final class ScipVisitor: SyntaxVisitor {
                 endLine: endLine
             ))
         }
+        // #830: subscript parameter and result types are uses of those types.
+        for param in node.parameterClause.parameters { recordTypeReference(param.type) }
+        recordTypeReference(node.returnClause.type)
         return .visitChildren
     }
 
@@ -405,6 +477,8 @@ final class ScipVisitor: SyntaxVisitor {
             if let typeAnn = binding.typeAnnotation {
                 let typeName = simpleTypeName(typeAnn.type)
                 if !typeName.isEmpty { bindLocal(name, type: typeName) }
+                // #830: the annotation is also a use of that type.
+                recordTypeReference(typeAnn.type)
             }
         }
         return .visitChildren
@@ -438,6 +512,7 @@ final class ScipVisitor: SyntaxVisitor {
                     if let typeAnn = param.type {
                         let typeName = simpleTypeName(typeAnn)
                         if !typeName.isEmpty { bindLocal(name, type: typeName) }
+                        recordTypeReference(typeAnn)
                     }
                 }
             }
@@ -459,6 +534,11 @@ final class ScipVisitor: SyntaxVisitor {
                     if baseName.first?.isUppercase == true {
                         // Static or type method call: SomeType.method()
                         references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln))
+                        // #830: the receiver type itself is used here too, so a
+                        // query for `SomeType` finds this qualified access.
+                        if !Self.builtinTypes.contains(baseName) {
+                            references.append(Reference(symbol: "swift::\(baseName)", line: ln))
+                        }
                     } else {
                         // Instance call: instance.method()
                         // Resolve via scope if the variable has an explicit type annotation.
@@ -517,6 +597,10 @@ final class ScipVisitor: SyntaxVisitor {
         if baseName.first?.isUppercase == true {
             // Static member access without a call: ClassC.shared, Color.red.
             references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln))
+            // #830: the receiver type itself is used here too.
+            if !Self.builtinTypes.contains(baseName) {
+                references.append(Reference(symbol: "swift::\(baseName)", line: ln))
+            }
         } else if let resolvedType = lookupType(baseName) {
             // Property access on an explicitly-typed local: svc.total.
             references.append(Reference(symbol: "swift::\(resolvedType).\(memberName)", line: ln))

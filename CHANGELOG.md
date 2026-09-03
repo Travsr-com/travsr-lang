@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Swift: the emitter recorded references only from call sites and member accesses, so a type used purely in type position produced zero references. `let x: WBMDAdManager`, a parameter or return type, a generic argument, and a superclass or protocol conformance were all invisible, so a file that only used a type in annotations yielded a definition-only document and `find_references` on the most-used API types returned a confident zero (travsr#830). The visitor now records a reference for every named type in a type position, recursing through optionals, arrays, dictionaries, tuples, `some`/`any` and generic arguments and skipping the language builtins, and the receiver type of a qualified static access (`Enum.constant`, `Type.method()`) is recorded alongside the member. This mirrors the Dart emitter's type-position capture (#14). The CI smoke test now asserts a type-position reference is emitted.
+
 ## [0.4.2] - 2026-08-22
 
 Windows Phase B for the JVM and .NET wrappers, which shipped binaries in v0.4.0 but produced nothing when run, plus graph noise-node cleanup. No API or protocol changes (#22).

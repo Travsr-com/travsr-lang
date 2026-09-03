@@ -187,12 +187,20 @@ jobs:
         run: |
           mkdir -p /tmp/swift_smoke/Sources
           cat > /tmp/swift_smoke/Sources/Hello.swift <<'EOF'
+          struct Config {}
           struct Greeter {
-              func greet() { print("hello") }
+              let config: Config
+              func greet() -> Config { config }
           }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
+          # travsr#830: a type used only in annotation / return position must be
+          # emitted as a reference, not just tracked. `Config` appears only in the
+          # field annotation and the return type here, so a reference to it proves
+          # type-position capture is on. Checks the references array specifically,
+          # since `swift::Config` is also present as a definition.
+          python3 -c "import json,sys; d=json.load(open('/tmp/swift_smoke_out.json')); refs=[r['symbol'] for doc in d['documents'] for r in doc['references']]; sys.exit(0 if 'swift::Config' in refs else 1)"
 
   swift-linux:
     name: swift emitter (Linux)
@@ -213,12 +221,20 @@ jobs:
         run: |
           mkdir -p /tmp/swift_smoke/Sources
           cat > /tmp/swift_smoke/Sources/Hello.swift <<'EOF'
+          struct Config {}
           struct Greeter {
-              func greet() { print("hello") }
+              let config: Config
+              func greet() -> Config { config }
           }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
+          # travsr#830: a type used only in annotation / return position must be
+          # emitted as a reference, not just tracked. `Config` appears only in the
+          # field annotation and the return type here, so a reference to it proves
+          # type-position capture is on. Checks the references array specifically,
+          # since `swift::Config` is also present as a definition.
+          python3 -c "import json,sys; d=json.load(open('/tmp/swift_smoke_out.json')); refs=[r['symbol'] for doc in d['documents'] for r in doc['references']]; sys.exit(0 if 'swift::Config' in refs else 1)"
 
   dart:
     name: dart emitter (Linux)
