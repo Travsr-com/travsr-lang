@@ -669,6 +669,8 @@ fn collect_kt_recursive(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)
 // ── Main orchestrator ─────────────────────────────────────────────────────────
 
 fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+    // #813: one read per referenced file, shared across all symbols.
+    let mut src_cache = travsr_lang_scip_reader::SourceCache::new();
     let kls = kls_binary().context(
         "kotlin-language-server not found. Install at ~/.travsr/bin/kotlin-language-server",
     )?;
@@ -827,6 +829,10 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
                     None => continue,
                 };
                 let ref_line = loc["range"]["start"]["line"].as_u64().unwrap_or(0);
+                // #813: KLS answers in LSP positions, so the character sits beside
+                // the line. LSP counts UTF-16 code units, but rather than trust
+                // that, keep it only where no encoding could change its meaning.
+                let ref_char = loc["range"]["start"]["character"].as_i64();
 
                 let ref_rel = match uri_to_rel(root, ref_uri) {
                     Some(r) => r,
@@ -854,9 +860,16 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
                     // is_call (#650): no call/non-call signal available here;
                     // preserve prior behavior / wire default (default_true).
                     is_call: true,
-                    // #813: no byte column available here; the daemon
-                    // name-searches the line (no regression).
-                    caller_col: None,
+                    // #813: the reference's own column, kept only where the
+                    // encoding cannot change its meaning; `None` otherwise, and
+                    // the daemon name-searches the line exactly as before.
+                    caller_col: ref_char.and_then(|c| {
+                        src_cache.col(
+                            &root.join(&ref_rel),
+                            (ref_line as u32).saturating_add(1),
+                            i32::try_from(c).ok()?,
+                        )
+                    }),
                 });
             }
         }

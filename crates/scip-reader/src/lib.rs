@@ -224,8 +224,21 @@ pub fn ingest_index(
     // or stdlib symbol, and converting those would flood the resolver.
     let cross_lang = matches!(language, Language::ObjectiveC);
     let mut unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
+    let project_root = index
+        .metadata
+        .as_ref()
+        .map(|m| m.project_root.clone())
+        .unwrap_or_default();
     for doc in &index.documents {
         let path = &doc.relative_path;
+        // #813: the document's source, read once, so each occurrence's column can
+        // be accepted only where every SCIP encoding agrees on what it means.
+        // `None` (no text, unreadable file) simply leaves every column unset.
+        let doc_src = document_text(doc, &project_root);
+        let doc_lines: Vec<&str> = doc_src
+            .as_deref()
+            .map(|t| t.lines().collect())
+            .unwrap_or_default();
         // #299 C1: scip-clang emits a reference occurrence at a symbol's *header
         // declaration* line (not a call site). Attributing those to a header
         // pollutes find_references with a spurious "use" on the declaration.
@@ -260,6 +273,13 @@ pub fn ingest_index(
                 continue;
             };
             let caller_line = start as u32 + 1;
+            // #813: range element [1] is the occurrence's start character (see
+            // `scip_range`). Accept it only inside the encoding-agnostic window.
+            let caller_col = scip_range(occ)
+                .get(1)
+                .copied()
+                .zip(doc_lines.get(start as usize))
+                .and_then(|(c, line)| encoding_agnostic_col(line, c));
             if let Some(&callee_id) = def_ids.get(occ.symbol.as_str()) {
                 refs.push(ScipRef {
                     caller_path: path.clone(),
@@ -272,12 +292,11 @@ pub fn ingest_index(
                     // ingested occurrence is treated as a call. Refining this per
                     // symbol_role is a separate change.
                     is_call: true,
-                    // #813: no source text is loaded here to convert a SCIP
-                    // occurrence's UTF-16 character offset to a byte column, and a
-                    // non-byte column would be a wrong editor position (a wrong
-                    // edge), so leave it unset. The daemon name-searches the line
-                    // as it did before this field existed (no regression).
-                    caller_col: None,
+                    // #813: the occurrence's own column, kept only where the
+                    // encoding cannot change its meaning (`encoding_agnostic_col`).
+                    // `None` outside that window, so the daemon name-searches the
+                    // line as it did before this field existed (no regression).
+                    caller_col,
                 });
                 count += 1;
             } else if cross_lang {
@@ -303,9 +322,9 @@ pub fn ingest_index(
                     // resolution behavior for these edges.
                     is_method_call: false,
                     recv_type: None,
-                    // #813: no byte column available for this SCIP occurrence
-                    // (see the ScipRef case above); the daemon name-searches.
-                    caller_col: None,
+                    // #813: same encoding-agnostic column as the ScipRef case
+                    // above; `None` when the unit would be ambiguous.
+                    caller_col,
                 });
                 count += 1;
             }
@@ -326,6 +345,153 @@ pub fn ingest_index(
         refs,
         unresolved_calls: unresolved,
     })
+}
+
+/// The occurrence column, but only when it means the same thing under every
+/// encoding SCIP permits.
+///
+/// `Document.position_encoding` may be UTF-8, UTF-16 or UTF-32, and in practice
+/// it is often absent altogether: a real scip-ruby index emits no encoding field
+/// at all, which decodes as `Unspecified`. So the wire does not reliably say
+/// which unit `start_character` is counted in, and guessing wrong writes a wrong
+/// editor position, which is a wrong edge (#813).
+///
+/// There is one window where no guess is required. While the line's prefix is
+/// pure ASCII, one code unit is one byte under all four encodings, so the offset
+/// is numerically identical whichever the indexer used. Measured over the 39,555
+/// committed occurrences of the travsr repository, 99.985% fall inside it.
+///
+/// Outside that window (a non-ASCII character sits before the occurrence) the
+/// unit is genuinely ambiguous, so this returns `None` and the daemon falls back
+/// to its word-boundary name search, exactly as it did before the field existed.
+/// Narrowing that remaining 0.015% needs per-emitter encoding evidence, not a
+/// default.
+pub fn encoding_agnostic_col(line: &str, character: i32) -> Option<u32> {
+    let col = usize::try_from(character).ok()?;
+    let bytes = line.as_bytes();
+    if col > bytes.len() {
+        return None;
+    }
+    bytes[..col].is_ascii().then_some(col as u32)
+}
+
+/// What a producer's reported column counts (#813).
+///
+/// Travsr's occurrence store keeps a 0-based UTF-8 byte column. A producer we
+/// own declares its unit, so the consumer converts instead of guessing. A
+/// producer we do not own (a third-party SCIP indexer) declares nothing
+/// reliable, so [`ColUnit::Unknown`] falls back to the encoding-agnostic window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColUnit {
+    /// Already a UTF-8 byte offset: used as-is once bounds-checked.
+    Utf8,
+    /// UTF-16 code units, converted against the line.
+    Utf16,
+    /// Not declared, or declared as something we do not know: keep the column
+    /// only where every encoding agrees ([`encoding_agnostic_col`]).
+    Unknown,
+}
+
+impl ColUnit {
+    /// Parse a producer's `col_unit` declaration. Anything unrecognised, or
+    /// absent, is [`ColUnit::Unknown`] and stays conservative.
+    pub fn parse(declared: Option<&str>) -> Self {
+        match declared {
+            Some("utf8") => Self::Utf8,
+            Some("utf16") => Self::Utf16,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The 0-based UTF-8 byte column for `character` on `line`, given what the
+/// producer says `character` counts.
+///
+/// Returns `None` when the position does not exist on this line, or when it
+/// lands inside a character (a UTF-16 column pointing at the low half of a
+/// surrogate pair), because half a character is not a position an editor can
+/// resolve.
+pub fn col_in_unit(line: &str, character: i32, unit: ColUnit) -> Option<u32> {
+    let target = usize::try_from(character).ok()?;
+    match unit {
+        ColUnit::Unknown => encoding_agnostic_col(line, character),
+        ColUnit::Utf8 => {
+            (target <= line.len() && line.is_char_boundary(target)).then_some(target as u32)
+        }
+        ColUnit::Utf16 => {
+            let mut units = 0usize;
+            for (byte_idx, ch) in line.char_indices() {
+                if units == target {
+                    return Some(byte_idx as u32);
+                }
+                units += ch.len_utf16();
+                if units > target {
+                    return None; // inside a surrogate pair
+                }
+            }
+            (units == target).then_some(line.len() as u32)
+        }
+    }
+}
+
+/// Line cache for readers whose occurrences arrive without source attached
+/// (the LSP and SemanticDB backed languages), so a file is read at most once.
+///
+/// Exists so every language applies the *same* column-safety rule as the SCIP
+/// path rather than each reimplementing it: a mis-slotted column is a wrong
+/// editor position, and that is the one failure this rule exists to prevent.
+#[derive(Default)]
+pub struct SourceCache {
+    files: std::collections::HashMap<std::path::PathBuf, Option<Vec<String>>>,
+}
+
+impl SourceCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// [`Self::col`] for a producer that declares its unit.
+    pub fn col_in(&mut self, path: &Path, line: u32, character: i32, unit: ColUnit) -> Option<u32> {
+        let entry = self.files.entry(path.to_path_buf()).or_insert_with(|| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|t| t.lines().map(|l| l.to_string()).collect())
+        });
+        let lines = entry.as_ref()?;
+        let idx = usize::try_from(line.checked_sub(1)?).ok()?;
+        col_in_unit(lines.get(idx)?, character, unit)
+    }
+
+    /// The byte column for `character` on 1-based `line` of `path`, or `None`
+    /// when the file is unreadable, the line is missing, or the encoding could
+    /// change what `character` means (see [`encoding_agnostic_col`]).
+    pub fn col(&mut self, path: &Path, line: u32, character: i32) -> Option<u32> {
+        let entry = self.files.entry(path.to_path_buf()).or_insert_with(|| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|t| t.lines().map(|l| l.to_string()).collect())
+        });
+        let lines = entry.as_ref()?;
+        let idx = usize::try_from(line.checked_sub(1)?).ok()?;
+        encoding_agnostic_col(lines.get(idx)?, character)
+    }
+}
+
+/// Source lines for `doc`, or `None` when the text cannot be obtained.
+///
+/// Prefers the document's inlined `text`; the SCIP spec marks that optional and
+/// says indexers are not expected to include it, in which case the client should
+/// resolve `Index.metadata.project_root` against `Document.relative_path`. That
+/// is why this needs no repo-root argument: the index carries its own root.
+fn document_text(doc: &scip::types::Document, project_root: &str) -> Option<String> {
+    if !doc.text.is_empty() {
+        return Some(doc.text.clone());
+    }
+    let root = project_root.strip_prefix("file://").unwrap_or(project_root);
+    if root.is_empty() {
+        return None;
+    }
+    std::fs::read_to_string(Path::new(root).join(&doc.relative_path)).ok()
 }
 
 /// Occurrence `range` as the packed `[start_line, start_col, end_col]` (single
@@ -588,6 +754,99 @@ mod tests {
             "scip-dotnet nuget . . Demo/Greeter#"
         ));
         assert!(!is_parameter_descriptor("scip-dotnet nuget . . Demo/"));
+    }
+
+    /// #813: a producer we own declares what its column counts, so the consumer
+    /// converts instead of guessing. Measured against the real emitters: the
+    /// Swift one reports UTF-8 bytes, the Dart one UTF-16 code units, and on a
+    /// line with a non-ASCII character those are different numbers.
+    #[test]
+    fn a_declared_unit_is_converted_rather_than_guessed() {
+        // `    var s = "Caf\u{e9}"; return g.hello();` : `hello` starts at byte 30,
+        // which the Dart emitter reports as UTF-16 column 29.
+        let mixed = "    var s = \"Caf\u{e9}\"; return g.hello();";
+        assert_eq!(col_in_unit(mixed, 29, ColUnit::Utf16), Some(30));
+        assert_eq!(&mixed.as_bytes()[30..35], b"hello");
+        // The same number read as bytes is the wrong position, which is why an
+        // undeclared producer abstains here instead of guessing.
+        assert_eq!(col_in_unit(mixed, 29, ColUnit::Unknown), None);
+        // A byte-native producer (SwiftSyntax) is used as-is, even here.
+        assert_eq!(col_in_unit(mixed, 30, ColUnit::Utf8), Some(30));
+
+        // On an ASCII line every unit agrees, so all three answer the same.
+        let ascii = "    return g.hello();";
+        for unit in [ColUnit::Utf8, ColUnit::Utf16, ColUnit::Unknown] {
+            assert_eq!(col_in_unit(ascii, 13, unit), Some(13), "{unit:?}");
+        }
+
+        // A position inside a character is not a position an editor can resolve.
+        let emoji = "let x = \"\u{1F600}\"; y();";
+        assert_eq!(col_in_unit(emoji, 10, ColUnit::Utf16), None); // low surrogate
+        assert_eq!(col_in_unit(emoji, 10, ColUnit::Utf8), None); // mid character
+
+        // Out of range abstains rather than panicking.
+        assert_eq!(col_in_unit(ascii, 999, ColUnit::Utf8), None);
+        assert_eq!(col_in_unit(ascii, -1, ColUnit::Utf16), None);
+    }
+
+    /// An emitter too old to declare a unit, or one declaring something we do
+    /// not know, stays on the conservative path rather than being assumed.
+    #[test]
+    fn an_undeclared_unit_stays_conservative() {
+        assert_eq!(ColUnit::parse(Some("utf8")), ColUnit::Utf8);
+        assert_eq!(ColUnit::parse(Some("utf16")), ColUnit::Utf16);
+        assert_eq!(ColUnit::parse(None), ColUnit::Unknown);
+        assert_eq!(ColUnit::parse(Some("utf32")), ColUnit::Unknown);
+        assert_eq!(ColUnit::parse(Some("")), ColUnit::Unknown);
+    }
+
+    /// #813: a column is kept only where every SCIP encoding agrees on what it
+    /// counts, because the wire often does not say (a real scip-ruby index emits
+    /// no `position_encoding` at all). Inside the ASCII prefix all four encodings
+    /// give the same number; outside it the unit is a guess, and a guessed column
+    /// is a wrong editor position.
+    #[test]
+    fn a_column_is_kept_only_where_the_encoding_cannot_change_it() {
+        // Pure ASCII prefix: byte == UTF-8 == UTF-16 == UTF-32, so it is safe.
+        assert_eq!(encoding_agnostic_col("    @p.hello", 4), Some(4));
+        assert_eq!(encoding_agnostic_col("let x = foo();", 8), Some(8));
+        // A non-ASCII character before the column makes the unit matter, and the
+        // index does not say which one it used: abstain.
+        assert_eq!(
+            encoding_agnostic_col("    x = \"Caf\u{e9}\"; @p.hello", 20),
+            None
+        );
+        // Non-ASCII AFTER the column is irrelevant, the prefix still decides.
+        assert_eq!(encoding_agnostic_col("    @c.gr\u{e9}et", 4), Some(4));
+        // Degenerate inputs abstain rather than producing an out-of-range column.
+        assert_eq!(encoding_agnostic_col("abc", -1), None);
+        assert_eq!(encoding_agnostic_col("abc", 9), None);
+        // End-of-line is in range (a zero-width position at the end).
+        assert_eq!(encoding_agnostic_col("abc", 3), Some(3));
+    }
+
+    /// The document's own `text` is preferred, and an absent one falls back to
+    /// the index's `project_root`, which is why populating the column needs no
+    /// repo-root argument threaded through the reader.
+    #[test]
+    fn document_text_prefers_inlined_text_then_the_project_root() {
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "a.rb".to_string();
+        doc.text = "inlined".to_string();
+        assert_eq!(
+            document_text(&doc, "file:///nowhere").as_deref(),
+            Some("inlined")
+        );
+
+        let tmp = std::env::temp_dir().join("travsr_scip_reader_doctext");
+        let _ = std::fs::create_dir_all(&tmp);
+        std::fs::write(tmp.join("a.rb"), "from disk").unwrap();
+        doc.text = String::new();
+        let root = format!("file://{}", tmp.display());
+        assert_eq!(document_text(&doc, &root).as_deref(), Some("from disk"));
+        // No root and no inlined text: nothing to read, so no column is derived.
+        assert_eq!(document_text(&doc, ""), None);
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]

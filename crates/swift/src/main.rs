@@ -193,12 +193,18 @@ fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse
         "swift emitter exited with {status}: {stderr_buf}"
     );
 
-    parse_emitter_output(&output_path, corpus)
+    parse_emitter_output(&output_path, corpus, root)
 }
 
 // ── JSON parsing ──────────────────────────────────────────────────────────────
 
-fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+fn parse_emitter_output(
+    json_path: &Path,
+    corpus: &str,
+    repo_root: &Path,
+) -> anyhow::Result<InvokeResponse> {
+    // #813: one read per referenced file, shared across all documents.
+    let mut src_cache = travsr_lang_scip_reader::SourceCache::new();
     let bytes = std::fs::read(json_path)
         .with_context(|| format!("reading emitter output {}", json_path.display()))?;
 
@@ -214,6 +220,9 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     }
 
     let root: serde_json::Value = serde_json::from_slice(&bytes).context("parsing emitter JSON")?;
+    // #813: the emitter declares what its `col` counts. An older emitter that
+    // declares nothing stays on the conservative encoding-agnostic path.
+    let col_unit = travsr_lang_scip_reader::ColUnit::parse(root["col_unit"].as_str());
 
     let docs = root["documents"]
         .as_array()
@@ -300,9 +309,19 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                             // is_call (#650): no call/non-call signal available
                             // here; preserve prior behavior / wire default.
                             is_call: true,
-                            // #813: the emitter output carries only a line, no
-                            // byte column; the daemon name-searches the line.
-                            caller_col: None,
+                            // #813: the emitter reports a column and declares its
+                            // unit, so this converts rather than guessing. An
+                            // emitter too old to declare one falls back to the
+                            // encoding-agnostic window, and anything unresolvable
+                            // stays `None` for the daemon to name-search.
+                            caller_col: r["col"].as_i64().and_then(|c| {
+                                src_cache.col_in(
+                                    &repo_root.join(path),
+                                    line as u32,
+                                    i32::try_from(c).ok()?,
+                                    col_unit,
+                                )
+                            }),
                         });
                     } else {
                         edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
@@ -382,7 +401,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("out.json");
         std::fs::write(&path, json).expect("write canned JSON");
-        parse_emitter_output(&path, "testcorpus").expect("parse")
+        parse_emitter_output(&path, "testcorpus", Path::new("/nonexistent")).expect("parse")
     }
 
     fn node_id(path: &str, sym: &str) -> NodeId {
