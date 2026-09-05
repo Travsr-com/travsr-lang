@@ -51,6 +51,10 @@ struct Definition: Encodable {
 struct Reference: Encodable {
     let symbol: String
     let line: Int
+    /// 0-based column of the reference on its line (#813). SwiftSyntax reports
+    /// a 1-based column, so this is that minus one. Travsr keeps it only where
+    /// the line prefix is ASCII, so the unit needs no conversion here.
+    let col: Int
 }
 
 /// Type-level inheritance or protocol conformance.
@@ -69,8 +73,20 @@ struct Document: Encodable {
 }
 
 struct Output: Encodable {
+    /// Unit of every `col` in this output (#813). SwiftSyntax reports source
+    /// locations in UTF-8 bytes, which is exactly the unit Travsr's occurrence
+    /// store keeps, so no conversion is needed on either side. Declared rather
+    /// than assumed by the consumer: it travels with the artifact, so if a
+    /// future SwiftSyntax changes this, the value changes with it.
+    let colUnit: String = "utf8"
+
     let version: Int
     let documents: [Document]
+
+    enum CodingKeys: String, CodingKey {
+        case colUnit = "col_unit"
+        case version, documents
+    }
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -177,6 +193,10 @@ final class ScipVisitor: SyntaxVisitor {
     init(converter: SourceLocationConverter) {
         self.converter = converter
         super.init(viewMode: .sourceAccurate)
+    }
+
+    private func colOf(_ node: some SyntaxProtocol) -> Int {
+        node.startLocation(converter: converter).column - 1
     }
 
     private func lineOf(_ node: some SyntaxProtocol) -> Int {
@@ -453,19 +473,28 @@ final class ScipVisitor: SyntaxVisitor {
 
         if let memberAccess = node.calledExpression.as(MemberAccessExprSyntax.self) {
             let memberName = memberAccess.declName.baseName.text
+            // #813: the column names the identifier that is being referenced,
+            // not the start of the whole call expression. For `svc.charge()`
+            // the referenced symbol is `charge`, so pointing at `svc` would
+            // send the editor's definition provider to the receiver variable
+            // (or, for `ClassC.registerEnvironments()`, to the type) instead of
+            // the member. Every other producer travsr reads reports the
+            // referenced identifier's own start.
+            let cl = colOf(memberAccess.declName.baseName)
             if let base = memberAccess.base {
                 if let declRef = base.as(DeclReferenceExprSyntax.self) {
                     let baseName = declRef.baseName.text
                     if baseName.first?.isUppercase == true {
                         // Static or type method call: SomeType.method()
-                        references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln))
+                        references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln, col: cl))
                     } else {
                         // Instance call: instance.method()
                         // Resolve via scope if the variable has an explicit type annotation.
                         if let resolvedType = lookupType(baseName) {
                             references.append(Reference(
                                 symbol: "swift::\(resolvedType).\(memberName)",
-                                line: ln
+                                line: ln,
+                                col: cl
                             ))
                         }
                         // Unresolvable (inferred type, chained call): skip rather than guess.
@@ -475,11 +504,15 @@ final class ScipVisitor: SyntaxVisitor {
             } else {
                 // No explicit base → implicit self inside a method body.
                 if let t = currentType {
-                    references.append(Reference(symbol: "swift::\(t).\(memberName)", line: ln))
+                    references.append(Reference(symbol: "swift::\(t).\(memberName)", line: ln, col: cl))
                 }
             }
         } else if let declRef = node.calledExpression.as(DeclReferenceExprSyntax.self) {
             let name = declRef.baseName.text
+            // The name token rather than the call expression: identical for a
+            // bare `Foo()` / `foo()`, but stated the same way as the member
+            // paths above so the rule does not have to be re-derived.
+            let cl = colOf(declRef.baseName)
             if name.first?.isUppercase == true {
                 // Constructor call: MyType() → the type itself, not its `.init`
                 // member (#449). find_references/get_callers query by type name
@@ -487,10 +520,10 @@ final class ScipVisitor: SyntaxVisitor {
                 // have a `swift::TypeName` definition regardless of whether it
                 // declares an explicit initializer, unlike `.init`, which only
                 // exists in def_ids when the type has one.
-                references.append(Reference(symbol: "swift::\(name)", line: ln))
+                references.append(Reference(symbol: "swift::\(name)", line: ln, col: cl))
             } else {
                 // Top-level or local function call: foo()
-                references.append(Reference(symbol: "swift::\(name)", line: ln))
+                references.append(Reference(symbol: "swift::\(name)", line: ln, col: cl))
             }
         }
 
@@ -514,12 +547,14 @@ final class ScipVisitor: SyntaxVisitor {
         let memberName = node.declName.baseName.text
         let baseName = declRef.baseName.text
         let ln = lineOf(node)
+        // #813: as in the call path, the column names the member, not the base.
+        let cl = colOf(node.declName.baseName)
         if baseName.first?.isUppercase == true {
             // Static member access without a call: ClassC.shared, Color.red.
-            references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln))
+            references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln, col: cl))
         } else if let resolvedType = lookupType(baseName) {
             // Property access on an explicitly-typed local: svc.total.
-            references.append(Reference(symbol: "swift::\(resolvedType).\(memberName)", line: ln))
+            references.append(Reference(symbol: "swift::\(resolvedType).\(memberName)", line: ln, col: cl))
         }
         // Unresolvable base (inferred type): skip rather than guess.
         return .visitChildren

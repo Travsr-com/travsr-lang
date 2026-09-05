@@ -10,6 +10,7 @@
 /// Output JSON schema  (version 1):
 /// {
 ///   "version": 1,
+///   "col_unit": "utf16",          // unit of every reference `col`
 ///   "documents": [
 ///     {
 ///       "path": "lib/src/foo.dart",       // relative to root-path
@@ -17,7 +18,7 @@
 ///         { "symbol": "<uri>::<qname>", "kind": "class|type|function|constructor|field|variable", "line": 5, "end_line": 12 }
 ///       ],
 ///       "references": [
-///         { "symbol": "<uri>::<qname>", "line": 12 }
+///         { "symbol": "<uri>::<qname>", "line": 12, "col": 4 }
 ///       ]
 ///     }
 ///   ]
@@ -98,7 +99,12 @@ Future<void> main(List<String> args) async {
     }
   }
 
-  final payload = jsonEncode({'version': 1, 'documents': documents});
+  // #813: `col` is reported in Dart string code units (UTF-16), which is NOT
+  // the UTF-8 byte column Travsr's occurrence store keeps. Declare the unit so
+  // the consumer converts rather than guessing; it travels with the artifact,
+  // so a future analyzer change is a change to this value, not a silent skew.
+  final payload =
+      jsonEncode({'version': 1, 'col_unit': 'utf16', 'documents': documents});
   File(outputPath).writeAsStringSync(payload);
   stderr.writeln(
     'dart-scip-emitter: ${documents.length} documents written to $outputPath',
@@ -150,6 +156,12 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   int _line(int offset) => lineInfo.getLocation(offset).lineNumber;
 
+  /// 0-based column of [offset] on its line. `columnNumber` is 1-based and
+  /// counts Dart string code units (UTF-16), which is why the output declares
+  /// `col_unit: utf16`: Travsr's occurrence store keeps a UTF-8 byte column, so
+  /// the consumer converts on any line whose prefix is not ASCII (#813).
+  int _col(int offset) => lineInfo.getLocation(offset).columnNumber - 1;
+
   /// Record a definition. [nameOffset] is the name token's offset (for `line`).
   /// [declEnd] is the exclusive end offset of the full declaration node (for
   /// `end_line`); pass `node.end` and this method subtracts 1 internally.
@@ -167,7 +179,7 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   void _addRef(Element? element, int offset) {
     final sym = _elementSymbol(element);
     if (sym.isEmpty) return;
-    references.add({'symbol': sym, 'line': _line(offset)});
+    references.add({'symbol': sym, 'line': _line(offset), 'col': _col(offset)});
   }
 
   // ── Definitions ────────────────────────────────────────────────────────────
@@ -279,7 +291,14 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   @override
   void visitInstanceCreationExpression(InstanceCreationExpression node) {
-    _addRef(node.constructorName.staticElement, node.offset);
+    // #813: the constructor name's own offset, not `node.offset`, which is the
+    // `new` / `const` keyword when one is written. The column is consumed as
+    // the exact position of the referenced identifier, and the other _addRef
+    // sites all pass an identifier offset.
+    _addRef(
+      node.constructorName.staticElement,
+      node.constructorName.offset,
+    );
     super.visitInstanceCreationExpression(node);
   }
 

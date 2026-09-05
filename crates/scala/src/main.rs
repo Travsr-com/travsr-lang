@@ -219,7 +219,12 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         all_docs.extend(parse_text_documents(&bytes));
     }
 
-    Ok(build_edges(&all_docs, corpus))
+    // #813: `sbt_root`, not `root`. SemanticDB `TextDocument.uri`s are relative
+    // to sbt's sourceroot, which is the sbt project base directory, and
+    // `find_sbt_root` allows that to be a nested directory. Joining them onto
+    // the repo root would not find the file, and the column would silently be
+    // `None` for every reference in such a build.
+    Ok(build_edges(&all_docs, corpus, &sbt_root))
 }
 
 fn run_sbt_compile(
@@ -309,6 +314,9 @@ struct SymbolInfo {
 #[derive(Debug)]
 struct Occurrence {
     start_line: u32,
+    // #813: SemanticDB Range field 2, the occurrence's start character. Kept so
+    // the reference can carry a column where the encoding cannot change it.
+    start_char: u32,
     end_line: u32,
     symbol: String,
     role: u32, // 1 = REFERENCE, 2 = DEFINITION
@@ -352,10 +360,12 @@ fn skip_field(data: &[u8], pos: &mut usize, wire_type: u64) {
     }
 }
 
-/// Parse both start_line (field 1) and end_line (field 3) from a SemanticDB Range message.
-fn parse_range_lines(data: &[u8]) -> (u32, u32) {
+/// Parse start_line (field 1), start_character (field 2) and end_line (field 3)
+/// from a SemanticDB Range message.
+fn parse_range_lines(data: &[u8]) -> (u32, u32, u32) {
     let mut pos = 0;
     let mut start_line = 0u32;
+    let mut start_char = 0u32;
     let mut end_line = 0u32;
     while pos < data.len() {
         let Some(tag) = read_varint(data, &mut pos) else {
@@ -367,6 +377,7 @@ fn parse_range_lines(data: &[u8]) -> (u32, u32) {
             let val = read_varint(data, &mut pos).unwrap_or(0);
             match field {
                 1 => start_line = val as u32,
+                2 => start_char = val as u32,
                 3 => end_line = val as u32,
                 _ => {}
             }
@@ -374,13 +385,14 @@ fn parse_range_lines(data: &[u8]) -> (u32, u32) {
             skip_field(data, &mut pos, wtype);
         }
     }
-    (start_line, end_line)
+    (start_line, start_char, end_line)
 }
 
 fn parse_occurrence(data: &[u8]) -> Occurrence {
     let mut pos = 0;
     let mut occ = Occurrence {
         start_line: 0,
+        start_char: 0,
         end_line: 0,
         symbol: String::new(),
         role: 0,
@@ -397,8 +409,9 @@ fn parse_occurrence(data: &[u8]) -> Occurrence {
                 // range: extract both start_line and end_line
                 let len = read_varint(data, &mut pos).unwrap_or(0) as usize;
                 let end = pos.saturating_add(len).min(data.len());
-                let (sl, el) = parse_range_lines(&data[pos..end]);
+                let (sl, sc, el) = parse_range_lines(&data[pos..end]);
                 occ.start_line = sl;
+                occ.start_char = sc;
                 occ.end_line = if el > 0 { el } else { sl }; // single-line: end == start
                 occ.has_range = true;
                 pos = end;
@@ -583,7 +596,12 @@ fn sdb_vname(symbol: &str, path: &str, corpus: &str) -> VName {
     VName::new(corpus, "", path, "scala", format!("sdb:{symbol}"))
 }
 
-fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
+/// `source_root` is what a `TextDocument.uri` is relative to (sbt's sourceroot,
+/// i.e. the sbt project base directory), used only to read source for the
+/// occurrence column. A wrong or unreadable root costs columns, never edges.
+fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> InvokeResponse {
+    // #813: one read per referenced file, shared across all documents.
+    let mut src_cache = travsr_lang_scip_reader::SourceCache::new();
     let mut nodes = Vec::new();
     let mut edges = Vec::new();
     // #299 S1: occurrence records (path:line) so the daemon can populate
@@ -688,9 +706,15 @@ fn build_edges(docs: &[TextDocument], corpus: &str) -> InvokeResponse {
                     // is_call (#650): no call/non-call signal available here;
                     // preserve prior behavior / wire default (default_true).
                     is_call: true,
-                    // #813: no byte column available here; the daemon
-                    // name-searches the line (no regression).
-                    caller_col: None,
+                    // #813: the occurrence's own column, kept only where the
+                    // encoding cannot change its meaning (SemanticDB counts
+                    // UTF-16 code units, but this does not have to trust that);
+                    // `None` otherwise and the daemon name-searches as before.
+                    caller_col: src_cache.col(
+                        &source_root.join(uri),
+                        occ.start_line + 1,
+                        occ.start_char as i32,
+                    ),
                 });
                 continue;
             }
@@ -780,6 +804,7 @@ mod tests {
 
     fn occ(symbol: &str, line: u32, role: u32) -> Occurrence {
         Occurrence {
+            start_char: 0,
             start_line: line,
             end_line: line,
             symbol: symbol.to_string(),
@@ -818,7 +843,7 @@ mod tests {
             },
         ];
 
-        let resp = build_edges(&docs, "testcorpus");
+        let resp = build_edges(&docs, "testcorpus", Path::new("/nonexistent"));
 
         // exactly one ScipRef, callee keyed on the DEFINITION uri (B.scala)
         let callee_id = sdb_vname("b/Callee#target().", "B.scala", "testcorpus").id();
@@ -849,7 +874,7 @@ mod tests {
             ],
         }];
 
-        let resp = build_edges(&docs, "testcorpus");
+        let resp = build_edges(&docs, "testcorpus", Path::new("/nonexistent"));
 
         assert!(resp.refs.is_empty());
         let src = sdb_vname("a/Caller#call().", "A.scala", "testcorpus").id();
@@ -893,7 +918,7 @@ mod tests {
             ],
         }];
 
-        let resp = build_edges(&docs, "testcorpus");
+        let resp = build_edges(&docs, "testcorpus", Path::new("/nonexistent"));
 
         // Only the class and the method are nodes; no parameter / local node.
         assert_eq!(resp.nodes.len(), 2);
