@@ -261,7 +261,7 @@ fn run_emitter(
         "objc-index-emitter: wrote SCIP index"
     );
 
-    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::ObjectiveC)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::ObjectiveC, root)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

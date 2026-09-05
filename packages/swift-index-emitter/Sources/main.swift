@@ -470,10 +470,17 @@ final class ScipVisitor: SyntaxVisitor {
 
     override func visit(_ node: FunctionCallExprSyntax) -> SyntaxVisitorContinueKind {
         let ln = lineOf(node)
-        let cl = colOf(node)
 
         if let memberAccess = node.calledExpression.as(MemberAccessExprSyntax.self) {
             let memberName = memberAccess.declName.baseName.text
+            // #813: the column names the identifier that is being referenced,
+            // not the start of the whole call expression. For `svc.charge()`
+            // the referenced symbol is `charge`, so pointing at `svc` would
+            // send the editor's definition provider to the receiver variable
+            // (or, for `ClassC.registerEnvironments()`, to the type) instead of
+            // the member. Every other producer travsr reads reports the
+            // referenced identifier's own start.
+            let cl = colOf(memberAccess.declName.baseName)
             if let base = memberAccess.base {
                 if let declRef = base.as(DeclReferenceExprSyntax.self) {
                     let baseName = declRef.baseName.text
@@ -502,6 +509,10 @@ final class ScipVisitor: SyntaxVisitor {
             }
         } else if let declRef = node.calledExpression.as(DeclReferenceExprSyntax.self) {
             let name = declRef.baseName.text
+            // The name token rather than the call expression: identical for a
+            // bare `Foo()` / `foo()`, but stated the same way as the member
+            // paths above so the rule does not have to be re-derived.
+            let cl = colOf(declRef.baseName)
             if name.first?.isUppercase == true {
                 // Constructor call: MyType() → the type itself, not its `.init`
                 // member (#449). find_references/get_callers query by type name
@@ -536,7 +547,8 @@ final class ScipVisitor: SyntaxVisitor {
         let memberName = node.declName.baseName.text
         let baseName = declRef.baseName.text
         let ln = lineOf(node)
-        let cl = colOf(node)
+        // #813: as in the call path, the column names the member, not the base.
+        let cl = colOf(node.declName.baseName)
         if baseName.first?.isUppercase == true {
             // Static member access without a call: ClassC.shared, Color.red.
             references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln, col: cl))

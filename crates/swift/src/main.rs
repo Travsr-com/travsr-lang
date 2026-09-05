@@ -404,6 +404,59 @@ mod tests {
         parse_emitter_output(&path, "testcorpus", Path::new("/nonexistent")).expect("parse")
     }
 
+    /// #813: the emitter declares `col_unit: utf8`, so a column past a
+    /// non-ASCII prefix must be carried through as the byte column rather than
+    /// abstaining the way an undeclared unit does. Uses a real source file,
+    /// since the conversion reads it: the other tests pass `/nonexistent` and
+    /// therefore never exercise this path.
+    #[test]
+    fn declared_utf8_col_survives_a_non_ascii_prefix() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        // `let s = "caf<e-acute>"; svc.charge()` - `charge` starts at byte 21
+        // but at UTF-16 code unit 20, so a reader that guessed the unit would
+        // land one character off, and one that abstained would drop it.
+        let line = "let s = \"caf\u{e9}\"; svc.charge()";
+        assert_eq!(line.find("charge"), Some(21));
+        std::fs::write(repo.path().join("Caller.swift"), format!("{line}\n")).expect("write");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json_path = dir.path().join("out.json");
+        std::fs::write(
+            &json_path,
+            r#"{"version":1,"col_unit":"utf8","documents":[
+                {"path":"Svc.swift","definitions":[
+                    {"symbol":"swift::Svc.charge","kind":"function","line":1,"end_line":3}
+                ],"references":[],"inheritances":[]},
+                {"path":"Caller.swift","definitions":[],
+                 "references":[{"symbol":"swift::Svc.charge","line":1,"col":21}],
+                 "inheritances":[]}
+            ]}"#,
+        )
+        .expect("write canned JSON");
+
+        let resp = parse_emitter_output(&json_path, "testcorpus", repo.path()).expect("parse");
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].caller_line, 1);
+        assert_eq!(resp.refs[0].caller_col, Some(21));
+    }
+
+    /// An emitter binary predating #813 declares no unit and reports no column,
+    /// so nothing is derived and the daemon name-searches the line as before.
+    #[test]
+    fn output_without_col_leaves_caller_col_unset() {
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"ClassA.swift","definitions":[
+                    {"symbol":"swift::ClassA","kind":"class","line":1,"end_line":10}
+                ],"references":[],"inheritances":[]},
+                {"path":"ClassB.swift","definitions":[],
+                 "references":[{"symbol":"swift::ClassA","line":7}],"inheritances":[]}
+            ]}"#,
+        );
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].caller_col, None);
+    }
+
     fn node_id(path: &str, sym: &str) -> NodeId {
         VName::new("testcorpus", "", path, Language::Swift.as_str(), sym).id()
     }

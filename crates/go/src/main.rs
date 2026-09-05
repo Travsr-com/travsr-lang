@@ -132,7 +132,7 @@ fn run_scip_go(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-go produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Go)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Go, root)
 }
 
 fn main() {

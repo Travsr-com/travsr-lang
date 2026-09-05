@@ -157,9 +157,9 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
   int _line(int offset) => lineInfo.getLocation(offset).lineNumber;
 
   /// 0-based column of [offset] on its line. `columnNumber` is 1-based and
-  /// counts Dart string code units (UTF-16). Travsr keeps the occurrence column
-  /// only where the line prefix is ASCII, where UTF-16 and byte offsets are the
-  /// same number, so the unit needs no conversion here (#813).
+  /// counts Dart string code units (UTF-16), which is why the output declares
+  /// `col_unit: utf16`: Travsr's occurrence store keeps a UTF-8 byte column, so
+  /// the consumer converts on any line whose prefix is not ASCII (#813).
   int _col(int offset) => lineInfo.getLocation(offset).columnNumber - 1;
 
   /// Record a definition. [nameOffset] is the name token's offset (for `line`).
@@ -291,7 +291,14 @@ class _ScipVisitor extends RecursiveAstVisitor<void> {
 
   @override
   void visitInstanceCreationExpression(InstanceCreationExpression node) {
-    _addRef(node.constructorName.staticElement, node.offset);
+    // #813: the constructor name's own offset, not `node.offset`, which is the
+    // `new` / `const` keyword when one is written. The column is consumed as
+    // the exact position of the referenced identifier, and the other _addRef
+    // sites all pass an identifier offset.
+    _addRef(
+      node.constructorName.staticElement,
+      node.constructorName.offset,
+    );
     super.visitInstanceCreationExpression(node);
   }
 

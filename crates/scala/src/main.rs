@@ -219,7 +219,12 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         all_docs.extend(parse_text_documents(&bytes));
     }
 
-    Ok(build_edges(&all_docs, corpus, root))
+    // #813: `sbt_root`, not `root`. SemanticDB `TextDocument.uri`s are relative
+    // to sbt's sourceroot, which is the sbt project base directory, and
+    // `find_sbt_root` allows that to be a nested directory. Joining them onto
+    // the repo root would not find the file, and the column would silently be
+    // `None` for every reference in such a build.
+    Ok(build_edges(&all_docs, corpus, &sbt_root))
 }
 
 fn run_sbt_compile(
@@ -591,7 +596,10 @@ fn sdb_vname(symbol: &str, path: &str, corpus: &str) -> VName {
     VName::new(corpus, "", path, "scala", format!("sdb:{symbol}"))
 }
 
-fn build_edges(docs: &[TextDocument], corpus: &str, root: &Path) -> InvokeResponse {
+/// `source_root` is what a `TextDocument.uri` is relative to (sbt's sourceroot,
+/// i.e. the sbt project base directory), used only to read source for the
+/// occurrence column. A wrong or unreadable root costs columns, never edges.
+fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> InvokeResponse {
     // #813: one read per referenced file, shared across all documents.
     let mut src_cache = travsr_lang_scip_reader::SourceCache::new();
     let mut nodes = Vec::new();
@@ -703,7 +711,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str, root: &Path) -> InvokeRespon
                     // UTF-16 code units, but this does not have to trust that);
                     // `None` otherwise and the daemon name-searches as before.
                     caller_col: src_cache.col(
-                        &root.join(uri),
+                        &source_root.join(uri),
                         occ.start_line + 1,
                         occ.start_char as i32,
                     ),
