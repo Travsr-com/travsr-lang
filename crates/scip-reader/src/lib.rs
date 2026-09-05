@@ -272,6 +272,12 @@ pub fn ingest_index(
                     // ingested occurrence is treated as a call. Refining this per
                     // symbol_role is a separate change.
                     is_call: true,
+                    // #813: no source text is loaded here to convert a SCIP
+                    // occurrence's UTF-16 character offset to a byte column, and a
+                    // non-byte column would be a wrong editor position (a wrong
+                    // edge), so leave it unset. The daemon name-searches the line
+                    // as it did before this field existed (no regression).
+                    caller_col: None,
                 });
                 count += 1;
             } else if cross_lang {
@@ -297,6 +303,9 @@ pub fn ingest_index(
                     // resolution behavior for these edges.
                     is_method_call: false,
                     recv_type: None,
+                    // #813: no byte column available for this SCIP occurrence
+                    // (see the ScipRef case above); the daemon name-searches.
+                    caller_col: None,
                 });
                 count += 1;
             }
