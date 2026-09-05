@@ -297,9 +297,16 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                             caller_path: path.to_string(),
                             caller_line: line as u32,
                             callee_id: dst_id,
-                            // is_call (#650): no call/non-call signal available
-                            // here; preserve prior behavior / wire default.
-                            is_call: true,
+                            // is_call (#650, #830): the emitter marks a
+                            // type-position use (annotation, parameter or
+                            // return type, generic argument, conformance, the
+                            // receiver of a qualified access) with
+                            // `"is_call": false` so it records an occurrence
+                            // for find_references without becoming a ref/call
+                            // edge. The key is written only for those, so a
+                            // call site and any JSON from an emitter built
+                            // before the field existed both read `true`.
+                            is_call: r["is_call"].as_bool().unwrap_or(true),
                             // #813: the emitter output carries only a line, no
                             // byte column; the daemon name-searches the line.
                             caller_col: None,
@@ -416,15 +423,44 @@ mod tests {
         assert_eq!(resp.refs[0].caller_line, 7);
         // travsr-lang#17: the ref must be flagged as a call so the daemon derives
         // a call edge (get_callers / blast radius). A ref with is_call=false is
-        // recorded for find_references only and yields no caller edge.
-        //
-        // NOTE: `is_call` is currently a hardcoded `true` at the sole ScipRef
-        // construction site, so this is a change detector: it catches accidental
-        // removal of the field, not a semantic regression. When the follow-up
-        // that refines per-SCIP `symbol_role` lands (flagged in e7a48ac), this
-        // assertion will start failing for the *correct* reason and should be
-        // updated to feed a genuine non-call reference.
+        // recorded for find_references only and yields no caller edge. The
+        // emitter omits `is_call` on a call site, so this also pins the default.
         assert!(resp.refs[0].is_call, "swift call-site ref must set is_call");
+    }
+
+    // #830: a type-position use carries `"is_call": false` and must reach the
+    // daemon as an occurrence-only ScipRef. Without this the emitter's new
+    // annotation / parameter / return / generic / conformance references would
+    // each become a `ref/call` edge, and `get_callers(ClassA)` would list every
+    // declaration site that merely names the type as a caller.
+    #[test]
+    fn type_position_ref_is_not_a_call() {
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"ClassA.swift","definitions":[
+                    {"symbol":"swift::ClassA","kind":"class","line":1,"end_line":10}
+                ],"references":[],"inheritances":[]},
+                {"path":"ClassB.swift","definitions":[],
+                 "references":[
+                    {"symbol":"swift::ClassA","line":7,"is_call":false},
+                    {"symbol":"swift::ClassA","line":9}
+                 ],"inheritances":[]}
+            ]}"#,
+        );
+        assert_eq!(resp.refs.len(), 2);
+        // The annotation at line 7 is an occurrence only.
+        assert_eq!(resp.refs[0].caller_line, 7);
+        assert!(
+            !resp.refs[0].is_call,
+            "type-position ref must not be a call"
+        );
+        // The call site at line 9 omits the key and keeps the `true` default,
+        // which is also what JSON from a pre-#830 emitter binary looks like.
+        assert_eq!(resp.refs[1].caller_line, 9);
+        assert!(
+            resp.refs[1].is_call,
+            "call-site ref must default to is_call"
+        );
     }
 
     #[test]
