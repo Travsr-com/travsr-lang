@@ -36,7 +36,7 @@ const TIMEOUT_SECS: u64 = 600;
 // command rather than an injected `.sbt` setting. A bare `semanticdbEnabled :=
 // true` in a root settings file binds only to the root project, and even
 // `ThisBuild / semanticdbEnabled := true` does not reach sbt-crossproject
-// sub-projects (their per-project default shadows the ThisBuild value —
+// sub-projects (their per-project default shadows the ThisBuild value;
 // verified: `parserCombinatorsJVM / Compile / semanticdbEnabled` stays false).
 // So a multi-module build (e.g. scala-parser-combinators, where `root`
 // aggregates parserCombinatorsJVM/JS/Native and carries no sources of its own)
@@ -132,14 +132,23 @@ fn find_sbt_root(root: &Path, max_depth: usize) -> Option<PathBuf> {
     None
 }
 
-/// Walk the whole sbt project collecting all `*.semanticdb` files (any depth).
+/// Walk the whole sbt project collecting `*.semanticdb` files written under a
+/// `target/` directory (any depth).
 ///
 /// #832: a multi-module / sbt-crossproject build writes SemanticDB under each
 /// sub-project's own `target/` (e.g. `<root>/jvm/target/.../meta-inf/semanticdb`),
 /// not only `<root>/target/`, so searching a single top-level `target/` misses
-/// every sub-project's output. `.semanticdb` files only ever live under a
-/// `target/` dir, so walking source trees too is harmless (and cheap next to a
-/// Scala compile); skip VCS / dependency noise dirs.
+/// every sub-project's output. `.semanticdb` files written by the compiler only
+/// ever live under a `target/` dir, so walking source trees too is harmless
+/// (and cheap next to a Scala compile).
+///
+/// Two rules keep the widened walk from picking up someone else's copy:
+/// every dot-directory is skipped, and a file is only collected when a `target`
+/// component precedes it. Metals/Bloop compile the same sources into
+/// `.bloop/<project>/bloop-bsp-clients-classes/.../META-INF/semanticdb/`, which
+/// would otherwise be parsed alongside sbt's own output: the same
+/// `TextDocument`s twice, from a copy that can lag the source and produce stale
+/// `edge_sites` lines.
 fn find_semanticdb_files(sbt_root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut queue: VecDeque<PathBuf> = VecDeque::new();
@@ -152,15 +161,28 @@ fn find_semanticdb_files(sbt_root: &Path) -> Vec<PathBuf> {
             let p = e.path();
             if p.is_dir() {
                 let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                if !matches!(name, ".git" | "node_modules" | ".travsr") {
+                // Skip dot-dirs (.git, .bloop, .metals, .bsp, .idea, .travsr)
+                // and dependency caches; everything else may hold a `target/`.
+                if !name.starts_with('.') && name != "node_modules" {
                     queue.push_back(p);
                 }
-            } else if p.extension().and_then(|e| e.to_str()) == Some("semanticdb") {
+            } else if p.extension().and_then(|e| e.to_str()) == Some("semanticdb")
+                && under_target_dir(sbt_root, &p)
+            {
                 found.push(p);
             }
         }
     }
     found
+}
+
+/// True when `file`, relative to `sbt_root`, has a `target` path component.
+/// Only the part below the sbt root is examined, so an sbt project that itself
+/// sits under a directory called `target` is not mistaken for build output.
+fn under_target_dir(sbt_root: &Path, file: &Path) -> bool {
+    let rel = file.strip_prefix(sbt_root).unwrap_or(file);
+    rel.components()
+        .any(|c| c.as_os_str().eq_ignore_ascii_case("target"))
 }
 
 /// `InvokeRequest::root` arrives on Windows already canonicalized with the
@@ -813,6 +835,63 @@ mod tests {
             strip_windows_verbatim_prefix("/home/u/repo").as_ref(),
             "/home/u/repo"
         );
+    }
+
+    fn touch(root: &Path, rel: &str) -> PathBuf {
+        let p = root.join(rel);
+        if let Some(parent) = p.parent() {
+            std::fs::create_dir_all(parent).expect("create parent");
+        }
+        std::fs::write(&p, b"").expect("write file");
+        p
+    }
+
+    // #832: sub-project `target/` output is collected at any depth, while the
+    // copies Metals/Bloop keep under dot-directories are not.
+    #[test]
+    fn find_semanticdb_files_collects_subproject_target_and_skips_tool_caches() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let jvm = touch(
+            root,
+            "jvm/target/scala-2.13/meta/META-INF/semanticdb/A.scala.semanticdb",
+        );
+        let native = touch(
+            root,
+            "native/target/scala-2.13/meta/META-INF/semanticdb/B.scala.semanticdb",
+        );
+        // Same sources, compiled by Bloop/Metals; must not be picked up.
+        touch(
+            root,
+            ".bloop/jvm/bloop-bsp-clients-classes/classes-Metals/META-INF/semanticdb/A.scala.semanticdb",
+        );
+        touch(root, ".git/objects/stale/A.scala.semanticdb");
+        touch(root, ".metals/readonly/C.scala.semanticdb");
+        // Not build output: a `.semanticdb` sitting in a source tree.
+        touch(root, "jvm/src/main/scala/D.scala.semanticdb");
+
+        let mut found = find_semanticdb_files(root);
+        found.sort();
+        let mut want = vec![jvm, native];
+        want.sort();
+        assert_eq!(found, want);
+    }
+
+    #[test]
+    fn tail_truncates_on_a_char_boundary() {
+        // Under the limit: returned verbatim, no marker.
+        assert_eq!(tail("abc", 8), "abc");
+        assert_eq!(tail("abcdefgh", 8), "abcdefgh");
+
+        let out = tail("abcdefghij", 4);
+        assert_eq!(out, "...(truncated)...\nghij");
+
+        // A cut landing mid-character advances to the next boundary rather
+        // than slicing a multi-byte char in half.
+        let s = "aa\u{00e9}bb"; // 6 bytes: 'a' 'a' 0xC3 0xA9 'b' 'b'
+        let out = tail(s, 3);
+        assert_eq!(out, "...(truncated)...\nbb");
     }
 
     fn sym(symbol: &str, kind: u32) -> SymbolInfo {
