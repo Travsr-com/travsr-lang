@@ -965,10 +965,11 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("a.rb"), "from disk").expect("write");
         doc.text = String::new();
-        let root = format!("file://{}", tmp.path().display());
+        let root = to_file_uri(tmp.path());
         assert_eq!(
             document_text(&doc, &root, Path::new("")).as_deref(),
-            Some("from disk")
+            Some("from disk"),
+            "project_root {root} should have resolved"
         );
 
         // #813 review: a project_root this cannot resolve must not silently
@@ -985,6 +986,27 @@ mod tests {
         // Neither root: nothing to read, so no column is derived.
         assert_eq!(document_text(&doc, "", Path::new("")), None);
     }
+
+    /// A well-formed `file://` URI for `p` on the running platform: a Windows
+    /// path needs its separators flipped and a third slash before the drive
+    /// (`C:\\x` -> `file:///C:/x`), which is exactly the shape that made
+    /// `strip_prefix("file://")` fail.
+    fn to_file_uri(p: &Path) -> String {
+        let s = p.display().to_string().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
+
+    /// An absolute path for the running platform. `/idx/root` has a root on
+    /// Windows but is not `is_absolute()` there (no drive), so a test that
+    /// wants a usable root has to spell one the platform accepts.
+    #[cfg(windows)]
+    const ABS_IDX_ROOT: &str = "C:/idx/root";
+    #[cfg(not(windows))]
+    const ABS_IDX_ROOT: &str = "/idx/root";
 
     /// `file://` URI decoding, the shapes `strip_prefix("file://")` got wrong.
     #[test]
@@ -1023,15 +1045,27 @@ mod tests {
     /// relative one defers to the repo root.
     #[test]
     fn source_root_prefers_a_usable_project_root() {
-        let repo = Path::new("/repo");
+        let repo_buf = std::path::PathBuf::from(if cfg!(windows) { "C:/repo" } else { "/repo" });
+        let repo = repo_buf.as_path();
+        let idx = Path::new(ABS_IDX_ROOT);
+
         assert_eq!(
-            source_root("file:///idx/root", repo).as_deref(),
-            Some(Path::new("/idx/root"))
+            source_root(&to_file_uri(idx), repo).as_deref(),
+            Some(idx),
+            "a well-formed absolute project_root URI wins"
         );
         assert_eq!(
-            source_root("/idx/root", repo).as_deref(),
-            Some(Path::new("/idx/root"))
+            source_root(ABS_IDX_ROOT, repo).as_deref(),
+            Some(idx),
+            "a bare absolute path is honoured too"
         );
+        // A POSIX-style root on Windows has a root but no drive, so it is not
+        // usable there and the repo root is taken instead. This is the same
+        // fallback an absent root gets, which is the point: an unusable root
+        // must not silently cost every column.
+        #[cfg(windows)]
+        assert_eq!(source_root("file:///idx/root", repo).as_deref(), Some(repo));
+
         assert_eq!(source_root("", repo).as_deref(), Some(repo));
         assert_eq!(source_root("rel/root", repo).as_deref(), Some(repo));
         assert_eq!(
