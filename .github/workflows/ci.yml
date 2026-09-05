@@ -192,15 +192,40 @@ jobs:
               let config: Config
               func greet() -> Config { config }
           }
+          struct Stack<Config> {
+              func push(_ x: Config) {}
+          }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('/tmp/swift_smoke_out.json'))
+          refs = [r for doc in d['documents'] for r in doc['references']]
+          errs = []
           # travsr#830: a type used only in annotation / return position must be
           # emitted as a reference, not just tracked. `Config` appears only in the
           # field annotation and the return type here, so a reference to it proves
           # type-position capture is on. Checks the references array specifically,
           # since `swift::Config` is also present as a definition.
-          python3 -c "import json,sys; d=json.load(open('/tmp/swift_smoke_out.json')); refs=[r['symbol'] for doc in d['documents'] for r in doc['references']]; sys.exit(0 if 'swift::Config' in refs else 1)"
+          config = [r for r in refs if r['symbol'] == 'swift::Config']
+          if not config:
+              errs.append('no reference to swift::Config (type-position capture off)')
+          # A type-position use is an occurrence, not a call: with is_call unset
+          # the wrapper defaults it to true and every annotation becomes a
+          # ref/call edge, so get_callers(Config) would list declaration sites.
+          if any(r.get('is_call', True) for r in config):
+              errs.append('type-position reference to swift::Config is flagged is_call')
+          # `Config` as the generic parameter of Stack shadows the real type; both
+          # references above are the annotation and the return type, so a third
+          # would be the generic parameter leaking through.
+          if len(config) != 2:
+              errs.append('expected 2 swift::Config refs, got %d (generic parameter leaked?)' % len(config))
+          if errs:
+              print('\n'.join(errs))
+              print(json.dumps(refs, indent=2))
+              sys.exit(1)
+          PY
 
   swift-linux:
     name: swift emitter (Linux)
@@ -226,15 +251,40 @@ jobs:
               let config: Config
               func greet() -> Config { config }
           }
+          struct Stack<Config> {
+              func push(_ x: Config) {}
+          }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('/tmp/swift_smoke_out.json'))
+          refs = [r for doc in d['documents'] for r in doc['references']]
+          errs = []
           # travsr#830: a type used only in annotation / return position must be
           # emitted as a reference, not just tracked. `Config` appears only in the
           # field annotation and the return type here, so a reference to it proves
           # type-position capture is on. Checks the references array specifically,
           # since `swift::Config` is also present as a definition.
-          python3 -c "import json,sys; d=json.load(open('/tmp/swift_smoke_out.json')); refs=[r['symbol'] for doc in d['documents'] for r in doc['references']]; sys.exit(0 if 'swift::Config' in refs else 1)"
+          config = [r for r in refs if r['symbol'] == 'swift::Config']
+          if not config:
+              errs.append('no reference to swift::Config (type-position capture off)')
+          # A type-position use is an occurrence, not a call: with is_call unset
+          # the wrapper defaults it to true and every annotation becomes a
+          # ref/call edge, so get_callers(Config) would list declaration sites.
+          if any(r.get('is_call', True) for r in config):
+              errs.append('type-position reference to swift::Config is flagged is_call')
+          # `Config` as the generic parameter of Stack shadows the real type; both
+          # references above are the annotation and the return type, so a third
+          # would be the generic parameter leaking through.
+          if len(config) != 2:
+              errs.append('expected 2 swift::Config refs, got %d (generic parameter leaked?)' % len(config))
+          if errs:
+              print('\n'.join(errs))
+              print(json.dumps(refs, indent=2))
+              sys.exit(1)
+          PY
 
   dart:
     name: dart emitter (Linux)

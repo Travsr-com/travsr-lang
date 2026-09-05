@@ -51,6 +51,37 @@ struct Definition: Encodable {
 struct Reference: Encodable {
     let symbol: String
     let line: Int
+    /// Whether this occurrence is a call site.
+    ///
+    /// `true` (the default) makes the Rust wrapper set `ScipRef.is_call`, which
+    /// `travsr-store::write_scip_attributed_batch` turns into a `ref/call` edge
+    /// from the enclosing function. Type-position uses (annotations, parameter
+    /// and return types, generic arguments, conformances, the receiver type of a
+    /// qualified access) are NOT calls: they must record only their occurrence,
+    /// so `find_references` enumerates them while `get_callers` and blast radius
+    /// stay a call graph.
+    ///
+    /// Serialised only when `false`, so the field is additive: a wrapper built
+    /// before it existed reads no key and keeps today's `true` default.
+    let isCall: Bool
+
+    init(symbol: String, line: Int, isCall: Bool = true) {
+        self.symbol = symbol
+        self.line = line
+        self.isCall = isCall
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case symbol, line
+        case isCall = "is_call"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(symbol, forKey: .symbol)
+        try c.encode(line, forKey: .line)
+        if !isCall { try c.encode(false, forKey: .isCall) }
+    }
 }
 
 /// Type-level inheritance or protocol conformance.
@@ -174,6 +205,14 @@ final class ScipVisitor: SyntaxVisitor {
     // are left unresolved rather than guessed.
     private var scopeStack: [[String: String]] = []
 
+    // Stack of in-scope generic parameter names, one frame per declaration that
+    // introduces a generic parameter clause. `struct Stack<Item>` and
+    // `func map<Element>(...)` bind names that look exactly like type names, so
+    // without this a repo that also defines a real `Item` or `Element` type gets
+    // a reference to the wrong thing. Pushed and popped alongside typeStack /
+    // scopeStack so nesting works.
+    private var genericParamStack: [Set<String>] = []
+
     init(converter: SourceLocationConverter) {
         self.converter = converter
         super.init(viewMode: .sourceAccurate)
@@ -214,6 +253,39 @@ final class ScipVisitor: SyntaxVisitor {
             if let t = frame[name] { return t }
         }
         return nil
+    }
+
+    // ── Generic parameter helpers ──────────────────────────────────────────────
+
+    /// Push one frame holding the names bound by `clause` (an empty frame when
+    /// the declaration is not generic, so every push has a matching pop), and
+    /// record the constraint types: `<T: Proto>` is a real use of `Proto`.
+    private func pushGenerics(_ clause: GenericParameterClauseSyntax?) {
+        guard let clause = clause else {
+            genericParamStack.append([])
+            return
+        }
+        var names: Set<String> = []
+        for param in clause.parameters {
+            names.insert(param.name.text)
+        }
+        genericParamStack.append(names)
+        // Recorded after the frame is pushed so a constraint that mentions an
+        // earlier parameter of the same clause is not emitted as a type.
+        for param in clause.parameters {
+            recordTypeReference(param.inheritedType)
+        }
+    }
+
+    private func popGenerics() {
+        if !genericParamStack.isEmpty { genericParamStack.removeLast() }
+    }
+
+    private func isGenericParam(_ name: String) -> Bool {
+        for frame in genericParamStack.reversed() where frame.contains(name) {
+            return true
+        }
+        return false
     }
 
     // ── Type name extraction ───────────────────────────────────────────────────
@@ -265,16 +337,18 @@ final class ScipVisitor: SyntaxVisitor {
         guard let type = type else { return }
         if let id = type.as(IdentifierTypeSyntax.self) {
             let name = id.name.text
-            if !name.isEmpty, !Self.builtinTypes.contains(name) {
-                references.append(Reference(symbol: "swift::\(name)", line: lineOf(id.name)))
+            if !name.isEmpty, !Self.builtinTypes.contains(name), !isGenericParam(name) {
+                references.append(Reference(
+                    symbol: "swift::\(name)", line: lineOf(id.name), isCall: false))
             }
             if let generics = id.genericArgumentClause {
                 for arg in generics.arguments { recordTypeReference(arg.argument) }
             }
         } else if let member = type.as(MemberTypeSyntax.self) {
             let name = member.name.text
-            if !name.isEmpty, !Self.builtinTypes.contains(name) {
-                references.append(Reference(symbol: "swift::\(name)", line: lineOf(member.name)))
+            if !name.isEmpty, !Self.builtinTypes.contains(name), !isGenericParam(name) {
+                references.append(Reference(
+                    symbol: "swift::\(name)", line: lineOf(member.name), isCall: false))
             }
             if let generics = member.genericArgumentClause {
                 for arg in generics.arguments { recordTypeReference(arg.argument) }
@@ -347,29 +421,41 @@ final class ScipVisitor: SyntaxVisitor {
     override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
         definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
+        pushGenerics(node.genericParameterClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
     }
-    override func visitPost(_ node: ClassDeclSyntax) { typeStack.removeLast() }
+    override func visitPost(_ node: ClassDeclSyntax) {
+        typeStack.removeLast()
+        popGenerics()
+    }
 
     override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
         definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
+        pushGenerics(node.genericParameterClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
     }
-    override func visitPost(_ node: StructDeclSyntax) { typeStack.removeLast() }
+    override func visitPost(_ node: StructDeclSyntax) {
+        typeStack.removeLast()
+        popGenerics()
+    }
 
     override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
         definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
+        pushGenerics(node.genericParameterClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
     }
-    override func visitPost(_ node: EnumDeclSyntax) { typeStack.removeLast() }
+    override func visitPost(_ node: EnumDeclSyntax) {
+        typeStack.removeLast()
+        popGenerics()
+    }
 
     override func visit(_ node: ProtocolDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
@@ -383,11 +469,15 @@ final class ScipVisitor: SyntaxVisitor {
     override func visit(_ node: ActorDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
         definitions.append(Definition(symbol: "swift::\(name)", kind: "class", line: lineOf(node.name), endLine: endLineOf(node.memberBlock.rightBrace)))
+        pushGenerics(node.genericParameterClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
         typeStack.append(name)
         return .visitChildren
     }
-    override func visitPost(_ node: ActorDeclSyntax) { typeStack.removeLast() }
+    override func visitPost(_ node: ActorDeclSyntax) {
+        typeStack.removeLast()
+        popGenerics()
+    }
 
     override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
         // Push the extended type name so extension members share symbols with
@@ -395,6 +485,14 @@ final class ScipVisitor: SyntaxVisitor {
         // Strip generic parameters: "Array<Element>" → "Array".
         let fullName = node.extendedType.trimmedDescription
         let typeName = fullName.components(separatedBy: "<").first ?? fullName
+        // #830: the extended type is itself a type-position use, and an
+        // extension's inheritance clause is a real conformance. Neither was
+        // recorded, so `extension Foo: Proto {}` was invisible to both
+        // find_references and the IsImplementation edges. Emitted before the
+        // typeStack push so emitInheritances keys the child on `typeName`
+        // rather than on an enclosing type.
+        recordTypeReference(node.extendedType)
+        emitInheritances(for: typeName, clause: node.inheritanceClause)
         typeStack.append(typeName)
         return .visitChildren
     }
@@ -419,13 +517,17 @@ final class ScipVisitor: SyntaxVisitor {
             endLine: endLine
         ))
         pushScope()
+        pushGenerics(node.genericParameterClause)
         if let t = currentType { bindLocal("self", type: t) }
         bindParameters(node.signature.parameterClause.parameters)
         // #830: the declared return type is a use of that type.
         recordTypeReference(node.signature.returnClause?.type)
         return .visitChildren
     }
-    override func visitPost(_ node: FunctionDeclSyntax) { popScope() }
+    override func visitPost(_ node: FunctionDeclSyntax) {
+        popGenerics()
+        popScope()
+    }
 
     override func visit(_ node: InitializerDeclSyntax) -> SyntaxVisitorContinueKind {
         if let t = currentType {
@@ -438,11 +540,15 @@ final class ScipVisitor: SyntaxVisitor {
             ))
         }
         pushScope()
+        pushGenerics(node.genericParameterClause)
         if let t = currentType { bindLocal("self", type: t) }
         bindParameters(node.signature.parameterClause.parameters)
         return .visitChildren
     }
-    override func visitPost(_ node: InitializerDeclSyntax) { popScope() }
+    override func visitPost(_ node: InitializerDeclSyntax) {
+        popGenerics()
+        popScope()
+    }
 
     override func visit(_ node: SubscriptDeclSyntax) -> SyntaxVisitorContinueKind {
         if let t = currentType {
@@ -455,11 +561,13 @@ final class ScipVisitor: SyntaxVisitor {
                 endLine: endLine
             ))
         }
+        pushGenerics(node.genericParameterClause)
         // #830: subscript parameter and result types are uses of those types.
         for param in node.parameterClause.parameters { recordTypeReference(param.type) }
         recordTypeReference(node.returnClause.type)
         return .visitChildren
     }
+    override func visitPost(_ node: SubscriptDeclSyntax) { popGenerics() }
 
     override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
         for binding in node.bindings {
@@ -508,11 +616,14 @@ final class ScipVisitor: SyntaxVisitor {
                     let name: String
                     if let second = param.secondName { name = second.text }
                     else { name = param.firstName.text }
+                    // #830: as in bindParameters, the type is referenced
+                    // regardless of the parameter name, so record it before the
+                    // `_` guard that only governs local binding.
+                    recordTypeReference(param.type)
                     guard name != "_", !name.isEmpty else { continue }
                     if let typeAnn = param.type {
                         let typeName = simpleTypeName(typeAnn)
                         if !typeName.isEmpty { bindLocal(name, type: typeName) }
-                        recordTypeReference(typeAnn)
                     }
                 }
             }
@@ -537,7 +648,8 @@ final class ScipVisitor: SyntaxVisitor {
                         // #830: the receiver type itself is used here too, so a
                         // query for `SomeType` finds this qualified access.
                         if !Self.builtinTypes.contains(baseName) {
-                            references.append(Reference(symbol: "swift::\(baseName)", line: ln))
+                            references.append(Reference(
+                                symbol: "swift::\(baseName)", line: ln, isCall: false))
                         }
                     } else {
                         // Instance call: instance.method()
@@ -599,7 +711,8 @@ final class ScipVisitor: SyntaxVisitor {
             references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln))
             // #830: the receiver type itself is used here too.
             if !Self.builtinTypes.contains(baseName) {
-                references.append(Reference(symbol: "swift::\(baseName)", line: ln))
+                references.append(Reference(
+                    symbol: "swift::\(baseName)", line: ln, isCall: false))
             }
         } else if let resolvedType = lookupType(baseName) {
             // Property access on an explicitly-typed local: svc.total.
