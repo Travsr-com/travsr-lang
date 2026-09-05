@@ -103,7 +103,20 @@ fn extract_args(item: &serde_json::Value, file: &Path) -> Vec<String> {
 
 fn glob_fallback(root: &Path, files: Option<&[String]>) -> Vec<CompilationEntry> {
     let sdk = sdk_path();
-    let root_str = root.to_string_lossy().into_owned();
+
+    // One traversal collects both the `.m`/`.mm` sources to index and every
+    // directory that holds a header. #831: the pre-existing single `-I<root>`
+    // could not resolve a quoted `#import "Foo.h"` when `Foo.h` lives in a
+    // subdirectory (the common project layout: sources in `Tests/`, headers in
+    // `Foo/`). An unresolved import leaves the imported class *undeclared*, and
+    // clang then drops the whole `[Foo bar]` send from the AST, so no cursor
+    // walk can recover its ref. Adding every header directory to the search
+    // path lets those imports resolve so the sends parse as real message exprs.
+    let mut sources = Vec::new();
+    let mut header_dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    // The root is always a search path (matches the previous behavior).
+    header_dirs.insert(root.to_path_buf());
+    walk_tree(root, &mut sources, &mut header_dirs);
 
     let source_files: Vec<PathBuf> = if let Some(list) = files {
         list.iter()
@@ -116,8 +129,27 @@ fn glob_fallback(root: &Path, files: Option<&[String]>) -> Vec<CompilationEntry>
             })
             .collect()
     } else {
-        walk_objc_files(root)
+        sources
     };
+
+    // Search paths + sysroot + framework paths are identical for every TU, so
+    // build them once and share.
+    let mut common: Vec<String> = header_dirs
+        .iter()
+        .map(|d| format!("-I{}", d.to_string_lossy()))
+        .collect();
+    if let Some(ref sdk) = sdk {
+        common.push("-isysroot".to_string());
+        common.push(sdk.clone());
+    }
+    // Best-effort: point at the active platform's framework directory (where
+    // XCTest.framework lives) so test targets can parse. Present only with a
+    // full Xcode install; empty under the Command Line Tools, where no XCTest
+    // exists to find and this is simply skipped.
+    if let Some(ref fw) = platform_frameworks() {
+        common.push("-iframework".to_string());
+        common.push(fw.clone());
+    }
 
     source_files
         .into_iter()
@@ -133,30 +165,21 @@ fn glob_fallback(root: &Path, files: Option<&[String]>) -> Vec<CompilationEntry>
             } else {
                 "objective-c"
             };
-            let mut args = vec![
-                "-x".to_string(),
-                lang.to_string(),
-                "-fobjc-arc".to_string(),
-                format!("-I{root_str}"),
-            ];
-
-            if let Some(ref sdk) = sdk {
-                args.push("-isysroot".to_string());
-                args.push(sdk.clone());
-            }
+            let mut args = vec!["-x".to_string(), lang.to_string(), "-fobjc-arc".to_string()];
+            args.extend(common.iter().cloned());
 
             CompilationEntry { file, args }
         })
         .collect()
 }
 
-fn walk_objc_files(root: &Path) -> Vec<PathBuf> {
-    let mut results = Vec::new();
-    walk_dir(root, root, &mut results);
-    results
-}
-
-fn walk_dir(_root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
+/// Single filesystem walk that collects `.m`/`.mm` sources to index and every
+/// directory containing a C/ObjC header (so the header can be `#import`ed).
+fn walk_tree(
+    dir: &Path,
+    sources: &mut Vec<PathBuf>,
+    header_dirs: &mut std::collections::BTreeSet<PathBuf>,
+) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -171,13 +194,40 @@ fn walk_dir(_root: &Path, dir: &Path, out: &mut Vec<PathBuf>) {
             {
                 continue;
             }
-            walk_dir(_root, &path, out);
+            walk_tree(&path, sources, header_dirs);
         } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
             if matches!(ext, "m" | "mm") {
-                out.push(path);
+                sources.push(path);
+            } else if matches!(ext, "h" | "hh" | "hpp" | "hxx" | "pch") {
+                header_dirs.insert(dir.to_path_buf());
             }
         }
     }
+}
+
+static PLATFORM_FRAMEWORKS: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// The active platform's `Developer/Library/Frameworks` directory (home of
+/// `XCTest.framework`), or `None` under the Command Line Tools where
+/// `--show-sdk-platform-path` is empty and no such directory exists.
+fn platform_frameworks() -> Option<String> {
+    PLATFORM_FRAMEWORKS
+        .get_or_init(|| {
+            let out = std::process::Command::new("xcrun")
+                .arg("--show-sdk-platform-path")
+                .output()
+                .ok()?;
+            if !out.status.success() {
+                return None;
+            }
+            let base = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if base.is_empty() {
+                return None;
+            }
+            let fw = Path::new(&base).join("Developer/Library/Frameworks");
+            fw.is_dir().then(|| fw.to_string_lossy().into_owned())
+        })
+        .clone()
 }
 
 static SDK_PATH: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
@@ -196,4 +246,37 @@ fn sdk_path() -> Option<String> {
             }
         })
         .clone()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn glob_fallback_adds_subdirectory_header_dirs() {
+        // #831: a header in a subdirectory must join the include search path so
+        // a quoted `#import "Foo.h"` from another directory resolves. The
+        // pre-#831 single `-I<root>` could not, leaving the class undeclared.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::create_dir_all(root.join("include/foo")).unwrap();
+        std::fs::write(root.join("app/Main.m"), "int main(){return 0;}\n").unwrap();
+        std::fs::write(root.join("include/foo/Foo.h"), "@interface Foo\n@end\n").unwrap();
+
+        let entries = discover(root, None);
+        let main = entries
+            .iter()
+            .find(|e| e.file.ends_with("app/Main.m"))
+            .expect("Main.m discovered");
+
+        let want = format!("-I{}", root.join("include/foo").to_string_lossy());
+        assert!(
+            main.args.contains(&want),
+            "expected the header's subdirectory on the include path: {want}\n got {:?}",
+            main.args
+        );
+        // The root itself stays a search path (prior behavior preserved).
+        assert!(main.args.contains(&format!("-I{}", root.to_string_lossy())));
+    }
 }

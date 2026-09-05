@@ -242,10 +242,12 @@ extern "C" fn visit_top_level(
                 // this via visit_members; a plain C function is dispatched here at
                 // the top level, so without this walk its calls were never
                 // collected and produced no ref/call edges.
+                let tu = ctx.tu;
                 let mut ref_ctx = RefCtx {
                     corpus: ctx.builder.corpus.clone(),
                     root: ctx.builder.root.clone(),
                     builder: ctx.builder,
+                    tu,
                 };
                 unsafe {
                     clang_visitChildren(cursor, visit_refs, &mut ref_ctx as *mut _ as _);
@@ -280,7 +282,7 @@ fn handle_interface(cursor: CXCursor, ctx: &mut VisitorCtx) {
     }
 
     // Visit methods and properties declared in this interface.
-    walk_members(cursor, class_name, ctx.builder);
+    walk_members(cursor, class_name, ctx.builder, ctx.tu);
 }
 
 // ── @implementation handler ───────────────────────────────────────────────────
@@ -301,7 +303,7 @@ fn handle_implementation(cursor: CXCursor, ctx: &mut VisitorCtx) {
         // avoid duplicating the class node with potentially empty relationships.
     }
 
-    walk_members(cursor, class_name, ctx.builder);
+    walk_members(cursor, class_name, ctx.builder, ctx.tu);
 }
 
 // ── Category handler ──────────────────────────────────────────────────────────
@@ -326,7 +328,7 @@ fn handle_category(cursor: CXCursor, kind: CXCursorKind, ctx: &mut VisitorCtx) {
         }
     }
 
-    walk_members(cursor, base_class, ctx.builder);
+    walk_members(cursor, base_class, ctx.builder, ctx.tu);
 }
 
 // ── @protocol handler ─────────────────────────────────────────────────────────
@@ -346,14 +348,19 @@ fn handle_protocol(cursor: CXCursor, ctx: &mut VisitorCtx) {
 
     // Protocol methods are ObjCMethodDecl children, emitted under the
     // protocol name (used as the "class_name" for selector scoping).
-    walk_members(cursor, proto_name, ctx.builder);
+    walk_members(cursor, proto_name, ctx.builder, ctx.tu);
 }
 
 // ── Member visitor (methods + properties inside a type) ───────────────────────
 
 /// Collect the `(line, col)` of every `@property` declaration under `container`,
 /// then walk its members (skipping synthesized property accessors, #596).
-fn walk_members(container: CXCursor, class_name: String, builder: &mut IndexBuilder) {
+fn walk_members(
+    container: CXCursor,
+    class_name: String,
+    builder: &mut IndexBuilder,
+    tu: CXTranslationUnit,
+) {
     let mut property_locs: std::collections::HashSet<(u32, u32)> = std::collections::HashSet::new();
     unsafe {
         clang_visitChildren(
@@ -366,6 +373,7 @@ fn walk_members(container: CXCursor, class_name: String, builder: &mut IndexBuil
         class_name,
         builder,
         property_locs,
+        tu,
     };
     unsafe {
         clang_visitChildren(container, visit_members, &mut member_ctx as *mut _ as _);
@@ -395,6 +403,9 @@ struct MemberCtx<'a> {
     /// (#596): they have no tree-sitter Phase A counterpart and would survive
     /// as un-unifiable orphan def nodes.
     property_locs: std::collections::HashSet<(u32, u32)>,
+    // #831: threaded to the method-body `RefCtx` so an unresolved class-message
+    // send can be tokenized from source.
+    tu: CXTranslationUnit,
 }
 
 extern "C" fn visit_members(
@@ -434,10 +445,12 @@ extern "C" fn visit_members(
                 ctx.builder.add_symbol_info(&rel_path, si);
 
                 // Walk method body for ObjCMessageExpr call-site references.
+                let tu = ctx.tu;
                 let mut ref_ctx = RefCtx {
                     corpus: ctx.builder.corpus.clone(),
                     root: ctx.builder.root.clone(),
                     builder: ctx.builder,
+                    tu,
                 };
                 unsafe {
                     clang_visitChildren(cursor, visit_refs, &mut ref_ctx as *mut _ as _);
@@ -473,6 +486,11 @@ struct RefCtx<'a> {
     corpus: String,
     root: PathBuf,
     builder: &'a mut IndexBuilder,
+    // #831: needed to tokenize an unresolved class-message send's source extent
+    // when clang could not resolve the callee (the semantic receiver/selector
+    // are then empty). `CXTranslationUnit` is a Copy pointer bounded by the
+    // enclosing `process_tu` visit, same as every other cursor here.
+    tu: CXTranslationUnit,
 }
 
 extern "C" fn visit_refs(
@@ -537,8 +555,24 @@ extern "C" fn visit_refs(
             // ObjCClassRef child, so synthesize the target symbol from
             // receiver + selector. Instance receivers with unknown type remain
             // skipped (precision over recall).
-            let selector = cursor_spelling(cursor);
-            let receiver = first_objc_class_ref(cursor);
+            //
+            // #831: when the *whole* callee class is undeclared in the TU (a
+            // test/example target whose `#import` chain dies on a missing
+            // framework header under the glob fallback), the receiver is not an
+            // `ObjCClassRef` and `cursor_spelling` on the message expr is empty,
+            // so the semantic pair above is `("", "")` and every
+            // `[ClassName selector]` call (the most common Obj-C pattern)
+            // produced no ref occurrence at all. Recover the receiver and
+            // selector lexically from the send's own source tokens, which are
+            // present regardless of semantic resolution.
+            let mut selector = cursor_spelling(cursor);
+            let mut receiver = first_objc_class_ref(cursor);
+            if (selector.is_empty() || receiver.is_empty()) && !ctx.tu.is_null() {
+                if let Some((r, s)) = syntactic_class_send(ctx.tu, cursor) {
+                    receiver = r;
+                    selector = s;
+                }
+            }
             if !selector.is_empty() && !receiver.is_empty() {
                 let target_sym = symbol::method_symbol(&ctx.corpus, &receiver, &selector);
                 if let Some((rel_path, ref_occ)) =
@@ -639,6 +673,106 @@ fn category_base_class(category_cursor: CXCursor) -> String {
 /// [`category_base_class`]; named separately for call-site clarity (#449).
 fn first_objc_class_ref(cursor: CXCursor) -> String {
     category_base_class(cursor)
+}
+
+/// #831: recover `(receiver, selector)` for a class-message send from its source
+/// tokens, for the case clang could not resolve semantically (the callee class
+/// is undeclared in the TU, so there is no `ObjCClassRef` receiver and the
+/// message expr spells empty).
+///
+/// A message send tokenizes as `[ Receiver keyword : arg keyword : arg ]`. The
+/// receiver is the first identifier at the outer message's depth; a keyword is
+/// any identifier at that depth immediately followed by a `:` at that depth,
+/// concatenated with colons (`setWidth:height:`). Depth tracking over
+/// `[](){}` keeps nested sends, casts and parenthesized args from being read as
+/// selector parts.
+///
+/// Gated to a class receiver (upper-case leading character, the Obj-C class
+/// naming convention): `[self …]`, `[super …]` and lower-case locals are
+/// instance dispatch on an unknown type and stay skipped, exactly as the
+/// semantic path already skips them. A wrong selector (e.g. a bare ternary
+/// colon at message depth) yields a symbol that matches no definition and is
+/// dropped downstream as a safe miss, never a wrong edge.
+fn syntactic_class_send(tu: CXTranslationUnit, cursor: CXCursor) -> Option<(String, String)> {
+    let extent = unsafe { clang_getCursorExtent(cursor) };
+    let mut tokens: *mut CXToken = std::ptr::null_mut();
+    let mut num: c_uint = 0;
+    unsafe { clang_tokenize(tu, extent, &mut tokens, &mut num) };
+    if tokens.is_null() || num == 0 {
+        return None;
+    }
+
+    let mut depth: i32 = 0;
+    let mut receiver: Option<String> = None;
+    let mut first_after_receiver: Option<String> = None;
+    // Last identifier seen at message depth, pending a `:` that would make it a
+    // selector keyword.
+    let mut pending_keyword: Option<String> = None;
+    let mut selector = String::new();
+    let mut has_colon = false;
+
+    for i in 0..num {
+        let tok = unsafe { *tokens.add(i as usize) };
+        let kind = unsafe { clang_getTokenKind(tok) };
+        let spelling = cx_string_to_owned(unsafe { clang_getTokenSpelling(tu, tok) });
+
+        match spelling.as_str() {
+            "[" | "(" | "{" => {
+                depth += 1;
+                continue;
+            }
+            "]" | ")" | "}" => {
+                depth -= 1;
+                continue;
+            }
+            _ => {}
+        }
+        // Only the outer message's own tokens (depth 1) form its receiver and
+        // selector; anything deeper belongs to a nested send or an argument.
+        if depth != 1 {
+            continue;
+        }
+        if spelling == ":" {
+            if let Some(k) = pending_keyword.take() {
+                selector.push_str(&k);
+                selector.push(':');
+                has_colon = true;
+            }
+            continue;
+        }
+        if kind == CXToken_Identifier {
+            if receiver.is_none() {
+                receiver = Some(spelling);
+            } else {
+                if first_after_receiver.is_none() {
+                    first_after_receiver = Some(spelling.clone());
+                }
+                pending_keyword = Some(spelling);
+            }
+        } else {
+            // A non-identifier, non-colon token cannot be a selector keyword and
+            // breaks the `identifier :` adjacency.
+            pending_keyword = None;
+        }
+    }
+
+    unsafe { clang_disposeTokens(tu, tokens, num) };
+
+    let receiver = receiver?;
+    if !receiver.chars().next().is_some_and(|c| c.is_uppercase()) {
+        return None;
+    }
+    let selector = if has_colon {
+        selector
+    } else {
+        // Unary selector: `[Class method]`, the single identifier after the
+        // receiver is the whole selector, no colon.
+        first_after_receiver?
+    };
+    if selector.is_empty() {
+        return None;
+    }
+    Some((receiver, selector))
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -815,4 +949,157 @@ fn to_rel_path(root: &Path, abs: &str) -> Option<String> {
         .strip_prefix(root)
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod ref_recovery_tests {
+    use super::*;
+
+    /// Run the visitor over a fixture directory and return the built index.
+    fn build(root: &Path) -> Index {
+        crate::init_libclang_env();
+        let lib = crate::shared_libclang().expect("libclang");
+        std::thread::scope(|s| {
+            let root = root.to_path_buf();
+            s.spawn(move || {
+                clang_sys::set_library(Some(lib));
+                build_index(&root, "t", None)
+            })
+            .join()
+            .unwrap()
+        })
+        .expect("build_index")
+    }
+
+    /// All reference-occurrence symbols in the index (`symbol_roles` even).
+    fn ref_symbols(index: &Index) -> Vec<String> {
+        index
+            .documents
+            .iter()
+            .flat_map(|d| d.occurrences.iter())
+            .filter(|o| o.symbol_roles & 1 == 0)
+            .map(|o| o.symbol.clone())
+            .collect()
+    }
+
+    #[test]
+    fn class_send_to_forward_declared_class_is_recovered() {
+        // #831: the callee class is only `@class`-forward-declared in the caller
+        // TU, so clang cannot resolve the class method and the message expr
+        // spells empty. The syntactic token fallback must still recover
+        // `Widget#make:().` from the source tokens (class-cased receiver).
+        if !crate::libclang_available() {
+            eprintln!("skipping: libclang not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // The definition lives in its own TU (never imported by the caller).
+        std::fs::write(
+            root.join("Def.m"),
+            "@interface Widget\n\
+             + (Widget *)make:(int)m;\n\
+             @end\n\
+             @implementation Widget\n\
+             + (Widget *)make:(int)m { return 0; }\n\
+             @end\n",
+        )
+        .unwrap();
+        // The caller only forward-declares Widget, so the send is unresolved.
+        std::fs::write(
+            root.join("Use.m"),
+            "@class Widget;\n\
+             @interface U\n\
+             - (void)go;\n\
+             @end\n\
+             @implementation U\n\
+             - (void)go { [Widget make:1]; }\n\
+             @end\n",
+        )
+        .unwrap();
+
+        let index = build(root);
+        let refs = ref_symbols(&index);
+        assert!(
+            refs.iter().any(|s| s.ends_with("Widget#make:().")),
+            "forward-declared class send must be recovered from tokens; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn instance_send_to_lowercase_receiver_is_not_synthesized() {
+        // Precision guard: the token fallback is class-message only. An
+        // unresolved instance send (`[helper doWork]`, lower-case receiver on an
+        // unknown type) must stay skipped, not be synthesized as `helper#…`.
+        if !crate::libclang_available() {
+            eprintln!("skipping: libclang not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Use.m"),
+            "@interface U\n\
+             - (void)go;\n\
+             @end\n\
+             @implementation U\n\
+             - (void)go { id helper = 0; [helper doWork]; }\n\
+             @end\n",
+        )
+        .unwrap();
+
+        let index = build(root);
+        let refs = ref_symbols(&index);
+        assert!(
+            !refs.iter().any(|s| s.contains("doWork")),
+            "instance send on unknown type must not be synthesized; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn class_send_across_subdirectory_header_resolves() {
+        // #831 (Fix A): the callee's header lives in a subdirectory. With the
+        // header directory on the include path the quoted `#import` resolves,
+        // the class is declared, and `[Thing build]` parses as a real message
+        // expr whose ref is emitted.
+        if !crate::libclang_available() {
+            eprintln!("skipping: libclang not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        std::fs::write(
+            root.join("sub/Thing.h"),
+            "@interface Thing\n+ (Thing *)build;\n@end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("sub/Thing.m"),
+            "#import \"Thing.h\"\n\
+             @implementation Thing\n\
+             + (Thing *)build { return 0; }\n\
+             @end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("app/Main.m"),
+            "#import \"Thing.h\"\n\
+             @interface App\n\
+             - (void)r;\n\
+             @end\n\
+             @implementation App\n\
+             - (void)r { [Thing build]; }\n\
+             @end\n",
+        )
+        .unwrap();
+
+        let index = build(root);
+        let refs = ref_symbols(&index);
+        assert!(
+            refs.iter().any(|s| s.ends_with("Thing#build().")),
+            "cross-subdirectory class send must resolve and emit a ref; got {refs:?}"
+        );
+    }
 }
