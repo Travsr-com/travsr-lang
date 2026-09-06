@@ -130,7 +130,7 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-java produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Java)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Java, root)
 }
 
 // ── Windows: travsr-driven build ───────────────────────────────────────────
@@ -192,7 +192,7 @@ fn run_windows(req: &InvokeRequest) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-java produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, req.corpus.as_str(), Language::Java)
+    travsr_lang_scip_reader::ingest(&output_path, req.corpus.as_str(), Language::Java, root)
 }
 
 /// Which build tool drives a Java project. Gradle wins when both are present:

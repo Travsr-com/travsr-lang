@@ -130,7 +130,7 @@ fn run_scip_php(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         .unwrap_or(0);
     tracing::info!("scip-php produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Php)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Php, root)
 }
 
 fn main() {

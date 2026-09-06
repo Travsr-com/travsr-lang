@@ -154,7 +154,7 @@ fn run_scip_clang(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<I
         .unwrap_or(0);
     tracing::info!("scip-clang produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::C)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::C, root)
 }
 
 fn main() {

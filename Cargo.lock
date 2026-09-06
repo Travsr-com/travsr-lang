@@ -650,6 +650,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "travsr-core",
+ "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 
@@ -718,6 +719,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "travsr-core",
+ "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 
@@ -744,6 +746,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "travsr-core",
+ "travsr-lang-scip-reader",
  "travsr-plugin-sdk",
 ]
 

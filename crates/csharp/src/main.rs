@@ -423,7 +423,7 @@ fn run_scip_dotnet(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> 
         .unwrap_or(0);
     tracing::info!("scip-dotnet produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::CSharp)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::CSharp, root)
 }
 
 fn main() {

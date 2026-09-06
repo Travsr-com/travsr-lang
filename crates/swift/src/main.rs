@@ -193,12 +193,18 @@ fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse
         "swift emitter exited with {status}: {stderr_buf}"
     );
 
-    parse_emitter_output(&output_path, corpus)
+    parse_emitter_output(&output_path, corpus, root)
 }
 
 // ── JSON parsing ──────────────────────────────────────────────────────────────
 
-fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+fn parse_emitter_output(
+    json_path: &Path,
+    corpus: &str,
+    repo_root: &Path,
+) -> anyhow::Result<InvokeResponse> {
+    // #813: one read per referenced file, shared across all documents.
+    let mut src_cache = travsr_lang_scip_reader::SourceCache::new();
     let bytes = std::fs::read(json_path)
         .with_context(|| format!("reading emitter output {}", json_path.display()))?;
 
@@ -214,6 +220,9 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     }
 
     let root: serde_json::Value = serde_json::from_slice(&bytes).context("parsing emitter JSON")?;
+    // #813: the emitter declares what its `col` counts. An older emitter that
+    // declares nothing stays on the conservative encoding-agnostic path.
+    let col_unit = travsr_lang_scip_reader::ColUnit::parse(root["col_unit"].as_str());
 
     let docs = root["documents"]
         .as_array()
@@ -300,9 +309,19 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
                             // is_call (#650): no call/non-call signal available
                             // here; preserve prior behavior / wire default.
                             is_call: true,
-                            // #813: the emitter output carries only a line, no
-                            // byte column; the daemon name-searches the line.
-                            caller_col: None,
+                            // #813: the emitter reports a column and declares its
+                            // unit, so this converts rather than guessing. An
+                            // emitter too old to declare one falls back to the
+                            // encoding-agnostic window, and anything unresolvable
+                            // stays `None` for the daemon to name-search.
+                            caller_col: r["col"].as_i64().and_then(|c| {
+                                src_cache.col_in(
+                                    &repo_root.join(path),
+                                    line as u32,
+                                    i32::try_from(c).ok()?,
+                                    col_unit,
+                                )
+                            }),
                         });
                     } else {
                         edges.push(Edge::new(file_id, dst_id, EdgeKind::RefCall));
@@ -382,7 +401,60 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("out.json");
         std::fs::write(&path, json).expect("write canned JSON");
-        parse_emitter_output(&path, "testcorpus").expect("parse")
+        parse_emitter_output(&path, "testcorpus", Path::new("/nonexistent")).expect("parse")
+    }
+
+    /// #813: the emitter declares `col_unit: utf8`, so a column past a
+    /// non-ASCII prefix must be carried through as the byte column rather than
+    /// abstaining the way an undeclared unit does. Uses a real source file,
+    /// since the conversion reads it: the other tests pass `/nonexistent` and
+    /// therefore never exercise this path.
+    #[test]
+    fn declared_utf8_col_survives_a_non_ascii_prefix() {
+        let repo = tempfile::tempdir().expect("tempdir");
+        // `let s = "caf<e-acute>"; svc.charge()` - `charge` starts at byte 21
+        // but at UTF-16 code unit 20, so a reader that guessed the unit would
+        // land one character off, and one that abstained would drop it.
+        let line = "let s = \"caf\u{e9}\"; svc.charge()";
+        assert_eq!(line.find("charge"), Some(21));
+        std::fs::write(repo.path().join("Caller.swift"), format!("{line}\n")).expect("write");
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let json_path = dir.path().join("out.json");
+        std::fs::write(
+            &json_path,
+            r#"{"version":1,"col_unit":"utf8","documents":[
+                {"path":"Svc.swift","definitions":[
+                    {"symbol":"swift::Svc.charge","kind":"function","line":1,"end_line":3}
+                ],"references":[],"inheritances":[]},
+                {"path":"Caller.swift","definitions":[],
+                 "references":[{"symbol":"swift::Svc.charge","line":1,"col":21}],
+                 "inheritances":[]}
+            ]}"#,
+        )
+        .expect("write canned JSON");
+
+        let resp = parse_emitter_output(&json_path, "testcorpus", repo.path()).expect("parse");
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].caller_line, 1);
+        assert_eq!(resp.refs[0].caller_col, Some(21));
+    }
+
+    /// An emitter binary predating #813 declares no unit and reports no column,
+    /// so nothing is derived and the daemon name-searches the line as before.
+    #[test]
+    fn output_without_col_leaves_caller_col_unset() {
+        let resp = parse(
+            r#"{"version":1,"documents":[
+                {"path":"ClassA.swift","definitions":[
+                    {"symbol":"swift::ClassA","kind":"class","line":1,"end_line":10}
+                ],"references":[],"inheritances":[]},
+                {"path":"ClassB.swift","definitions":[],
+                 "references":[{"symbol":"swift::ClassA","line":7}],"inheritances":[]}
+            ]}"#,
+        );
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].caller_col, None);
     }
 
     fn node_id(path: &str, sym: &str) -> NodeId {

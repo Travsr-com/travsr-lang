@@ -134,7 +134,7 @@ fn run_scip_python(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> 
         .unwrap_or(0);
     tracing::info!("scip-python produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Python)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Python, root)
 }
 
 fn main() {

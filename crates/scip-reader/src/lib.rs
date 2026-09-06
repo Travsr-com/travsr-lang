@@ -39,10 +39,16 @@ const MAX_REF_EDGES_PER_DOC: usize = 5_000;
 ///
 /// `corpus` should be the canonical corpus string (e.g. `github.com/org/repo`).
 /// Pass `""` when corpus is not known at plugin invocation time.
+///
+/// `repo_root` is the wrapper's own view of the repository root, used to read
+/// source for occurrence columns when the index's `project_root` is absent or
+/// unparsable (see [`source_root`]). Only the column depends on it: an empty or
+/// wrong root costs columns, never nodes or edges.
 pub fn ingest(
     scip_path: &Path,
     corpus: &str,
     language: Language,
+    repo_root: &Path,
 ) -> anyhow::Result<InvokeResponse> {
     let bytes = std::fs::read(scip_path)
         .with_context(|| format!("failed to read SCIP file: {}", scip_path.display()))?;
@@ -52,14 +58,17 @@ pub fn ingest(
     }
     let index = scip::types::Index::parse_from_bytes(&bytes)
         .with_context(|| format!("failed to parse SCIP protobuf from {}", scip_path.display()))?;
-    ingest_index(&index, corpus, language)
+    ingest_index(&index, corpus, language, repo_root)
 }
 
 /// Ingest an already-decoded [`scip::types::Index`] (useful for unit tests).
+///
+/// See [`ingest`] for `repo_root`.
 pub fn ingest_index(
     index: &scip::types::Index,
     corpus: &str,
     language: Language,
+    repo_root: &Path,
 ) -> anyhow::Result<InvokeResponse> {
     let lang_str = language.as_str();
     let mut nodes: Vec<Node> = Vec::new();
@@ -224,8 +233,21 @@ pub fn ingest_index(
     // or stdlib symbol, and converting those would flood the resolver.
     let cross_lang = matches!(language, Language::ObjectiveC);
     let mut unresolved: Vec<travsr_core::UnresolvedCall> = Vec::new();
+    let project_root = index
+        .metadata
+        .as_ref()
+        .map(|m| m.project_root.clone())
+        .unwrap_or_default();
     for doc in &index.documents {
         let path = &doc.relative_path;
+        // #813: the document's source, read once, so each occurrence's column can
+        // be accepted only where every SCIP encoding agrees on what it means.
+        // `None` (no text, unreadable file) simply leaves every column unset.
+        let doc_src = document_text(doc, &project_root, repo_root);
+        let doc_lines: Vec<&str> = doc_src
+            .as_deref()
+            .map(|t| t.lines().collect())
+            .unwrap_or_default();
         // #299 C1: scip-clang emits a reference occurrence at a symbol's *header
         // declaration* line (not a call site). Attributing those to a header
         // pollutes find_references with a spurious "use" on the declaration.
@@ -260,6 +282,13 @@ pub fn ingest_index(
                 continue;
             };
             let caller_line = start as u32 + 1;
+            // #813: range element [1] is the occurrence's start character (see
+            // `scip_range`). Accept it only inside the encoding-agnostic window.
+            let caller_col = scip_range(occ)
+                .get(1)
+                .copied()
+                .zip(doc_lines.get(start as usize))
+                .and_then(|(c, line)| encoding_agnostic_col(line, c));
             if let Some(&callee_id) = def_ids.get(occ.symbol.as_str()) {
                 refs.push(ScipRef {
                     caller_path: path.clone(),
@@ -272,12 +301,11 @@ pub fn ingest_index(
                     // ingested occurrence is treated as a call. Refining this per
                     // symbol_role is a separate change.
                     is_call: true,
-                    // #813: no source text is loaded here to convert a SCIP
-                    // occurrence's UTF-16 character offset to a byte column, and a
-                    // non-byte column would be a wrong editor position (a wrong
-                    // edge), so leave it unset. The daemon name-searches the line
-                    // as it did before this field existed (no regression).
-                    caller_col: None,
+                    // #813: the occurrence's own column, kept only where the
+                    // encoding cannot change its meaning (`encoding_agnostic_col`).
+                    // `None` outside that window, so the daemon name-searches the
+                    // line as it did before this field existed (no regression).
+                    caller_col,
                 });
                 count += 1;
             } else if cross_lang {
@@ -303,9 +331,9 @@ pub fn ingest_index(
                     // resolution behavior for these edges.
                     is_method_call: false,
                     recv_type: None,
-                    // #813: no byte column available for this SCIP occurrence
-                    // (see the ScipRef case above); the daemon name-searches.
-                    caller_col: None,
+                    // #813: same encoding-agnostic column as the ScipRef case
+                    // above; `None` when the unit would be ambiguous.
+                    caller_col,
                 });
                 count += 1;
             }
@@ -326,6 +354,266 @@ pub fn ingest_index(
         refs,
         unresolved_calls: unresolved,
     })
+}
+
+/// The occurrence column, but only when it means the same thing under every
+/// encoding SCIP permits.
+///
+/// `Document.position_encoding` may be UTF-8, UTF-16 or UTF-32, and in practice
+/// it is often absent altogether: a real scip-ruby index emits no encoding field
+/// at all, which decodes as `Unspecified`. So the wire does not reliably say
+/// which unit `start_character` is counted in, and guessing wrong writes a wrong
+/// editor position, which is a wrong edge (#813).
+///
+/// There is one window where no guess is required. While the line's prefix is
+/// pure ASCII, one code unit is one byte under all four encodings, so the offset
+/// is numerically identical whichever the indexer used. Measured over the 39,555
+/// committed occurrences of the travsr repository, 99.985% fall inside it.
+///
+/// Outside that window (a non-ASCII character sits before the occurrence) the
+/// unit is genuinely ambiguous, so this returns `None` and the daemon falls back
+/// to its word-boundary name search, exactly as it did before the field existed.
+/// Narrowing that remaining 0.015% needs per-emitter encoding evidence, not a
+/// default.
+pub fn encoding_agnostic_col(line: &str, character: i32) -> Option<u32> {
+    let col = usize::try_from(character).ok()?;
+    let bytes = line.as_bytes();
+    if col > bytes.len() {
+        return None;
+    }
+    bytes[..col].is_ascii().then_some(col as u32)
+}
+
+/// What a producer's reported column counts (#813).
+///
+/// Travsr's occurrence store keeps a 0-based UTF-8 byte column. A producer we
+/// own declares its unit, so the consumer converts instead of guessing. A
+/// producer we do not own (a third-party SCIP indexer) declares nothing
+/// reliable, so [`ColUnit::Unknown`] falls back to the encoding-agnostic window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColUnit {
+    /// Already a UTF-8 byte offset: used as-is once bounds-checked.
+    Utf8,
+    /// UTF-16 code units, converted against the line.
+    Utf16,
+    /// Not declared, or declared as something we do not know: keep the column
+    /// only where every encoding agrees ([`encoding_agnostic_col`]).
+    Unknown,
+}
+
+impl ColUnit {
+    /// Parse a producer's `col_unit` declaration. Anything unrecognised, or
+    /// absent, is [`ColUnit::Unknown`] and stays conservative.
+    pub fn parse(declared: Option<&str>) -> Self {
+        match declared {
+            Some("utf8") => Self::Utf8,
+            Some("utf16") => Self::Utf16,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// The 0-based UTF-8 byte column for `character` on `line`, given what the
+/// producer says `character` counts.
+///
+/// Returns `None` when the position does not exist on this line, or when it
+/// lands inside a character (a UTF-16 column pointing at the low half of a
+/// surrogate pair), because half a character is not a position an editor can
+/// resolve.
+pub fn col_in_unit(line: &str, character: i32, unit: ColUnit) -> Option<u32> {
+    let target = usize::try_from(character).ok()?;
+    match unit {
+        ColUnit::Unknown => encoding_agnostic_col(line, character),
+        ColUnit::Utf8 => {
+            (target <= line.len() && line.is_char_boundary(target)).then_some(target as u32)
+        }
+        ColUnit::Utf16 => {
+            let mut units = 0usize;
+            for (byte_idx, ch) in line.char_indices() {
+                if units == target {
+                    return Some(byte_idx as u32);
+                }
+                units += ch.len_utf16();
+                if units > target {
+                    return None; // inside a surrogate pair
+                }
+            }
+            (units == target).then_some(line.len() as u32)
+        }
+    }
+}
+
+/// Line cache for readers whose occurrences arrive without source attached
+/// (the LSP and SemanticDB backed languages), so a file is read at most once.
+///
+/// Exists so every language applies the *same* column-safety rule as the SCIP
+/// path rather than each reimplementing it: a mis-slotted column is a wrong
+/// editor position, and that is the one failure this rule exists to prevent.
+#[derive(Default)]
+pub struct SourceCache {
+    files: std::collections::HashMap<std::path::PathBuf, Option<Vec<String>>>,
+}
+
+impl SourceCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// [`Self::col`] for a producer that declares its unit.
+    pub fn col_in(&mut self, path: &Path, line: u32, character: i32, unit: ColUnit) -> Option<u32> {
+        let entry = self.files.entry(path.to_path_buf()).or_insert_with(|| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|t| t.lines().map(|l| l.to_string()).collect())
+        });
+        let lines = entry.as_ref()?;
+        let idx = usize::try_from(line.checked_sub(1)?).ok()?;
+        col_in_unit(lines.get(idx)?, character, unit)
+    }
+
+    /// The byte column for `character` on 1-based `line` of `path`, or `None`
+    /// when the file is unreadable, the line is missing, or the encoding could
+    /// change what `character` means (see [`encoding_agnostic_col`]).
+    pub fn col(&mut self, path: &Path, line: u32, character: i32) -> Option<u32> {
+        let entry = self.files.entry(path.to_path_buf()).or_insert_with(|| {
+            std::fs::read_to_string(path)
+                .ok()
+                .map(|t| t.lines().map(|l| l.to_string()).collect())
+        });
+        let lines = entry.as_ref()?;
+        let idx = usize::try_from(line.checked_sub(1)?).ok()?;
+        encoding_agnostic_col(lines.get(idx)?, character)
+    }
+}
+
+/// Decode a `file://` URI into a filesystem path, or `None` when `uri` is not
+/// one this can resolve to an absolute path.
+///
+/// Hand-rolled rather than pulling in `url`: the shapes that matter are few and
+/// each is pinned by a test. `strip_prefix("file://")` alone is not enough.
+/// A Windows root arrives as `file:///C:/work/repo`, and dropping only the
+/// scheme leaves `/C:/work/repo`, which Windows does not treat as an absolute
+/// drive path, so every read fails. Path segments are also percent-encoded,
+/// so a repo under a directory with a space or a non-ASCII name never resolves
+/// until the escapes are decoded.
+///
+/// Handles the empty and `localhost` authorities (both mean the local machine);
+/// a real remote authority (`file://server/share`) is rejected, since reading
+/// it is not something this code should attempt silently.
+fn file_uri_to_path(uri: &str) -> Option<std::path::PathBuf> {
+    let rest = uri.strip_prefix("file://")?;
+    // Split the authority from the path: everything up to the first `/`.
+    // No `/` at all means `file://` with no path.
+    let slash = rest.find('/')?;
+    let (authority, path) = (&rest[..slash], &rest[slash..]);
+    if !authority.is_empty() && !authority.eq_ignore_ascii_case("localhost") {
+        return None;
+    }
+    let decoded = percent_decode(path);
+    // `/C:/work/repo` is the URI spelling of the Windows path `C:\work\repo`:
+    // the leading slash is part of the URI grammar, not of the path. Recognised
+    // on every platform so the shape is testable off Windows.
+    let trimmed = decoded.strip_prefix('/').unwrap_or(&decoded);
+    let is_drive = {
+        let b = trimmed.as_bytes();
+        b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':'
+    };
+    let out = if is_drive { trimmed } else { &decoded };
+    if out.is_empty() {
+        return None;
+    }
+    Some(std::path::PathBuf::from(out))
+}
+
+/// Decode `%XX` escapes in a URI path.
+///
+/// Escapes are accumulated as raw bytes and interpreted as UTF-8 at the end, so
+/// `%C3%A9` becomes `e-acute` rather than two mojibake chars. A malformed
+/// escape is left literal instead of decoding to NUL.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16);
+            let lo = (bytes[i + 2] as char).to_digit(16);
+            if let (Some(hi), Some(lo)) = (hi, lo) {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The directory `doc.relative_path` is relative to, or `None` when neither
+/// source gives an absolute one.
+///
+/// The SCIP spec says a client should resolve `Index.metadata.project_root`
+/// against `Document.relative_path`, and where the indexer filled that in as a
+/// well-formed absolute `file://` URI it is authoritative. But that is a claim
+/// about the producer, not a guarantee: scip-dotnet and scip-clang have both
+/// been seen leaving it empty or relative, and a root this cannot parse is
+/// indistinguishable from one that is simply absent. In every one of those
+/// cases the wrapper's own repo root is the right answer, and each wrapper has
+/// it in hand, so it is threaded in rather than letting the column silently
+/// disappear.
+fn source_root<'a>(project_root: &'a str, repo_root: &'a Path) -> Option<Cow<'a, Path>> {
+    if let Some(p) = file_uri_to_path(project_root) {
+        if p.is_absolute() {
+            return Some(Cow::Owned(p));
+        }
+    } else {
+        // Not a URI at all: some producers write a bare path.
+        let p = Path::new(project_root);
+        if p.is_absolute() {
+            return Some(Cow::Borrowed(p));
+        }
+    }
+    (!repo_root.as_os_str().is_empty()).then_some(Cow::Borrowed(repo_root))
+}
+
+/// Source lines for `doc`, or `None` when the text cannot be obtained.
+///
+/// Prefers the document's inlined `text`; the SCIP spec marks that optional and
+/// says indexers are not expected to include it, in which case the file is read
+/// from disk under [`source_root`].
+fn document_text(
+    doc: &scip::types::Document,
+    project_root: &str,
+    repo_root: &Path,
+) -> Option<String> {
+    if !doc.text.is_empty() {
+        return Some(doc.text.clone());
+    }
+    let Some(root) = source_root(project_root, repo_root) else {
+        tracing::debug!(
+            project_root,
+            repo_root = %repo_root.display(),
+            relative_path = %doc.relative_path,
+            "no usable source root; every occurrence column will be unset"
+        );
+        return None;
+    };
+    let full = root.join(&doc.relative_path);
+    match std::fs::read_to_string(&full) {
+        Ok(t) => Some(t),
+        Err(e) => {
+            // Not an error: a file the indexer saw and this process cannot read
+            // only costs the column, and the daemon name-searches the line.
+            // Logged so a run with zero columns is diagnosable.
+            tracing::debug!(
+                path = %full.display(),
+                error = %e,
+                "could not read source for occurrence columns"
+            );
+            None
+        }
+    }
 }
 
 /// Occurrence `range` as the packed `[start_line, start_col, end_col]` (single
@@ -590,10 +878,207 @@ mod tests {
         assert!(!is_parameter_descriptor("scip-dotnet nuget . . Demo/"));
     }
 
+    /// #813: a producer we own declares what its column counts, so the consumer
+    /// converts instead of guessing. Measured against the real emitters: the
+    /// Swift one reports UTF-8 bytes, the Dart one UTF-16 code units, and on a
+    /// line with a non-ASCII character those are different numbers.
+    #[test]
+    fn a_declared_unit_is_converted_rather_than_guessed() {
+        // `    var s = "Caf\u{e9}"; return g.hello();` : `hello` starts at byte 30,
+        // which the Dart emitter reports as UTF-16 column 29.
+        let mixed = "    var s = \"Caf\u{e9}\"; return g.hello();";
+        assert_eq!(col_in_unit(mixed, 29, ColUnit::Utf16), Some(30));
+        assert_eq!(&mixed.as_bytes()[30..35], b"hello");
+        // The same number read as bytes is the wrong position, which is why an
+        // undeclared producer abstains here instead of guessing.
+        assert_eq!(col_in_unit(mixed, 29, ColUnit::Unknown), None);
+        // A byte-native producer (SwiftSyntax) is used as-is, even here.
+        assert_eq!(col_in_unit(mixed, 30, ColUnit::Utf8), Some(30));
+
+        // On an ASCII line every unit agrees, so all three answer the same.
+        let ascii = "    return g.hello();";
+        for unit in [ColUnit::Utf8, ColUnit::Utf16, ColUnit::Unknown] {
+            assert_eq!(col_in_unit(ascii, 13, unit), Some(13), "{unit:?}");
+        }
+
+        // A position inside a character is not a position an editor can resolve.
+        let emoji = "let x = \"\u{1F600}\"; y();";
+        assert_eq!(col_in_unit(emoji, 10, ColUnit::Utf16), None); // low surrogate
+        assert_eq!(col_in_unit(emoji, 10, ColUnit::Utf8), None); // mid character
+
+        // Out of range abstains rather than panicking.
+        assert_eq!(col_in_unit(ascii, 999, ColUnit::Utf8), None);
+        assert_eq!(col_in_unit(ascii, -1, ColUnit::Utf16), None);
+    }
+
+    /// An emitter too old to declare a unit, or one declaring something we do
+    /// not know, stays on the conservative path rather than being assumed.
+    #[test]
+    fn an_undeclared_unit_stays_conservative() {
+        assert_eq!(ColUnit::parse(Some("utf8")), ColUnit::Utf8);
+        assert_eq!(ColUnit::parse(Some("utf16")), ColUnit::Utf16);
+        assert_eq!(ColUnit::parse(None), ColUnit::Unknown);
+        assert_eq!(ColUnit::parse(Some("utf32")), ColUnit::Unknown);
+        assert_eq!(ColUnit::parse(Some("")), ColUnit::Unknown);
+    }
+
+    /// #813: a column is kept only where every SCIP encoding agrees on what it
+    /// counts, because the wire often does not say (a real scip-ruby index emits
+    /// no `position_encoding` at all). Inside the ASCII prefix all four encodings
+    /// give the same number; outside it the unit is a guess, and a guessed column
+    /// is a wrong editor position.
+    #[test]
+    fn a_column_is_kept_only_where_the_encoding_cannot_change_it() {
+        // Pure ASCII prefix: byte == UTF-8 == UTF-16 == UTF-32, so it is safe.
+        assert_eq!(encoding_agnostic_col("    @p.hello", 4), Some(4));
+        assert_eq!(encoding_agnostic_col("let x = foo();", 8), Some(8));
+        // A non-ASCII character before the column makes the unit matter, and the
+        // index does not say which one it used: abstain.
+        assert_eq!(
+            encoding_agnostic_col("    x = \"Caf\u{e9}\"; @p.hello", 20),
+            None
+        );
+        // Non-ASCII AFTER the column is irrelevant, the prefix still decides.
+        assert_eq!(encoding_agnostic_col("    @c.gr\u{e9}et", 4), Some(4));
+        // Degenerate inputs abstain rather than producing an out-of-range column.
+        assert_eq!(encoding_agnostic_col("abc", -1), None);
+        assert_eq!(encoding_agnostic_col("abc", 9), None);
+        // End-of-line is in range (a zero-width position at the end).
+        assert_eq!(encoding_agnostic_col("abc", 3), Some(3));
+    }
+
+    /// The document's own `text` is preferred; an absent one is read from the
+    /// index's `project_root`, and from the wrapper's repo root when that root
+    /// is missing or unusable.
+    #[test]
+    fn document_text_prefers_inlined_text_then_the_project_root() {
+        let mut doc = scip::types::Document::new();
+        doc.relative_path = "a.rb".to_string();
+        doc.text = "inlined".to_string();
+        assert_eq!(
+            document_text(&doc, "file:///nowhere", Path::new("")).as_deref(),
+            Some("inlined")
+        );
+
+        // tempfile, not a fixed `temp_dir()` path: two concurrent test runs
+        // would otherwise collide on the same `a.rb`.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("a.rb"), "from disk").expect("write");
+        doc.text = String::new();
+        let root = to_file_uri(tmp.path());
+        assert_eq!(
+            document_text(&doc, &root, Path::new("")).as_deref(),
+            Some("from disk"),
+            "project_root {root} should have resolved"
+        );
+
+        // #813 review: a project_root this cannot resolve must not silently
+        // cost every column. The wrapper's own repo root is used instead.
+        assert_eq!(
+            document_text(&doc, "", tmp.path()).as_deref(),
+            Some("from disk")
+        );
+        assert_eq!(
+            document_text(&doc, "not/absolute", tmp.path()).as_deref(),
+            Some("from disk")
+        );
+
+        // Neither root: nothing to read, so no column is derived.
+        assert_eq!(document_text(&doc, "", Path::new("")), None);
+    }
+
+    /// A well-formed `file://` URI for `p` on the running platform: a Windows
+    /// path needs its separators flipped and a third slash before the drive
+    /// (`C:\\x` -> `file:///C:/x`), which is exactly the shape that made
+    /// `strip_prefix("file://")` fail.
+    fn to_file_uri(p: &Path) -> String {
+        let s = p.display().to_string().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            format!("file:///{s}")
+        }
+    }
+
+    /// An absolute path for the running platform. `/idx/root` has a root on
+    /// Windows but is not `is_absolute()` there (no drive), so a test that
+    /// wants a usable root has to spell one the platform accepts.
+    #[cfg(windows)]
+    const ABS_IDX_ROOT: &str = "C:/idx/root";
+    #[cfg(not(windows))]
+    const ABS_IDX_ROOT: &str = "/idx/root";
+
+    /// `file://` URI decoding, the shapes `strip_prefix("file://")` got wrong.
+    #[test]
+    fn file_uri_to_path_handles_windows_drives_and_escapes() {
+        assert_eq!(
+            file_uri_to_path("file:///home/u/repo"),
+            Some(std::path::PathBuf::from("/home/u/repo"))
+        );
+        // A Windows drive root: the URI's leading slash is grammar, not path.
+        // Checked on every platform so the shape is pinned off Windows too.
+        assert_eq!(
+            file_uri_to_path("file:///C:/work/repo"),
+            Some(std::path::PathBuf::from("C:/work/repo"))
+        );
+        // Percent escapes decode, including multi-byte UTF-8.
+        assert_eq!(
+            file_uri_to_path("file:///home/u/my%20repo"),
+            Some(std::path::PathBuf::from("/home/u/my repo"))
+        );
+        assert_eq!(
+            file_uri_to_path("file:///home/jos%C3%A9/repo"),
+            Some(std::path::PathBuf::from("/home/jos\u{e9}/repo"))
+        );
+        // `localhost` is the local machine; a real remote authority is not.
+        assert_eq!(
+            file_uri_to_path("file://localhost/srv/repo"),
+            Some(std::path::PathBuf::from("/srv/repo"))
+        );
+        assert_eq!(file_uri_to_path("file://server/share/repo"), None);
+        // Not a file URI, and a URI with no path at all.
+        assert_eq!(file_uri_to_path("/plain/path"), None);
+        assert_eq!(file_uri_to_path("file://"), None);
+    }
+
+    /// A bare absolute path in `project_root` (not a URI) is honoured, and a
+    /// relative one defers to the repo root.
+    #[test]
+    fn source_root_prefers_a_usable_project_root() {
+        let repo_buf = std::path::PathBuf::from(if cfg!(windows) { "C:/repo" } else { "/repo" });
+        let repo = repo_buf.as_path();
+        let idx = Path::new(ABS_IDX_ROOT);
+
+        assert_eq!(
+            source_root(&to_file_uri(idx), repo).as_deref(),
+            Some(idx),
+            "a well-formed absolute project_root URI wins"
+        );
+        assert_eq!(
+            source_root(ABS_IDX_ROOT, repo).as_deref(),
+            Some(idx),
+            "a bare absolute path is honoured too"
+        );
+        // A POSIX-style root on Windows has a root but no drive, so it is not
+        // usable there and the repo root is taken instead. This is the same
+        // fallback an absent root gets, which is the point: an unusable root
+        // must not silently cost every column.
+        #[cfg(windows)]
+        assert_eq!(source_root("file:///idx/root", repo).as_deref(), Some(repo));
+
+        assert_eq!(source_root("", repo).as_deref(), Some(repo));
+        assert_eq!(source_root("rel/root", repo).as_deref(), Some(repo));
+        assert_eq!(
+            source_root("file://server/share", repo).as_deref(),
+            Some(repo)
+        );
+        assert_eq!(source_root("", Path::new("")), None);
+    }
+
     #[test]
     fn empty_index_returns_empty_response() {
         let index = scip::types::Index::default();
-        let resp = ingest_index(&index, "test", Language::Go).unwrap();
+        let resp = ingest_index(&index, "test", Language::Go, Path::new("")).unwrap();
         assert!(resp.nodes.is_empty());
         assert!(resp.edges.is_empty());
     }
@@ -645,6 +1130,116 @@ mod tests {
         );
     }
 
+    /// End-to-end wiring for #813: an occurrence's start character reaches
+    /// `ScipRef.caller_col` as a 0-based UTF-8 byte column, and abstains past a
+    /// non-ASCII prefix. The pure functions below are tested directly, but
+    /// nothing pinned that `ingest_index` actually consults the document text,
+    /// which is what a wrong column would come from.
+    #[test]
+    fn ingest_index_populates_caller_col_from_document_text() {
+        let def: String = "go mod example.com 1.0.0 Target.".into();
+        let def_doc = scip::types::Document {
+            relative_path: "target.go".into(),
+            occurrences: vec![scip::types::Occurrence {
+                symbol: def.clone(),
+                symbol_roles: 1, // Definition
+                range: vec![0, 5, 11],
+                ..Default::default()
+            }],
+            symbols: vec![scip::types::SymbolInformation {
+                symbol: def.clone(),
+                kind: scip::types::symbol_information::Kind::Function.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        // Line 0 is pure ASCII up to the reference, so the column is kept.
+        // Line 1 puts a non-ASCII char before it, where a UTF-8 byte column and
+        // a UTF-16 code-unit column disagree, so the reader abstains.
+        let ref_doc = scip::types::Document {
+            relative_path: "caller.go".into(),
+            text: "\tx := Target()\n\ts := \"caf\u{e9}\"; Target()\n".into(),
+            occurrences: vec![
+                scip::types::Occurrence {
+                    symbol: def.clone(),
+                    range: vec![0, 6, 12],
+                    ..Default::default()
+                },
+                scip::types::Occurrence {
+                    symbol: def.clone(),
+                    range: vec![1, 15, 21],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let index = scip::types::Index {
+            documents: vec![def_doc, ref_doc],
+            ..Default::default()
+        };
+        let resp = ingest_index(&index, "example.com", Language::Go, Path::new("")).unwrap();
+
+        assert_eq!(resp.refs.len(), 2);
+        assert_eq!(resp.refs[0].caller_line, 1);
+        assert_eq!(resp.refs[0].caller_col, Some(6));
+        assert_eq!(resp.refs[1].caller_line, 2);
+        assert_eq!(
+            resp.refs[1].caller_col, None,
+            "a column past a non-ASCII prefix must abstain, not guess"
+        );
+    }
+
+    /// The same wiring when the text is not inlined: the file is read through
+    /// the repo-root fallback, which is the path scip-java / scip-dotnet /
+    /// scip-go / scip-clang take (none of them inline `Document.text`).
+    #[test]
+    fn ingest_index_reads_columns_through_the_repo_root_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join("caller.go"), "\tx := Target()\n").expect("write");
+
+        let def: String = "go mod example.com 1.0.0 Target.".into();
+        let def_doc = scip::types::Document {
+            relative_path: "target.go".into(),
+            occurrences: vec![scip::types::Occurrence {
+                symbol: def.clone(),
+                symbol_roles: 1,
+                range: vec![0, 5, 11],
+                ..Default::default()
+            }],
+            symbols: vec![scip::types::SymbolInformation {
+                symbol: def.clone(),
+                kind: scip::types::symbol_information::Kind::Function.into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ref_doc = scip::types::Document {
+            relative_path: "caller.go".into(),
+            occurrences: vec![scip::types::Occurrence {
+                symbol: def.clone(),
+                range: vec![0, 6, 12],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        // project_root left empty, as an indexer that does not fill it in leaves it.
+        let index = scip::types::Index {
+            documents: vec![def_doc, ref_doc],
+            ..Default::default()
+        };
+
+        let resp = ingest_index(&index, "example.com", Language::Go, tmp.path()).unwrap();
+        assert_eq!(resp.refs.len(), 1);
+        assert_eq!(resp.refs[0].caller_col, Some(6));
+
+        // Without the fallback root there is no text, so no column: the daemon
+        // name-searches the line, as it did before the field existed.
+        let resp = ingest_index(&index, "example.com", Language::Go, Path::new("")).unwrap();
+        assert_eq!(resp.refs[0].caller_col, None);
+    }
+
     #[test]
     fn definition_node_extracted_from_index() {
         let sym: String = "go mod example.com 1.0.0 SomeFunc.".into();
@@ -670,7 +1265,13 @@ mod tests {
             ..Default::default()
         };
 
-        let resp = ingest_index(&index, "github.com/example/repo", Language::Go).unwrap();
+        let resp = ingest_index(
+            &index,
+            "github.com/example/repo",
+            Language::Go,
+            Path::new(""),
+        )
+        .unwrap();
         assert_eq!(resp.nodes.len(), 1);
         assert_eq!(resp.nodes[0].kind, "function");
         assert_eq!(resp.nodes[0].line, Some(6)); // 0-indexed line 5 → 1-indexed line 6
@@ -708,7 +1309,13 @@ mod tests {
             ..Default::default()
         };
 
-        let resp = ingest_index(&index, "github.com/example/repo", Language::Go).unwrap();
+        let resp = ingest_index(
+            &index,
+            "github.com/example/repo",
+            Language::Go,
+            Path::new(""),
+        )
+        .unwrap();
         assert_eq!(resp.nodes.len(), 1, "one definition node");
         // G2: reference occurrences become ScipRef records (not raw edges) so the
         // daemon can attribute them to the enclosing function at write time.
@@ -799,7 +1406,7 @@ mod tests {
             ..Default::default()
         });
 
-        let resp = ingest_index(&index, "m", Language::Java).unwrap();
+        let resp = ingest_index(&index, "m", Language::Java, Path::new("")).unwrap();
         assert_eq!(resp.nodes.len(), 1, "one definition node from typed range");
         assert_eq!(
             resp.nodes[0].line,
@@ -843,7 +1450,7 @@ mod tests {
             ..Default::default()
         });
 
-        let resp = ingest_index(&index, "m", Language::Java).unwrap();
+        let resp = ingest_index(&index, "m", Language::Java, Path::new("")).unwrap();
         assert_eq!(
             resp.refs.len(),
             1,
@@ -877,7 +1484,7 @@ mod tests {
             ..Default::default()
         });
 
-        let resp = ingest_index(&index, "m", Language::Java).unwrap();
+        let resp = ingest_index(&index, "m", Language::Java, Path::new("")).unwrap();
         assert_eq!(
             resp.refs.len(),
             1,
@@ -952,7 +1559,7 @@ mod tests {
             ..Default::default()
         };
 
-        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC, Path::new("")).unwrap();
         assert!(resp.refs.is_empty(), "no in-index target, no ScipRef");
         assert_eq!(resp.unresolved_calls.len(), 1);
         let uc = &resp.unresolved_calls[0];
@@ -979,7 +1586,7 @@ mod tests {
             documents: vec![doc],
             ..Default::default()
         };
-        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC, Path::new("")).unwrap();
         assert!(resp.unresolved_calls.is_empty());
     }
 
@@ -1008,7 +1615,7 @@ mod tests {
             documents: vec![doc],
             ..Default::default()
         };
-        let resp = ingest_index(&index, "corp", Language::ObjectiveC).unwrap();
+        let resp = ingest_index(&index, "corp", Language::ObjectiveC, Path::new("")).unwrap();
         assert!(resp.unresolved_calls.is_empty());
     }
 
@@ -1038,7 +1645,7 @@ mod tests {
             documents: vec![doc],
             ..Default::default()
         };
-        let resp = ingest_index(&index, "example.com", Language::Go).unwrap();
+        let resp = ingest_index(&index, "example.com", Language::Go, Path::new("")).unwrap();
         assert!(resp.unresolved_calls.is_empty());
     }
 
@@ -1110,7 +1717,7 @@ mod tests {
             ..Default::default()
         };
 
-        let resp = ingest_index(&index, corpus, Language::Java).unwrap();
+        let resp = ingest_index(&index, corpus, Language::Java, Path::new("")).unwrap();
         assert_eq!(resp.refs.len(), 1, "one ScipRef");
         assert_eq!(resp.refs[0].caller_path, path);
         assert_eq!(resp.refs[0].caller_line, 3); // 0-indexed line 2 → 1-indexed 3

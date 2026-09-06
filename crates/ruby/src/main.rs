@@ -163,7 +163,7 @@ fn run_scip_ruby(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<In
         .unwrap_or(0);
     tracing::info!("scip-ruby produced {output_size} bytes of SCIP output");
 
-    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Ruby)
+    travsr_lang_scip_reader::ingest(&output_path, corpus, Language::Ruby, root)
 }
 
 fn main() {
