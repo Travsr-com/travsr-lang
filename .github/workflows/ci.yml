@@ -187,12 +187,78 @@ jobs:
         run: |
           mkdir -p /tmp/swift_smoke/Sources
           cat > /tmp/swift_smoke/Sources/Hello.swift <<'EOF'
+          struct Config {}
           struct Greeter {
-              func greet() { print("hello") }
+              let config: Config
+              func greet() -> Config { config }
+          }
+          struct Stack<Config> {
+              func push(_ x: Config) {}
+          }
+          extension Stack {
+              func peek() -> Config? { nil }
+          }
+          struct Payload {}
+          protocol Shape {}
+          struct Box {}
+          enum Event { case fired(Payload) }
+          struct Widget {
+              let combo: Box & Shape
+              func cast(_ any: Any) -> Box? { any as? Box }
           }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('/tmp/swift_smoke_out.json'))
+          refs = [r for doc in d['documents'] for r in doc['references']]
+          errs = []
+          # travsr#830: a type used only in annotation / return position must be
+          # emitted as a reference, not just tracked. `Config` appears only in the
+          # field annotation and the return type here, so a reference to it proves
+          # type-position capture is on. Checks the references array specifically,
+          # since `swift::Config` is also present as a definition.
+          config = [r for r in refs if r['symbol'] == 'swift::Config']
+          if not config:
+              errs.append('no reference to swift::Config (type-position capture off)')
+          # A type-position use is an occurrence, not a call: with is_call unset
+          # the wrapper defaults it to true and every annotation becomes a
+          # ref/call edge, so get_callers(Config) would list declaration sites.
+          if any(r.get('is_call', True) for r in config):
+              errs.append('type-position reference to swift::Config is flagged is_call')
+          # `Config` as the generic parameter of Stack shadows the real type. The
+          # two valid references are the annotation and the return type in Greeter.
+          # `struct Stack<Config>` binds Config as a generic parameter, and the
+          # `extension Stack` uses it in a return type without restating it, so a
+          # third or fourth swift::Config reference means a generic parameter leaked
+          # (from the declaration or, the extension case, from the extension body).
+          if len(config) != 2:
+              errs.append('expected 2 swift::Config refs, got %d (generic parameter leaked?)' % len(config))
+          # travsr#830 recall beyond simple annotations. Each type below is used
+          # only in a position the emitter must descend into, and each must be a
+          # type-position occurrence (is_call false), never a call edge.
+          def occ(sym):
+              return [r for r in refs if r['symbol'] == sym]
+          # enum associated value: `case fired(Payload)`
+          payload = occ('swift::Payload')
+          if not payload:
+              errs.append('enum associated-value type swift::Payload not referenced')
+          # protocol composition member: `Box & Shape`
+          if not occ('swift::Shape'):
+              errs.append('composition member swift::Shape not referenced')
+          # `Box` is used in the composition, the return type and the `as?` cast
+          box = occ('swift::Box')
+          if len(box) < 2:
+              errs.append('swift::Box undercounted (composition/return/as-cast): %d' % len(box))
+          for r in payload + occ('swift::Shape') + box:
+              if r.get('is_call', True):
+                  errs.append('type-position ref %s flagged is_call' % r['symbol'])
+          if errs:
+              print('\n'.join(errs))
+              print(json.dumps(refs, indent=2))
+              sys.exit(1)
+          PY
 
   swift-linux:
     name: swift emitter (Linux)
@@ -213,12 +279,78 @@ jobs:
         run: |
           mkdir -p /tmp/swift_smoke/Sources
           cat > /tmp/swift_smoke/Sources/Hello.swift <<'EOF'
+          struct Config {}
           struct Greeter {
-              func greet() { print("hello") }
+              let config: Config
+              func greet() -> Config { config }
+          }
+          struct Stack<Config> {
+              func push(_ x: Config) {}
+          }
+          extension Stack {
+              func peek() -> Config? { nil }
+          }
+          struct Payload {}
+          protocol Shape {}
+          struct Box {}
+          enum Event { case fired(Payload) }
+          struct Widget {
+              let combo: Box & Shape
+              func cast(_ any: Any) -> Box? { any as? Box }
           }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('/tmp/swift_smoke_out.json'))
+          refs = [r for doc in d['documents'] for r in doc['references']]
+          errs = []
+          # travsr#830: a type used only in annotation / return position must be
+          # emitted as a reference, not just tracked. `Config` appears only in the
+          # field annotation and the return type here, so a reference to it proves
+          # type-position capture is on. Checks the references array specifically,
+          # since `swift::Config` is also present as a definition.
+          config = [r for r in refs if r['symbol'] == 'swift::Config']
+          if not config:
+              errs.append('no reference to swift::Config (type-position capture off)')
+          # A type-position use is an occurrence, not a call: with is_call unset
+          # the wrapper defaults it to true and every annotation becomes a
+          # ref/call edge, so get_callers(Config) would list declaration sites.
+          if any(r.get('is_call', True) for r in config):
+              errs.append('type-position reference to swift::Config is flagged is_call')
+          # `Config` as the generic parameter of Stack shadows the real type. The
+          # two valid references are the annotation and the return type in Greeter.
+          # `struct Stack<Config>` binds Config as a generic parameter, and the
+          # `extension Stack` uses it in a return type without restating it, so a
+          # third or fourth swift::Config reference means a generic parameter leaked
+          # (from the declaration or, the extension case, from the extension body).
+          if len(config) != 2:
+              errs.append('expected 2 swift::Config refs, got %d (generic parameter leaked?)' % len(config))
+          # travsr#830 recall beyond simple annotations. Each type below is used
+          # only in a position the emitter must descend into, and each must be a
+          # type-position occurrence (is_call false), never a call edge.
+          def occ(sym):
+              return [r for r in refs if r['symbol'] == sym]
+          # enum associated value: `case fired(Payload)`
+          payload = occ('swift::Payload')
+          if not payload:
+              errs.append('enum associated-value type swift::Payload not referenced')
+          # protocol composition member: `Box & Shape`
+          if not occ('swift::Shape'):
+              errs.append('composition member swift::Shape not referenced')
+          # `Box` is used in the composition, the return type and the `as?` cast
+          box = occ('swift::Box')
+          if len(box) < 2:
+              errs.append('swift::Box undercounted (composition/return/as-cast): %d' % len(box))
+          for r in payload + occ('swift::Shape') + box:
+              if r.get('is_call', True):
+                  errs.append('type-position ref %s flagged is_call' % r['symbol'])
+          if errs:
+              print('\n'.join(errs))
+              print(json.dumps(refs, indent=2))
+              sys.exit(1)
+          PY
 
   dart:
     name: dart emitter (Linux)
