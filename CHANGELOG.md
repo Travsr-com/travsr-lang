@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- Scala: a multi-module or sbt-crossproject build produced zero `.semanticdb` files. The wrapper wrote a root-scoped `semanticdb.sbt` and then looked only under `<root>/target/`, so sub-projects never had SemanticDB enabled and their own `target/` output was never read; a warm standalone `sbt compile` also left Zinc with nothing to recompile, so the sidecar returned in seconds having produced nothing, and the stdout that would have shown this was drained and discarded (travsr#832). The `scalacOptions` are now set from the command line with `set every semanticdbEnabled := true`, which reaches every sub-project (including sbt-crossproject JVM/JS/Native targets) and forces a recompile, the walk collects `.semanticdb` from every sub-project's `target/` at any depth while skipping dot-directories so the Metals/Bloop copies of the same sources are not ingested twice, and a compile that succeeds with zero output now logs the bounded sbt stdout/stderr tail at `warn`. Enabling SemanticDB in every scope also covers `Test`, so test-source references now enter the graph.
+
 ## [0.4.2] - 2026-08-22
 
 Windows Phase B for the JVM and .NET wrappers, which shipped binaries in v0.4.0 but produced nothing when run, plus graph noise-node cleanup. No API or protocol changes (#22).
