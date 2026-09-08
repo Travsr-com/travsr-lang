@@ -8,6 +8,18 @@
 //!   1. $TRAVSR_DART_EMITTER
 //!   2. packages/dart-scip-emitter/bin/emit-native (dev)
 //!   3. <prefix>/bin/travsr-dart-index-emitter (installed)
+//!
+//! ## `cargo build` does NOT build the emitter
+//!
+//! This crate is a spawner. The analyzer is the Dart package above, built with
+//! `cd packages/dart-scip-emitter && dart compile exe bin/emit.dart -o
+//! bin/emit-native`, and nothing in the Cargo workspace builds it. Rebuilding
+//! the workspace after editing `bin/emit.dart` therefore leaves a new spawner
+//! driving the previously installed emitter, whose output is still well formed,
+//! so the skew is invisible at the result level. `check_emitter_version` makes
+//! it visible: it asks the resolved emitter for `--version` once per process,
+//! logs the path and version at info, and warns when the version does not match
+//! this crate's, or when the emitter is old enough not to know the flag.
 
 use anyhow::Context as _;
 use std::io::Read as _;
@@ -15,6 +27,7 @@ use std::path::{Path, PathBuf};
 use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
+    PluginDiagnostic,
 };
 
 const TIMEOUT_SECS: u64 = 300;
@@ -126,6 +139,105 @@ impl Plugin for DartPhaseB {
     }
 }
 
+// ── Emitter version handshake ─────────────────────────────────────────────────
+
+/// Ask the resolved emitter what it is, then log it and warn if it is not the
+/// build this sidecar expects.
+///
+/// The trap this closes: `cargo build --release` at the repo root does NOT
+/// build `packages/dart-scip-emitter`. A developer who rebuilds the workspace
+/// therefore gets a new Rust spawner talking to whatever emitter binary is
+/// already installed at `~/.travsr/bin/travsr-dart-index-emitter`, with no
+/// signal that the pair is skewed. A stale emitter emits well-formed output,
+/// so the only symptom is results that quietly do not reflect the source.
+///
+/// Two signals, both WARN and never fatal (a version-skewed emitter still
+/// produces a usable index, and refusing to run would take Phase B away from
+/// someone whose only problem is a missing rebuild):
+///   1. The emitter does not understand `--version` at all. It predates this
+///      handshake, so it is definitely older than this sidecar.
+///   2. It reports a version other than this sidecar's own package version.
+///
+/// Runs once per process (`OnceLock`), so a repeat invoke does not re-spawn it.
+fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
+    // Caches the *verdict*, not just the fact of having run: the probe stays
+    // once-per-process, but a repeat invoke still gets the diagnostic to attach
+    // to its own response.
+    static CHECKED: std::sync::OnceLock<Option<PluginDiagnostic>> = std::sync::OnceLock::new();
+    if let Some(cached) = CHECKED.get() {
+        return cached.clone();
+    }
+
+    let mtime = std::fs::metadata(emitter)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+
+    let reported = std::process::Command::new(emitter)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    // Always say which binary actually ran. Benchmarking against an emitter you
+    // did not build is the failure this exists to prevent, and the path plus the
+    // build identity is what makes that visible.
+    tracing::info!(
+        emitter = %emitter.display(),
+        version = reported.as_deref().unwrap_or("unknown"),
+        mtime_unix = mtime,
+        sidecar_version = env!("CARGO_PKG_VERSION"),
+        "dart emitter resolved"
+    );
+
+    let expected = env!("CARGO_PKG_VERSION");
+    let diagnostic = match &reported {
+        None => Some(PluginDiagnostic::warning(
+            "emitter.version-unsupported",
+            format!(
+                "the dart index emitter at {} does not support `--version`, so it predates \
+                 this sidecar (v{expected}) and its output may not reflect the current emitter \
+                 source. `cargo build` does not rebuild it.",
+                emitter.display()
+            ),
+        )),
+        Some(line) if !line.ends_with(expected) => Some(PluginDiagnostic::warning(
+            "emitter.version-mismatch",
+            format!(
+                "the dart index emitter at {} reports {line}, but this sidecar is v{expected}. \
+                 Its output may not reflect the current emitter source; `cargo build` does not \
+                 rebuild it.",
+                emitter.display()
+            ),
+        )),
+        Some(_) => None,
+    };
+    match reported {
+        None => tracing::warn!(
+            emitter = %emitter.display(),
+            "dart emitter does not support `--version`, so it predates this \
+             sidecar (v{expected}) and its output may not reflect the current \
+             emitter source. `cargo build` does not rebuild it: run \
+             `cd packages/dart-scip-emitter && dart compile exe bin/emit.dart -o bin/emit-native` and reinstall it to \
+             ~/.travsr/bin/travsr-dart-index-emitter."
+        ),
+        Some(line) if !line.ends_with(expected) => tracing::warn!(
+            emitter = %emitter.display(),
+            reported = %line,
+            expected = %expected,
+            "dart emitter version does not match this sidecar. Rebuild it with \
+             `cd packages/dart-scip-emitter && dart compile exe bin/emit.dart -o bin/emit-native` and reinstall it to \
+             ~/.travsr/bin/travsr-dart-index-emitter."
+        ),
+        Some(_) => {}
+    }
+    let _ = CHECKED.set(diagnostic.clone());
+    diagnostic
+}
+
 // ── Emitter invocation ────────────────────────────────────────────────────────
 
 fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
@@ -133,6 +245,7 @@ fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse>
         "travsr-dart-index-emitter not found. \
          set $TRAVSR_DART_EMITTER or run `travsr lang install dart`",
     )?;
+    let version_diagnostic = check_emitter_version(&emitter);
 
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = scratch.path().join("index.json");
@@ -180,7 +293,13 @@ fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse>
         "dart emitter exited with {status}: {stderr_buf}"
     );
 
-    parse_emitter_output(&output_path, corpus)
+    // A version-skewed emitter still produces a usable index, so this rides out
+    // on the response rather than failing the run. Attaching it here is the point:
+    // the host only echoes sidecar stderr when a run yields zero nodes, and a
+    // stale emitter yields plenty, just not of the current source.
+    let mut resp = parse_emitter_output(&output_path, corpus)?;
+    resp.diagnostics.extend(version_diagnostic);
+    Ok(resp)
 }
 
 // ── JSON parsing ──────────────────────────────────────────────────────────────

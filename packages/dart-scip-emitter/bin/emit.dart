@@ -40,9 +40,24 @@ import 'package:analyzer/dart/element/element.dart';
 import 'package:analyzer/file_system/physical_file_system.dart';
 import 'package:path/path.dart' as p;
 
+/// Build identity of this emitter, reported by `--version`.
+///
+/// Keep in sync with the Cargo workspace version in `Cargo.toml`: the Rust
+/// spawner (`crates/dart`) compares this against its own package version and
+/// warns when they disagree, because `cargo build` does NOT rebuild this
+/// binary and a stale emitter is otherwise indistinguishable from a current
+/// one. Bump both together at release.
+const emitterVersion = '0.4.2';
+
 Future<void> main(List<String> args) async {
+  if (args.isNotEmpty && args[0] == '--version') {
+    stdout.writeln('dart-index-emitter $emitterVersion');
+    exit(0);
+  }
+
   if (args.length < 2) {
     stderr.writeln('usage: emit.dart <root-path> <output-json-path>');
+    stderr.writeln('       emit.dart --version');
     exit(1);
   }
 
