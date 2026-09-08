@@ -29,7 +29,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::Path;
 use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
-use travsr_plugin_sdk::InvokeResponse;
+use travsr_plugin_sdk::{InvokeResponse, PluginDiagnostic};
 
 /// Maximum reference-occurrence edges emitted per document (per SCIP document,
 /// not per invocation). Keeps memory footprint bounded for large repos.
@@ -856,6 +856,114 @@ fn kind_from_symbol_string(symbol: &str) -> String {
         "definition"
     }
     .into()
+}
+
+// ── Dark-scope detection ─────────────────────────────────────────────────────
+
+/// Warn when a language's test sources are present but produced no semantic
+/// output at all.
+///
+/// A Phase B analyzer that is driven by the project's own build (scip-java via
+/// Maven/Gradle, scip-clang via a compile database, scip-ruby via the srb
+/// config) indexes only what the build actually compiles. When the build skips
+/// a whole scope, the analyzer still exits 0 and still emits a valid index, so
+/// the scope is simply absent: no definitions, no references, no edges. Nothing
+/// downstream can tell that apart from a repo that legitimately has no calls in
+/// its tests, and `travsr lang list` keeps reporting the language as healthy
+/// while a large share of the corpus is semantically dark.
+///
+/// This is the signal for that. It is deliberately generic: any sidecar can
+/// call it after ingest and pass its own `cause_hint` naming the build flags
+/// that produce the condition for its ecosystem.
+///
+/// The finding is attached to `resp.diagnostics`, not only logged. A dark test
+/// scope is by definition a partially populated index, and the host echoes a
+/// sidecar's stderr only when a run returns zero nodes, so for the whole life
+/// of this warning it was written to a stream nobody read.
+///
+/// Arguments:
+/// * `files` is `InvokeRequest::files`, the daemon's pre-walked repo-relative
+///   file list for this language. `None` (a pre-P6 daemon) skips the check
+///   rather than guessing from a second directory walk.
+/// * `resp` is the ingest result being returned to the daemon; the diagnostic
+///   is pushed onto it.
+/// * `cause_hint` is one sentence naming the likely build-side cause.
+pub fn warn_if_test_scope_dark(
+    language: Language,
+    files: Option<&[String]>,
+    resp: &mut InvokeResponse,
+    cause_hint: &str,
+) {
+    if !is_dark_test_scope(files, resp) {
+        return;
+    }
+    // `is_dark_test_scope` returned true, so the list is present and non-empty.
+    let files = files.unwrap_or_default();
+    let test_files = files.iter().filter(|p| is_test_path(p)).count();
+    let lang = language.as_str();
+    let total = files.len();
+    let message = format!(
+        "semantic index is test-blind: {test_files} of {total} {lang} source files are test \
+         sources, and not one definition or reference in any of them reached the \
+         index. {cause_hint} Until that is fixed, `travsr references`, \
+         `get_callers` and blast radius will miss every call site that lives in a \
+         test file."
+    );
+    tracing::warn!(
+        language = lang,
+        test_files,
+        source_files = total,
+        "{message}"
+    );
+    resp.diagnostics.push(PluginDiagnostic::warning(
+        format!("{lang}.test-scope-dark"),
+        message,
+    ));
+}
+
+/// The predicate behind [`warn_if_test_scope_dark`], split out so it can be
+/// tested without capturing a `tracing` subscriber.
+fn is_dark_test_scope(files: Option<&[String]>, resp: &InvokeResponse) -> bool {
+    let Some(files) = files else {
+        // Pre-P6 daemon: no file list, and a second directory walk here would
+        // cost more than the diagnostic is worth. Say nothing.
+        tracing::debug!("no pre-walked file list, skipping dark-test-scope check");
+        return false;
+    };
+    // An index that is empty everywhere is a different (already reported)
+    // failure: the analyzer did not run, or ran and produced nothing at all.
+    // Only a partially dark index is this check's business.
+    if resp.nodes.is_empty() {
+        return false;
+    }
+    if !files.iter().any(|p| is_test_path(p)) {
+        return false;
+    }
+    let covered = resp.refs.iter().any(|r| is_test_path(&r.caller_path))
+        || resp.nodes.iter().any(|n| is_test_path(&n.vname.path));
+    !covered
+}
+
+/// Whether a repo-relative path looks like a test source.
+///
+/// Directory-segment match first (`src/test/...`, `tests/`, `spec/`,
+/// `__tests__/`), then the common filename conventions (`FooTest.java`,
+/// `foo_test.go`, `test_foo.py`, `Foo.spec.ts`). Heuristic by construction: it
+/// only ever decides whether to emit a diagnostic, never what enters the graph.
+fn is_test_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let mut segments = lower.split('/');
+    let file = segments.next_back().unwrap_or("");
+    if segments.any(|seg| matches!(seg, "test" | "tests" | "spec" | "specs" | "__tests__")) {
+        return true;
+    }
+    let stem = file.split('.').next().unwrap_or("");
+    stem.ends_with("test")
+        || stem.ends_with("tests")
+        || stem.ends_with("spec")
+        || stem.starts_with("test_")
+        || file.contains(".test.")
+        || file.contains(".spec.")
 }
 
 #[cfg(test)]
@@ -1724,5 +1832,87 @@ mod tests {
         assert_eq!(resp.refs[0].caller_line, 3); // 0-indexed line 2 → 1-indexed 3
                                                  // callee_id must be the definition node, the daemon resolves src at write time.
         assert_eq!(resp.refs[0].callee_id, resp.nodes[0].id);
+    }
+}
+
+#[cfg(test)]
+mod dark_scope_tests {
+    use super::*;
+    use travsr_core::{Node, ScipRef, VName};
+
+    fn node(path: &str) -> Node {
+        Node::new(VName::new("c", "", path, "java", "scip:x"), "function")
+    }
+
+    fn scip_ref(path: &str) -> ScipRef {
+        ScipRef {
+            caller_path: path.to_string(),
+            caller_line: 1,
+            callee_id: travsr_core::NodeId(1),
+            is_call: true,
+            caller_col: None,
+        }
+    }
+
+    #[test]
+    fn test_path_recognition() {
+        for p in [
+            "src/test/java/org/json/junit/JSONObjectTest.java",
+            "tests/Tests/AFHTTPSessionManagerTests.m",
+            "spec/models/user_spec.rb",
+            "pkg/foo/bar_test.go",
+            "app/__tests__/render.js",
+            "lib/test_parser.py",
+            "src/widget.spec.ts",
+        ] {
+            assert!(is_test_path(p), "{p} should read as a test path");
+        }
+        for p in [
+            "src/main/java/org/json/JSONObject.java",
+            "AFNetworking/AFURLSessionManager.m",
+            "crates/store/src/lib.rs",
+        ] {
+            assert!(!is_test_path(p), "{p} should not read as a test path");
+        }
+    }
+
+    #[test]
+    fn warns_only_when_tests_are_present_and_uncovered() {
+        let files = vec![
+            "src/main/java/A.java".to_string(),
+            "src/test/java/ATest.java".to_string(),
+        ];
+
+        // Dark: nodes exist, but none from a test path and no test-path refs.
+        let dark = InvokeResponse {
+            diagnostics: Vec::new(),
+            nodes: vec![node("src/main/java/A.java")],
+            refs: vec![scip_ref("src/main/java/A.java")],
+            ..Default::default()
+        };
+        assert!(is_dark_test_scope(Some(&files), &dark));
+
+        // Covered by a reference originating in a test file.
+        let mut covered = dark.clone();
+        covered.refs.push(scip_ref("src/test/java/ATest.java"));
+        assert!(!is_dark_test_scope(Some(&files), &covered));
+
+        // Covered by a definition node in a test file.
+        let mut covered = dark.clone();
+        covered.nodes.push(node("src/test/java/ATest.java"));
+        assert!(!is_dark_test_scope(Some(&files), &covered));
+
+        // No test sources at all: nothing to be dark about.
+        let no_tests = vec!["src/main/java/A.java".to_string()];
+        assert!(!is_dark_test_scope(Some(&no_tests), &dark));
+
+        // Wholly empty index: a different failure, reported elsewhere.
+        assert!(!is_dark_test_scope(
+            Some(&files),
+            &InvokeResponse::default()
+        ));
+
+        // Pre-P6 daemon sends no file list: no guessing.
+        assert!(!is_dark_test_scope(None, &dark));
     }
 }

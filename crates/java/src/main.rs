@@ -48,6 +48,22 @@ use travsr_plugin_sdk::{
 /// JVM builds (Gradle/Maven) can be slow on a cold dependency cache.
 const TIMEOUT_SECS: u64 = 600;
 
+/// Why a Java repo's test sources can be entirely missing from an otherwise
+/// healthy SCIP index.
+///
+/// scip-java analyses with SemanticDB, which is a javac plugin: it only ever
+/// sees the sources the build actually hands to javac. If the build skips test
+/// compilation then `testCompile` is a no-op, no `.semanticdb` file is written
+/// for any test source, the SCIP index carries no Document for it, and no
+/// semantic edge can originate in a test file. scip-java exits 0 throughout,
+/// so the only visible symptom is a graph that quietly knows nothing about the
+/// tests.
+const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
+     source the build never compiles produces no index at all. The usual cause \
+     is a build that skips test compilation: `-Dmaven.test.skip=true` (on the \
+     command line or in `.mvn/maven.config`), `<maven.test.skip>` or \
+     `<skipTests>` in the pom, or `-x compileTestJava` for Gradle.";
+
 struct JavaPhaseB;
 
 impl Plugin for JavaPhaseB {
@@ -74,7 +90,15 @@ impl Plugin for JavaPhaseB {
             run_scip_java(&req.root, req.corpus.as_str())
         };
         match result {
-            Ok(resp) => resp,
+            Ok(mut resp) => {
+                travsr_lang_scip_reader::warn_if_test_scope_dark(
+                    Language::Java,
+                    req.files.as_deref(),
+                    &mut resp,
+                    TEST_SCOPE_CAUSE_HINT,
+                );
+                resp
+            }
             Err(e) => {
                 tracing::warn!("scip-java failed for {}: {e:#}", req.root.display());
                 InvokeResponse::default()
@@ -571,7 +595,11 @@ fn main() {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("travsr_lang_java=info".parse().unwrap()),
+                .add_directive("travsr_lang_java=info".parse().unwrap())
+                // The shared SCIP ingest crate is a different tracing target, so
+                // without this its own diagnostics (empty index, test-blind
+                // index) are filtered out and never reach stderr.
+                .add_directive("travsr_lang_scip_reader=info".parse().unwrap()),
         )
         .init();
 
