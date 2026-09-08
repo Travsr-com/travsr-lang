@@ -817,6 +817,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> Invok
     );
 
     InvokeResponse {
+        diagnostics: Vec::new(),
         nodes,
         edges,
         refs,

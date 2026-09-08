@@ -879,6 +879,7 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
     session.shutdown(deadline);
     Ok(InvokeResponse {
+        diagnostics: Vec::new(),
         nodes,
         edges,
         refs,

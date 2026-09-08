@@ -349,6 +349,7 @@ pub fn ingest_index(
     );
 
     Ok(InvokeResponse {
+        diagnostics: Vec::new(),
         nodes,
         edges,
         refs,

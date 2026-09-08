@@ -286,6 +286,7 @@ fn parse_emitter_output(json_path: &Path, corpus: &str) -> anyhow::Result<Invoke
     );
 
     Ok(InvokeResponse {
+        diagnostics: Vec::new(),
         nodes,
         edges,
         ..Default::default()

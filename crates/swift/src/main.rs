@@ -379,6 +379,7 @@ fn parse_emitter_output(
     );
 
     Ok(InvokeResponse {
+        diagnostics: Vec::new(),
         nodes,
         edges,
         refs: refs_out,
