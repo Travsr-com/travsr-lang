@@ -35,7 +35,7 @@ impl Plugin for PhpPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_scip_php(&req.root, req.corpus.as_str()) {
+        match run_scip_php(&req.root, req.corpus.as_str(), &req.scratch) {
             Ok(resp) => resp,
             Err(e) => {
                 tracing::warn!("scip-php failed for {}: {e}", req.root.display());
@@ -81,27 +81,59 @@ fn scip_php_available() -> bool {
     find_scip_php().is_some()
 }
 
-fn run_scip_php(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+/// `scratch` is the sandbox-authorized writable directory from the invoke
+/// request. Used instead of a self-minted `tempfile::tempdir()` so the path is
+/// one the sandbox actually granted, matching every other sidecar.
+fn run_scip_php(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_php().ok_or_else(|| {
         anyhow::anyhow!(
             "scip-php not found. See https://github.com/davidrjenni/scip-php \
-             (composer require --dev davidrjenni/scip-php, then place vendor/bin/scip-php in ~/.travsr/bin/)"
+             (clone it and run `composer install` inside that checkout, then place \
+             its bin/scip-php in ~/.travsr/bin/). Installing it as a project \
+             dev-dependency does not work: it requires a vendor/ directory inside \
+             its own package dir, which composer does not create for a dependency."
         )
     })?;
 
-    let scratch = tempfile::tempdir().context("failed to create temp dir")?;
-    let output_path = scratch.path().join("index.scip");
+    // scip-php takes no positional root and has no `--output`: it indexes
+    // `getcwd()` and hardcodes its output to `./index.scip` (bin/scip-php:39,53).
+    // travsr passed both anyway and ran it in an empty temp dir, so scip-php set
+    // its project root to that dir, failed to read `composer.json` there, and
+    // exited 255 on every repo. The `Err` was then swallowed into a default
+    // response, so PHP Phase B reported success with zero nodes. Run it in the
+    // repo and move its artifact into scratch.
+    let produced = root.join("index.scip");
+    // Never clobber a file the repo already carries: a pre-existing index.scip
+    // is someone's committed artifact, and this function would delete it below.
+    anyhow::ensure!(
+        !produced.exists(),
+        "refusing to run scip-php: {} already exists and would be overwritten",
+        produced.display()
+    );
+    let output_path = scratch.join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
 
     let mut child = std::process::Command::new(bin)
-        .arg(root)
-        .arg("--output")
-        .arg(&output_path)
-        .current_dir(scratch.path())
-        .stdout(std::process::Stdio::piped())
+        .current_dir(root)
+        // Nothing reads stdout, and scip-php is chatty (PHP deprecation notices
+        // from its parser). Piping it unread deadlocks the child once the ~64KB
+        // pipe buffer fills, surfacing as a spurious timeout. Same hazard, and
+        // the same fix, as travsr-lang#17 in the Ruby sidecar.
+        .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("failed to spawn scip-php")?;
+
+    // Drain stderr on a reader thread so the child never blocks on a full pipe
+    // while we poll for exit.
+    let stderr_reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
 
     let status = loop {
         match child.try_wait().context("polling scip-php")? {
@@ -114,16 +146,20 @@ fn run_scip_php(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         }
     };
 
-    let mut stderr_out = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        use std::io::Read;
-        let _ = err.read_to_string(&mut stderr_out);
-    }
+    let stderr_out = stderr_reader
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     anyhow::ensure!(
         status.success(),
         "scip-php exited with {status}: {stderr_out}"
     );
+
+    // Move the artifact out of the repo so the checkout is left as it was found.
+    std::fs::rename(&produced, &output_path)
+        .or_else(|_| std::fs::copy(&produced, &output_path).map(|_| ()))
+        .with_context(|| format!("scip-php wrote no index at {}", produced.display()))?;
+    let _ = std::fs::remove_file(&produced);
 
     let output_size = std::fs::metadata(&output_path)
         .map(|m| m.len())
