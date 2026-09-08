@@ -23,7 +23,7 @@
 //! ```
 
 use anyhow::Context as _;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, ScipRef, VName};
@@ -238,7 +238,26 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     tracing::info!(sbt_root = %sbt_root.display(), "found sbt project root");
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
-    let (status, stdout_out, stderr_out) = run_sbt_compile(&sbt_root, sbt_bin, deadline)?;
+    // Compile the Test configuration too. `compile` alone builds only the
+    // Compile config, so no test source ever gets a `.semanticdb` and every
+    // caller that lives in a test is invisible: on scala-parser-combinators all
+    // 78 files were `src/main` and `references parseAll` returned 0 of its 4
+    // real callers, every one of them a test. Enabling the SemanticDB *setting*
+    // in every scope (#832) does not compile test sources, it only means they
+    // would carry SemanticDB if something built them.
+    let (mut status, mut stdout_out, mut stderr_out) =
+        run_sbt_compile(&sbt_root, sbt_bin, deadline, true)?;
+    if !status.success() {
+        // A repo whose tests do not compile must still get its main-scope
+        // graph rather than nothing: sbt runs the commands in sequence and
+        // aborts at the first failure, so a broken test tree would otherwise
+        // take `compile` down with it. Retry without the test scope.
+        tracing::warn!(
+            "sbt compile including Test scope failed, retrying with the Compile \
+             scope only; test-source references will be missing:\n{stderr_out}"
+        );
+        (status, stdout_out, stderr_out) = run_sbt_compile(&sbt_root, sbt_bin, deadline, false)?;
+    }
     anyhow::ensure!(
         status.success(),
         "sbt compile exited with {status}:\n{stderr_out}"
@@ -291,10 +310,14 @@ fn tail(s: &str, max_bytes: usize) -> String {
     format!("...(truncated)...\n{}", &s[start..])
 }
 
+/// `with_tests` also compiles the Test configuration, so test sources get
+/// SemanticDB output and their call sites enter the graph. Retried as `false` by
+/// the caller when a repo's tests do not compile.
 fn run_sbt_compile(
     sbt_root: &Path,
     sbt_bin: &Path,
     deadline: std::time::Instant,
+    with_tests: bool,
 ) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
     // #S3: plain `sbt compile` uses sbt 2.x's thin-client/background-server
     // split (`sbtn`), which talks to the server over a loopback socket. Windows
@@ -307,7 +330,11 @@ fn run_sbt_compile(
     // the same whether sandboxed or not; confirmed identical real compiles
     // (real elapsed time, `.semanticdb` output) with and without the sandbox.
     let mut child = std::process::Command::new(sbt_bin)
-        .args(["--server", SEMANTICDB_ENABLE_CMD, "compile"])
+        .args(if with_tests {
+            &["--server", SEMANTICDB_ENABLE_CMD, "compile", "Test/compile"][..]
+        } else {
+            &["--server", SEMANTICDB_ENABLE_CMD, "compile"][..]
+        })
         .current_dir(sbt_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -628,6 +655,12 @@ fn kind_str(kind: u32) -> &'static str {
     }
 }
 
+/// A symbol whose fully-qualified name sits under a standard-library namespace.
+///
+/// Only meaningful together with the set of symbols this repo defines: see
+/// [`is_noise_symbol`]. A SemanticDB symbol carries no package or provenance
+/// prefix, so the namespace alone cannot say whether `scala/util/…` is the
+/// standard library or the repo's own code.
 fn is_stdlib_symbol(symbol: &str) -> bool {
     symbol.starts_with("scala/")
         || symbol.starts_with("java/")
@@ -652,10 +685,22 @@ fn is_parameter_descriptor(symbol: &str) -> bool {
     symbol.ends_with(')')
 }
 
-/// Symbols that must not become graph nodes or edge endpoints: stdlib, anonymous
-/// locals, and parameter descriptors.
-fn is_noise_symbol(symbol: &str) -> bool {
-    is_stdlib_symbol(symbol) || is_local_symbol(symbol) || is_parameter_descriptor(symbol)
+/// Symbols that must not become graph nodes or edge endpoints: anonymous
+/// locals, parameter descriptors, and *external* standard-library symbols.
+///
+/// `defined` is every symbol carrying a `SymbolInformation` entry in some parsed
+/// `TextDocument`, which is exactly the set this repo defines. A SCIP symbol
+/// carries a package moniker that separates the stdlib from the repo's own code;
+/// a SemanticDB symbol does not, it is a bare fully-qualified name. So the
+/// namespace prefix can only be trusted for a symbol the repo does not define
+/// itself. Without that gate, a repo published under `scala.*` has 100% of its
+/// own symbols classified as stdlib and indexes to zero nodes: on
+/// scala-parser-combinators all 3460 non-local symbols were dropped, `def_ids`
+/// came out empty, and Phase B reported success with an empty graph.
+fn is_noise_symbol(symbol: &str, defined: &HashSet<&str>) -> bool {
+    is_local_symbol(symbol)
+        || is_parameter_descriptor(symbol)
+        || (!defined.contains(symbol) && is_stdlib_symbol(symbol))
 }
 
 fn sdb_vname(symbol: &str, path: &str, corpus: &str) -> VName {
@@ -679,10 +724,18 @@ fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> Invok
     // symbol defined in another resolves to the correct callee node (the per-doc
     // edge builder below keys dst on the *reference's* uri, which is wrong across
     // files; refs use this map instead).
+    // Every symbol this repo defines, so `is_noise_symbol` can tell the repo's
+    // own `scala/…` code from the actual standard library.
+    let defined: HashSet<&str> = docs
+        .iter()
+        .flat_map(|d| d.symbols.iter())
+        .map(|s| s.symbol.as_str())
+        .collect();
+
     let mut def_ids: HashMap<String, NodeId> = HashMap::new();
     for doc in docs {
         for sym in &doc.symbols {
-            if is_noise_symbol(&sym.symbol) {
+            if is_noise_symbol(&sym.symbol, &defined) {
                 continue;
             }
             def_ids
@@ -716,7 +769,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> Invok
 
         // Emit a node for every user-defined symbol
         for sym in &doc.symbols {
-            if is_noise_symbol(&sym.symbol) {
+            if is_noise_symbol(&sym.symbol, &defined) {
                 continue;
             }
             let vname = sdb_vname(&sym.symbol, uri, corpus);
@@ -742,7 +795,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> Invok
             if occ.role != 1 {
                 continue; // only REFERENCEs
             }
-            if is_noise_symbol(&occ.symbol) {
+            if is_noise_symbol(&occ.symbol, &defined) {
                 continue;
             }
             // #299 F3: a range-less reference occurrence has no real position;
@@ -1007,6 +1060,30 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::RefCall));
+    }
+
+    // SemanticDB symbols carry no package/provenance prefix, so a namespace
+    // prefix alone cannot tell the stdlib from a repo that publishes under that
+    // same namespace. scala-parser-combinators lives in `scala.util.parsing.*`,
+    // so every one of its 3460 symbols was classified stdlib and dropped: an
+    // empty `def_ids`, no nodes, and a Phase B "success" with an empty graph.
+    #[test]
+    fn repo_defined_stdlib_namespace_symbol_is_kept() {
+        let own = "scala/util/parsing/combinator/Parsers#phrase().";
+        let external = "scala/Predef#println().";
+        let defined: HashSet<&str> = [own].into_iter().collect();
+
+        assert!(
+            !is_noise_symbol(own, &defined),
+            "a `scala/...` symbol this repo defines is the repo's own code"
+        );
+        assert!(
+            is_noise_symbol(external, &defined),
+            "a `scala/...` symbol the repo does not define is the real stdlib"
+        );
+        // The other two classes are unaffected by the `defined` set.
+        assert!(is_noise_symbol("local0", &defined));
+        assert!(is_noise_symbol("com/demo/Greeter#greet().(name)", &defined));
     }
 
     #[test]
