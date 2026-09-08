@@ -206,6 +206,19 @@ jobs:
               let combo: Box & Shape
               func cast(_ any: Any) -> Box? { any as? Box }
           }
+          protocol Runner {}
+          extension Runner {
+              static func launch() -> Int { 0 }
+              static func chain() -> Int { launch() }
+          }
+          struct Job: Runner {}
+          class Base { class func baseStatic() {} }
+          class Derived: Base {}
+          func inheritedCalls() -> Int {
+              Derived.baseStatic()
+              return Job.launch()
+          }
+          func genericCall<T: Runner>(_ t: T.Type) -> Int { T.launch() }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
@@ -251,6 +264,28 @@ jobs:
           box = occ('swift::Box')
           if len(box) < 2:
               errs.append('swift::Box undercounted (composition/return/as-cast): %d' % len(box))
+          # A static/type-method call is written on the receiver but may be
+          # declared on a supertype or protocol extension. The emitter keyed the
+          # symbol on the receiver, so every inherited call named a symbol no
+          # definition carried and was dropped: 33% of all references on
+          # swift-argument-parser, and `references parseAsRoot` found none of its
+          # 11 caller files. Each case below must key on the DECLARING type.
+          if not occ('swift::Runner.launch'):
+              errs.append('inherited protocol-extension call not keyed on the declaring type')
+          if occ('swift::Job.launch'):
+              errs.append('call keyed on the receiver (swift::Job.launch) instead of the declarer')
+          if not occ('swift::Base.baseStatic'):
+              errs.append('inherited superclass call not keyed on the declaring type')
+          if occ('swift::Derived.baseStatic'):
+              errs.append('call keyed on the subclass instead of the declarer')
+          # A bare call inside the declaring extension is implicit-self static
+          # dispatch, not a top-level function.
+          if occ('swift::launch'):
+              errs.append('bare call in the declaring extension emitted as a free function')
+          # A generic parameter names no real type: it must resolve through its
+          # constraint, and never be emitted as a type reference of its own.
+          if occ('swift::T'):
+              errs.append('generic parameter emitted as a real type reference')
           for r in payload + occ('swift::Shape') + box:
               if r.get('is_call', True):
                   errs.append('type-position ref %s flagged is_call' % r['symbol'])
@@ -298,6 +333,19 @@ jobs:
               let combo: Box & Shape
               func cast(_ any: Any) -> Box? { any as? Box }
           }
+          protocol Runner {}
+          extension Runner {
+              static func launch() -> Int { 0 }
+              static func chain() -> Int { launch() }
+          }
+          struct Job: Runner {}
+          class Base { class func baseStatic() {} }
+          class Derived: Base {}
+          func inheritedCalls() -> Int {
+              Derived.baseStatic()
+              return Job.launch()
+          }
+          func genericCall<T: Runner>(_ t: T.Type) -> Int { T.launch() }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
@@ -343,6 +391,28 @@ jobs:
           box = occ('swift::Box')
           if len(box) < 2:
               errs.append('swift::Box undercounted (composition/return/as-cast): %d' % len(box))
+          # A static/type-method call is written on the receiver but may be
+          # declared on a supertype or protocol extension. The emitter keyed the
+          # symbol on the receiver, so every inherited call named a symbol no
+          # definition carried and was dropped: 33% of all references on
+          # swift-argument-parser, and `references parseAsRoot` found none of its
+          # 11 caller files. Each case below must key on the DECLARING type.
+          if not occ('swift::Runner.launch'):
+              errs.append('inherited protocol-extension call not keyed on the declaring type')
+          if occ('swift::Job.launch'):
+              errs.append('call keyed on the receiver (swift::Job.launch) instead of the declarer')
+          if not occ('swift::Base.baseStatic'):
+              errs.append('inherited superclass call not keyed on the declaring type')
+          if occ('swift::Derived.baseStatic'):
+              errs.append('call keyed on the subclass instead of the declarer')
+          # A bare call inside the declaring extension is implicit-self static
+          # dispatch, not a top-level function.
+          if occ('swift::launch'):
+              errs.append('bare call in the declaring extension emitted as a free function')
+          # A generic parameter names no real type: it must resolve through its
+          # constraint, and never be emitted as a type reference of its own.
+          if occ('swift::T'):
+              errs.append('generic parameter emitted as a real type reference')
           for r in payload + occ('swift::Shape') + box:
               if r.get('is_call', True):
                   errs.append('type-position ref %s flagged is_call' % r['symbol'])
