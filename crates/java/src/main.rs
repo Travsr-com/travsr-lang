@@ -142,12 +142,52 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = scratch.path().join("index.scip");
 
-    let mut cmd = std::process::Command::new(bin);
-    cmd.arg("index")
-        .arg("--output")
-        .arg(&output_path)
-        .current_dir(root);
-    run_to_completion(cmd, "scip-java")?;
+    // Maven: ask for `test-compile` explicitly instead of letting scip-java run
+    // the project's default lifecycle.
+    //
+    // Two things go wrong with the default. It runs far past what SemanticDB
+    // needs, so a goal that has nothing to do with indexing can fail the whole
+    // run: on the pinned JSON-java fixture it reached maven-gpg-plugin and died
+    // with `Cannot run program "gpg"`, producing an empty index and a Phase B
+    // that knew nothing about the repo. And a project that skips test
+    // compilation (`-Dmaven.test.skip=true` in `.mvn/maven.config`, a common
+    // way to make such a build pass) never compiles its tests, so SemanticDB,
+    // being a javac plugin, sees none of them and no call site in any test file
+    // reaches the graph.
+    //
+    // `test-compile` is the earliest phase that compiles BOTH source roots and
+    // it runs no tests, no javadoc, no signing and no deploy. Measured on that
+    // fixture: the default fails outright, `test-compile` succeeds and the index
+    // gains 59 test files.
+    //
+    // Falls back to the default on failure rather than giving up, because a repo
+    // whose tests genuinely do not compile should still get its main scope
+    // indexed. Same shape as the scala sidecar's `Test/compile` fallback.
+    let maven = matches!(detect_build_system(root), Some(BuildSystem::Maven));
+    let mut ran = false;
+    if maven {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("index")
+            .arg("--output")
+            .arg(&output_path)
+            .arg("test-compile")
+            .current_dir(root);
+        match run_to_completion(cmd, "scip-java") {
+            Ok(()) => ran = true,
+            Err(e) => tracing::warn!(
+                "scip-java `test-compile` failed, retrying with the project's \
+                 default build command (test call sites will be missing): {e:#}"
+            ),
+        }
+    }
+    if !ran {
+        let mut cmd = std::process::Command::new(bin);
+        cmd.arg("index")
+            .arg("--output")
+            .arg(&output_path)
+            .current_dir(root);
+        run_to_completion(cmd, "scip-java")?;
+    }
 
     let output_size = std::fs::metadata(&output_path)
         .map(|m| m.len())
