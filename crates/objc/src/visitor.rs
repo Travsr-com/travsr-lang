@@ -20,7 +20,7 @@ use scip::types::{
     symbol_information::Kind as ScipKind, Document, Index, Occurrence, Relationship,
     SymbolInformation,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_int, c_uint};
 use std::path::{Path, PathBuf};
@@ -34,8 +34,20 @@ use crate::symbol;
 struct IndexBuilder {
     corpus: String,
     root: PathBuf,
-    /// Relative path → (occurrences, symbol_infos)
-    docs: HashMap<String, DocData>,
+    /// Relative path → (occurrences, symbol_infos).
+    ///
+    /// A `BTreeMap`, not a `HashMap`, so `finish()` emits documents in a stable
+    /// path order. Downstream SCIP ingest keys its definition table on the SCIP
+    /// symbol string, and a symbol defined in two documents (e.g. a test file
+    /// that re-declares a category method) is resolved first-document-wins, so
+    /// a randomized document order made identical input produce a different
+    /// edge target from run to run.
+    docs: BTreeMap<String, DocData>,
+    /// #833 phase 1: class-message sends recovered lexically from translation
+    /// units clang reported errors on. Held aside until every TU is processed,
+    /// because the phase-2 gate ("does the index define this method?") cannot
+    /// be evaluated before the last definition has been seen.
+    recovery: Vec<SendCandidate>,
 }
 
 #[derive(Default)]
@@ -49,7 +61,8 @@ impl IndexBuilder {
         Self {
             corpus: corpus.to_string(),
             root: root.to_owned(),
-            docs: HashMap::new(),
+            docs: BTreeMap::new(),
+            recovery: Vec::new(),
         }
     }
 
@@ -69,6 +82,9 @@ impl IndexBuilder {
             .push(si);
     }
 
+    /// Emit the accumulated documents in ascending `relative_path` order.
+    ///
+    /// The ordering is load-bearing, not cosmetic: see the `docs` field docs.
     fn finish(self) -> Index {
         let mut index = Index::default();
         for (path, data) in self.docs {
@@ -128,11 +144,17 @@ pub fn build_index(root: &Path, corpus: &str, files: Option<&[String]>) -> anyho
         );
     }
 
+    // #833 phase 2: every TU has been processed, so the index now holds every
+    // definition it will ever hold. Only now can a lexically recovered send be
+    // checked against it.
+    let recovered = apply_error_tu_recovery(&mut builder);
+
     let index = builder.finish();
     tracing::info!(
         documents = index.documents.len(),
         parsed_ok,
         total = entries.len(),
+        recovered,
         "objc visitor complete"
     );
     Ok(index)
@@ -184,6 +206,24 @@ fn process_tu(
 
     // Diag stub: diag::collect(tu as *mut c_void, &builder.root), called
     // here when RFC-016 Phase 1 lands. Currently a no-op.
+
+    // #833 phase 1: when clang reported an error for this TU, an undeclared
+    // receiver made Sema drop the whole enclosing `ObjCMessageExpr` (no
+    // RecoveryExpr is built), so `visit_refs` never saw a send to gate on and
+    // the #831 token fallback inside it was unreachable. Re-scan the TU's
+    // method and function bodies lexically and buffer the candidates; they are
+    // filtered against the index in phase 2.
+    if tu_has_error(tu) {
+        let root_path = builder.root.clone();
+        let mut rec = RecoveryCtx {
+            tu,
+            root: root_path,
+            out: &mut builder.recovery,
+        };
+        unsafe {
+            clang_visitChildren(root_cursor, visit_recovery, &mut rec as *mut _ as _);
+        }
+    }
 
     unsafe { clang_disposeTranslationUnit(tu) };
     Ok(())
@@ -680,49 +720,115 @@ fn first_objc_class_ref(cursor: CXCursor) -> String {
 /// is undeclared in the TU, so there is no `ObjCClassRef` receiver and the
 /// message expr spells empty).
 ///
-/// A message send tokenizes as `[ Receiver keyword : arg keyword : arg ]`. The
-/// receiver is the first identifier at the outer message's depth; a keyword is
-/// any identifier at that depth immediately followed by a `:` at that depth,
-/// concatenated with colons (`setWidth:height:`). Depth tracking over
-/// `[](){}` keeps nested sends, casts and parenthesized args from being read as
-/// selector parts.
-///
-/// Gated to a class receiver (upper-case leading character, the Obj-C class
-/// naming convention): `[self …]`, `[super …]` and lower-case locals are
-/// instance dispatch on an unknown type and stay skipped, exactly as the
-/// semantic path already skips them. A wrong selector (e.g. a bare ternary
-/// colon at message depth) yields a symbol that matches no definition and is
-/// dropped downstream as a safe miss, never a wrong edge.
+/// The token grammar itself lives in [`parse_send_at`], shared with the #833
+/// error-TU recovery pass, which scans whole bodies rather than one message.
+/// A wrong selector (e.g. a bare ternary colon at message depth) yields a
+/// symbol that matches no definition and is dropped downstream as a safe miss,
+/// never a wrong edge.
 fn syntactic_class_send(tu: CXTranslationUnit, cursor: CXCursor) -> Option<(String, String)> {
     let extent = unsafe { clang_getCursorExtent(cursor) };
+    let toks = tokenize_range(tu, extent);
+    // A message expr's extent starts at its own `[`; find it rather than
+    // assuming index 0 so a leading cast or attribute cannot shift the grammar.
+    let open = toks.iter().position(|t| t.spelling == "[")?;
+    let send = parse_send_at(&toks, open)?;
+    Some((send.receiver, send.selector))
+}
+
+/// One lexed source token: the pieces the send grammar needs, captured while
+/// the libclang token array is still alive.
+struct Tok {
+    kind: CXTokenKind,
+    spelling: String,
+    /// 1-based spelling line/column. Zero when libclang has no location.
+    line: u32,
+    col: u32,
+}
+
+/// Lex a source range into owned tokens.
+///
+/// `clang_tokenize` is purely lexical, so every token comes from the raw text
+/// of `extent` in a single file; the caller supplies that file's path.
+fn tokenize_range(tu: CXTranslationUnit, extent: CXSourceRange) -> Vec<Tok> {
     let mut tokens: *mut CXToken = std::ptr::null_mut();
     let mut num: c_uint = 0;
     unsafe { clang_tokenize(tu, extent, &mut tokens, &mut num) };
     if tokens.is_null() || num == 0 {
-        return None;
+        return Vec::new();
     }
 
-    let mut depth: i32 = 0;
-    let mut receiver: Option<String> = None;
-    let mut first_after_receiver: Option<String> = None;
-    // Last identifier seen at message depth, pending a `:` that would make it a
-    // selector keyword.
-    let mut pending_keyword: Option<String> = None;
-    let mut selector = String::new();
-    let mut has_colon = false;
-
+    let mut out = Vec::with_capacity(num as usize);
     for i in 0..num {
         let tok = unsafe { *tokens.add(i as usize) };
         let kind = unsafe { clang_getTokenKind(tok) };
         let spelling = cx_string_to_owned(unsafe { clang_getTokenSpelling(tu, tok) });
+        let loc = unsafe { clang_getTokenLocation(tu, tok) };
+        let mut line: c_uint = 0;
+        let mut col: c_uint = 0;
+        let mut offset: c_uint = 0;
+        unsafe {
+            clang_getSpellingLocation(loc, std::ptr::null_mut(), &mut line, &mut col, &mut offset);
+        }
+        out.push(Tok {
+            kind,
+            spelling,
+            line,
+            col,
+        });
+    }
 
-        match spelling.as_str() {
+    // The `CXToken` values borrow this buffer, so nothing may outlive it; every
+    // field `Tok` needs has already been copied out.
+    unsafe { clang_disposeTokens(tu, tokens, num) };
+    out
+}
+
+/// A `[Receiver keyword:arg …]` send recovered from source tokens.
+struct ParsedSend {
+    receiver: String,
+    selector: String,
+    /// Index into the token slice of the selector's first keyword token. This
+    /// is the send's "selector start", the same location libclang reports for
+    /// an `ObjCMessageExpr` cursor, so a recovered occurrence lands on the same
+    /// range a parsed one would.
+    selector_tok: usize,
+}
+
+/// Parse the class-message send whose opening `[` is `toks[open]`.
+///
+/// The receiver is the first identifier at the bracket's own depth; a selector
+/// keyword is any identifier at that depth immediately followed by a `:` at
+/// that depth, concatenated with colons (`setWidth:height:`). Depth tracking
+/// over `[](){}` keeps nested sends, casts and parenthesized arguments from
+/// being read as selector parts, and the scan stops at the matching `]`.
+///
+/// Gated to a class receiver (upper-case leading character, the Obj-C class
+/// naming convention): `[self …]`, `[super …]` and lower-case locals are
+/// instance dispatch on an unknown type and stay skipped, exactly as the
+/// semantic path already skips them. This also rejects the array-subscript and
+/// collection-literal brackets a body-wide scan necessarily walks over.
+fn parse_send_at(toks: &[Tok], open: usize) -> Option<ParsedSend> {
+    let mut depth: i32 = 0;
+    let mut receiver: Option<String> = None;
+    let mut first_after_receiver: Option<(String, usize)> = None;
+    // Last identifier seen at message depth, pending a `:` that would make it a
+    // selector keyword.
+    let mut pending_keyword: Option<(String, usize)> = None;
+    let mut selector = String::new();
+    let mut selector_tok: Option<usize> = None;
+    let mut has_colon = false;
+
+    for (i, tok) in toks.iter().enumerate().skip(open) {
+        match tok.spelling.as_str() {
             "[" | "(" | "{" => {
                 depth += 1;
                 continue;
             }
             "]" | ")" | "}" => {
                 depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
                 continue;
             }
             _ => {}
@@ -732,22 +838,25 @@ fn syntactic_class_send(tu: CXTranslationUnit, cursor: CXCursor) -> Option<(Stri
         if depth != 1 {
             continue;
         }
-        if spelling == ":" {
-            if let Some(k) = pending_keyword.take() {
+        if tok.spelling == ":" {
+            if let Some((k, idx)) = pending_keyword.take() {
                 selector.push_str(&k);
                 selector.push(':');
                 has_colon = true;
+                if selector_tok.is_none() {
+                    selector_tok = Some(idx);
+                }
             }
             continue;
         }
-        if kind == CXToken_Identifier {
+        if tok.kind == CXToken_Identifier {
             if receiver.is_none() {
-                receiver = Some(spelling);
+                receiver = Some(tok.spelling.clone());
             } else {
                 if first_after_receiver.is_none() {
-                    first_after_receiver = Some(spelling.clone());
+                    first_after_receiver = Some((tok.spelling.clone(), i));
                 }
-                pending_keyword = Some(spelling);
+                pending_keyword = Some((tok.spelling.clone(), i));
             }
         } else {
             // A non-identifier, non-colon token cannot be a selector keyword and
@@ -756,23 +865,188 @@ fn syntactic_class_send(tu: CXTranslationUnit, cursor: CXCursor) -> Option<(Stri
         }
     }
 
-    unsafe { clang_disposeTokens(tu, tokens, num) };
-
     let receiver = receiver?;
     if !receiver.chars().next().is_some_and(|c| c.is_uppercase()) {
         return None;
     }
-    let selector = if has_colon {
-        selector
+    let (selector, selector_tok) = if has_colon {
+        (selector, selector_tok?)
     } else {
         // Unary selector: `[Class method]`, the single identifier after the
         // receiver is the whole selector, no colon.
-        first_after_receiver?
+        let (name, idx) = first_after_receiver?;
+        (name, idx)
     };
     if selector.is_empty() {
         return None;
     }
-    Some((receiver, selector))
+    Some(ParsedSend {
+        receiver,
+        selector,
+        selector_tok,
+    })
+}
+
+// ── Error-TU token recovery (#833) ───────────────────────────────────────────
+
+/// A class-message send recovered lexically from a TU clang reported errors on.
+/// Buffered in phase 1; only turned into an occurrence in phase 2, and only if
+/// the index actually defines `receiver` + `selector`.
+struct SendCandidate {
+    rel_path: String,
+    /// 1-based selector-start location.
+    line: u32,
+    col: u32,
+    receiver: String,
+    selector: String,
+}
+
+/// True when clang emitted at least one Error or Fatal diagnostic for this TU.
+///
+/// `diag.rs` is an RFC-016 stub that surfaces nothing, so the severity read
+/// lives here where the libclang handle already is.
+fn tu_has_error(tu: CXTranslationUnit) -> bool {
+    let n = unsafe { clang_getNumDiagnostics(tu) };
+    for i in 0..n {
+        let d = unsafe { clang_getDiagnostic(tu, i) };
+        if d.is_null() {
+            continue;
+        }
+        let severity = unsafe { clang_getDiagnosticSeverity(d) };
+        unsafe { clang_disposeDiagnostic(d) };
+        if severity >= CXDiagnostic_Error {
+            return true;
+        }
+    }
+    false
+}
+
+struct RecoveryCtx<'a> {
+    tu: CXTranslationUnit,
+    root: PathBuf,
+    out: &'a mut Vec<SendCandidate>,
+}
+
+/// Walks an error TU looking for bodies to re-scan lexically.
+extern "C" fn visit_recovery(
+    cursor: CXCursor,
+    _parent: CXCursor,
+    data: CXClientData,
+) -> CXChildVisitResult {
+    let ctx = unsafe { &mut *(data as *mut RecoveryCtx) };
+
+    let loc = unsafe { clang_getCursorLocation(cursor) };
+    if unsafe { clang_Location_isInSystemHeader(loc) } != 0 {
+        return CXChildVisit_Continue;
+    }
+
+    let kind = unsafe { clang_getCursorKind(cursor) };
+    if matches!(
+        kind,
+        CXCursor_ObjCInstanceMethodDecl | CXCursor_ObjCClassMethodDecl | CXCursor_FunctionDecl
+    ) {
+        scan_body_for_sends(ctx, cursor);
+        // The body is scanned whole; bodies do not nest.
+        return CXChildVisit_Continue;
+    }
+
+    CXChildVisit_Recurse
+}
+
+/// Lex one method/function body and buffer every class-message send in it.
+fn scan_body_for_sends(ctx: &mut RecoveryCtx, cursor: CXCursor) {
+    let Some((abs_path, _, _)) = cursor_name_location(cursor) else {
+        return;
+    };
+    let Some(rel_path) = to_rel_path(&ctx.root, &abs_path) else {
+        return;
+    };
+
+    let extent = unsafe { clang_getCursorExtent(cursor) };
+    let toks = tokenize_range(ctx.tu, extent);
+
+    // Unlike the #831 fallback, the extent here is a whole body, so every `[`
+    // is a candidate send opener rather than exactly one message.
+    for (i, tok) in toks.iter().enumerate() {
+        if tok.spelling != "[" {
+            continue;
+        }
+        let Some(send) = parse_send_at(&toks, i) else {
+            continue;
+        };
+        let at = &toks[send.selector_tok];
+        if at.line == 0 || at.col == 0 {
+            continue;
+        }
+        ctx.out.push(SendCandidate {
+            rel_path: rel_path.clone(),
+            line: at.line,
+            col: at.col,
+            receiver: send.receiver,
+            selector: send.selector,
+        });
+    }
+}
+
+/// #833 phase 2: turn buffered candidates into reference occurrences.
+///
+/// Two gates keep this from being grep with extra steps:
+///   1. `receiver` + `selector` must canonicalize to a method symbol the index
+///      already defines. An unknown `[NSFileManager defaultManager]` resolves
+///      to nothing and is dropped; `[AFSecurityPolicy policyWithPinningMode:]`
+///      matches the definition in `AFSecurityPolicy.m` and is kept.
+///   2. A send that parsed fine already produced its own occurrence, so a
+///      candidate for a symbol already referenced on that line is dropped
+///      instead of double-counting the call.
+///
+/// Returns the number of occurrences added.
+fn apply_error_tu_recovery(builder: &mut IndexBuilder) -> usize {
+    let candidates = std::mem::take(&mut builder.recovery);
+    if candidates.is_empty() {
+        return 0;
+    }
+
+    let corpus = builder.corpus.clone();
+    let defined: HashSet<String> = builder
+        .docs
+        .values()
+        .flat_map(|d| d.syms.iter().map(|si| si.symbol.clone()))
+        .collect();
+
+    // (file, symbol, line) of every occurrence already in the index. Keyed on
+    // the line rather than the exact range so a one-column difference between
+    // the lexical selector-start and libclang's own cursor location can never
+    // let the same call in twice.
+    let mut seen: HashSet<(String, String, i32)> = HashSet::new();
+    for (path, data) in &builder.docs {
+        for occ in &data.occs {
+            if let Some(&line) = occ.range.first() {
+                seen.insert((path.clone(), occ.symbol.clone(), line));
+            }
+        }
+    }
+
+    let mut added = 0usize;
+    for c in candidates {
+        let target = symbol::method_symbol(&corpus, &c.receiver, &c.selector);
+        if !defined.contains(&target) {
+            continue;
+        }
+        let line = (c.line - 1) as i32;
+        let start_col = (c.col - 1) as i32;
+        if !seen.insert((c.rel_path.clone(), target.clone(), line)) {
+            continue;
+        }
+        let occ = Occurrence {
+            symbol: target,
+            symbol_roles: 0, // reference
+            range: vec![line, start_col, start_col + c.selector.len() as i32],
+            ..Default::default()
+        };
+        builder.add_occurrence(&c.rel_path, occ);
+        added += 1;
+    }
+    added
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -982,6 +1256,14 @@ mod ref_recovery_tests {
             .collect()
     }
 
+    /// Number of reference occurrences whose symbol ends with `suffix`.
+    fn ref_count(index: &Index, suffix: &str) -> usize {
+        ref_symbols(index)
+            .iter()
+            .filter(|s| s.ends_with(suffix))
+            .count()
+    }
+
     #[test]
     fn class_send_to_forward_declared_class_is_recovered() {
         // #831: the callee class is only `@class`-forward-declared in the caller
@@ -1101,5 +1383,200 @@ mod ref_recovery_tests {
             refs.iter().any(|s| s.ends_with("Thing#build().")),
             "cross-subdirectory class send must resolve and emit a ref; got {refs:?}"
         );
+    }
+    // ── #833: error-TU token recovery ────────────────────────────────────────
+
+    #[test]
+    fn error_tu_recovery_drops_sends_to_undefined_classes() {
+        // #833 PRECISION GUARD. `Bad.h` uses `@import`, which is a hard error
+        // under the glob-fallback flags, so clang drops every expression whose
+        // receiver it could not declare. The body-wide token re-scan therefore
+        // sees BOTH `[Local ping]` and `[NSFileManager defaultManager]`.
+        // Only the first resolves to a definition this index holds, so only the
+        // first may become an edge. Recovering the second would make this
+        // feature grep with extra steps.
+        if !crate::libclang_available() {
+            eprintln!("skipping: libclang not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Local.h"),
+            "@interface Local\n+ (void)ping;\n@end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Local.m"),
+            "#import \"Local.h\"\n\
+             @implementation Local\n\
+             + (void)ping {}\n\
+             @end\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Bad.h"), "@import NoSuchModuleAnywhere;\n").unwrap();
+        std::fs::write(
+            root.join("Use.m"),
+            "#import \"Bad.h\"\n\
+             @interface U\n\
+             + (void)go;\n\
+             @end\n\
+             @implementation U\n\
+             + (void)go { [Local ping]; [NSFileManager defaultManager]; }\n\
+             @end\n",
+        )
+        .unwrap();
+
+        let index = build(root);
+        let refs = ref_symbols(&index);
+        // Positive control: proves the recovery pass actually ran on this TU.
+        assert!(
+            refs.iter().any(|s| s.ends_with("Local#ping().")),
+            "recovery must emit the send whose callee the index defines; got {refs:?}"
+        );
+        // The guard itself.
+        assert!(
+            !refs.iter().any(|s| s.contains("defaultManager")),
+            "send to a class the index does not define must be dropped; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn class_send_under_module_import_error_is_recovered() {
+        // #833, the AFNetworking miss minimised: the caller's header reaches the
+        // callee class only through a Clang MODULE import. `@import` is a hard
+        // error without `-fmodules`, so `Policy` is undeclared, Sema returns
+        // ExprError for the receiver, and the enclosing `ObjCMessageExpr` is
+        // never constructed at all (not even a RecoveryExpr). Nothing reaches
+        // `visit_refs`, so the #831 fallback that lives inside its
+        // `CXCursor_ObjCMessageExpr` branch cannot fire. Recovery has to sit
+        // above that gate.
+        if !crate::libclang_available() {
+            eprintln!("skipping: libclang not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Policy.h"),
+            "@interface Policy\n+ (Policy *)policyWithMode:(int)m;\n@end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Policy.m"),
+            "#import \"Policy.h\"\n\
+             @implementation Policy\n\
+             + (Policy *)policyWithMode:(int)m { return 0; }\n\
+             @end\n",
+        )
+        .unwrap();
+        // The caller's header pulls the callee in as a module, and nothing else.
+        std::fs::write(
+            root.join("Client.h"),
+            "@import SomethingUnavailable;\n@interface Client\n+ (void)go;\n@end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Client.m"),
+            "#import \"Client.h\"\n\
+             @implementation Client\n\
+             + (void)go { [Policy policyWithMode:1]; }\n\
+             @end\n",
+        )
+        .unwrap();
+
+        let index = build(root);
+        let refs = ref_symbols(&index);
+        assert!(
+            refs.iter()
+                .any(|s| s.ends_with("Policy#policyWithMode:().")),
+            "send through a failed module import must be recovered; got {refs:?}"
+        );
+    }
+
+    #[test]
+    fn recovery_does_not_double_count_a_send_that_parsed() {
+        // #833: the TU still reports an error (the `@import` in Client.h), so
+        // the recovery scan runs over this body too. But `Policy.h` is imported
+        // directly here, so the send parses and `visit_refs` already emitted its
+        // occurrence. Exactly one reference must survive.
+        if !crate::libclang_available() {
+            eprintln!("skipping: libclang not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Policy.h"),
+            "@interface Policy\n+ (Policy *)policyWithMode:(int)m;\n@end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Policy.m"),
+            "#import \"Policy.h\"\n\
+             @implementation Policy\n\
+             + (Policy *)policyWithMode:(int)m { return 0; }\n\
+             @end\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("Bad.h"), "@import NoSuchModuleAnywhere;\n").unwrap();
+        std::fs::write(
+            root.join("Client.m"),
+            "#import \"Bad.h\"\n\
+             #import \"Policy.h\"\n\
+             @interface Client\n\
+             + (void)go;\n\
+             @end\n\
+             @implementation Client\n\
+             + (void)go { [Policy policyWithMode:1]; }\n\
+             @end\n",
+        )
+        .unwrap();
+
+        let index = build(root);
+        assert_eq!(
+            ref_count(&index, "Policy#policyWithMode:()."),
+            1,
+            "a send that parsed must not be counted twice; got {:?}",
+            ref_symbols(&index)
+        );
+    }
+}
+
+#[cfg(test)]
+mod document_order_tests {
+    use super::*;
+
+    /// Two builders fed the same documents must emit them in the same order.
+    ///
+    /// Regression guard for the objc nondeterminism bug: `docs` was a
+    /// `HashMap`, so `finish()` walked it in a per-map randomized order. Two
+    /// consecutive indexes of the same unmodified repo then disagreed on which
+    /// document defined a symbol that appears in more than one (SCIP ingest
+    /// resolves a duplicated symbol first-document-wins), and a handful of
+    /// `ref/call` edges flipped target from run to run. `std`'s `RandomState`
+    /// reseeds per map instance, so the two builders below take different
+    /// orders under the old code even inside one process.
+    #[test]
+    fn finish_emits_documents_in_stable_sorted_order() {
+        let build = || {
+            let mut b = IndexBuilder::new(Path::new("/tmp"), "test/objc");
+            // Insert in an order that is neither sorted nor reverse sorted.
+            for i in [7, 1, 11, 3, 9, 0, 5, 2, 10, 4, 8, 6] {
+                b.add_occurrence(&format!("src/File{i:02}.m"), Occurrence::default());
+            }
+            b.finish()
+                .documents
+                .iter()
+                .map(|d| d.relative_path.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let first = build();
+        assert_eq!(first, build(), "document order must not vary between runs");
+
+        let mut sorted = first.clone();
+        sorted.sort();
+        assert_eq!(first, sorted, "documents must be emitted in path order");
     }
 }
