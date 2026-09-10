@@ -105,12 +105,34 @@ fn run_scip_clang(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<I
         return Ok(InvokeResponse::default());
     }
 
-    // Use the daemon's sandbox-authorized scratch dir; creating a new tempdir
-    // here would fail inside the sandbox (write denied outside {scratch}).
+    // The field is validated, not trusted, because it can name a path that was
+    // never mapped into this process. The plugin host fills it with the HOST
+    // path of its tempdir (travsr-plugin-host `transport.rs`,
+    // `Sidecar::invoke_phase_b`), and the Linux sandbox bind-mounts that
+    // directory at the fixed path `/travsr-scratch`, over a fresh tmpfs root
+    // with `/tmp` unbound (`sandbox/linux.rs`). The name handed to us therefore
+    // does not exist in our own mount namespace and every write through it
+    // fails: scip-clang produces no index and C Phase B reports zero nodes
+    // without an error. macOS and Windows grant the host path itself, so there
+    // it is real and it is used.
+    //
+    // The fallback is not a degraded mode on Linux, it is the path that has
+    // been working: `tempfile::tempdir` resolves `TMPDIR`, which that same
+    // sandbox sets to `/travsr-scratch`, so the tempdir lands inside exactly
+    // the directory the write grant covers.
     let _fallback_scratch;
-    let output_path = if !scratch.as_os_str().is_empty() {
+    let output_path = if !scratch.as_os_str().is_empty() && scratch.is_dir() {
         scratch.join("index.scip")
     } else {
+        if !scratch.as_os_str().is_empty() {
+            // Never silent: this line is the only signal that the granted
+            // scratch dir was unusable and something else got written to.
+            tracing::debug!(
+                "invoke scratch dir {} is not a directory this process can see, \
+                 falling back to TMPDIR",
+                scratch.display()
+            );
+        }
         _fallback_scratch = tempfile::tempdir().context("failed to create temp dir")?;
         _fallback_scratch.path().join("index.scip")
     };
