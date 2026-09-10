@@ -201,7 +201,26 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("index").arg("--output").arg(&output_path);
     if maven {
-        cmd.args(["--", "--batch-mode", "clean", "test-compile"]);
+        // `-Dmaven.clean.failOnError=false` is what lets `clean` run inside the
+        // sandbox. The host grants `target/` as a bind over a read-only repo
+        // root, so maven-clean-plugin can delete everything INSIDE target/ but
+        // not the `target` directory itself, and by default that one failure is
+        // fatal: "Failed to delete /repo/target", BUILD FAILURE, no index.
+        //
+        // Measured on Linux (bwrap, arm64, maven 3.9): with the flag, clean
+        // still clears the contents, the undeletable directory degrades to a
+        // WARNING, javac runs and the build succeeds. Contents are all `clean`
+        // was ever needed for here: scip-java passes
+        // `-Dmaven.compiler.useIncrementalCompilation=false`, which selects the
+        // stale-source check, and clearing the classes is what makes every
+        // source stale again.
+        cmd.args([
+            "--",
+            "--batch-mode",
+            "-Dmaven.clean.failOnError=false",
+            "clean",
+            "test-compile",
+        ]);
     }
     cmd.current_dir(root);
     run_to_completion(cmd, "scip-java")?;
