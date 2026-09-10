@@ -105,6 +105,96 @@ fn emitter_path() -> Option<PathBuf> {
     None
 }
 
+// ── Dart SDK discovery ────────────────────────────────────────────────────────
+
+/// Locate the Dart SDK root, so the emitter can be told where it lives.
+///
+/// The emitter is AOT-compiled, so package:analyzer's default SDK detection
+/// resolves relative to `Platform.resolvedExecutable`, which is the emitter's
+/// own install directory and not an SDK. `emit.dart:78` reads `DART_SDK` and
+/// hands it to `AnalysisContextCollection` as `sdkPath`; unset or empty falls
+/// back to that broken auto-detect (`emit.dart:82`), which leaves Dart Phase B
+/// empty. A wrong path would be passed straight through, so this returns `Some`
+/// only for a directory that validates as an SDK root.
+///
+/// The validation marker and the search order match travsr's own direct-spawn
+/// path in `crates/travsr-analysis/src/phase_b_dart.rs`.
+fn detect_dart_sdk() -> Option<PathBuf> {
+    let is_sdk_root = |sdk: &Path| sdk.join("lib/_internal/allowed_experiments.json").exists();
+
+    // An explicit override wins, but only when it validates.
+    if let Ok(p) = std::env::var("DART_SDK") {
+        let path = PathBuf::from(&p);
+        if !p.is_empty() && is_sdk_root(&path) {
+            return Some(path);
+        }
+    }
+
+    let dart_name = format!("dart{}", std::env::consts::EXE_SUFFIX);
+    let path_var = std::env::var_os("PATH")?;
+    let mut first_dart: Option<PathBuf> = None;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(&dart_name);
+        if !candidate.exists() {
+            continue;
+        }
+        if first_dart.is_none() {
+            first_dart = Some(candidate.clone());
+        }
+        // `<sdk>/bin/dart` gives `<sdk>`. Canonicalize first to follow symlinks
+        // (Homebrew: /opt/homebrew/bin/dart -> .../dart-sdk/<ver>/libexec/bin/dart).
+        let real = std::fs::canonicalize(&candidate).unwrap_or(candidate);
+        if let Some(sdk) = real.parent().and_then(|p| p.parent()) {
+            if is_sdk_root(sdk) {
+                return Some(sdk.to_path_buf());
+            }
+        }
+    }
+
+    // Version-manager shims (asdf / mise / volta) are shell scripts rather than
+    // symlinks into `<sdk>/bin/dart`, so the parent walk above lands on the shim
+    // directory and never validates. Ask the `dart` tool itself instead.
+    if let Some(dart) = first_dart {
+        if let Some(sdk) = sdk_root_via_dart(&dart) {
+            if is_sdk_root(&sdk) {
+                return Some(sdk);
+            }
+        }
+    }
+
+    tracing::warn!(
+        "Dart SDK not found on PATH; the emitter will fall back to the SDK \
+         auto-detection that does not work for an AOT binary. Set DART_SDK to \
+         the SDK root (the directory containing lib/_internal) to enable \
+         cross-file Dart analysis."
+    );
+    None
+}
+
+/// Ask the `dart` tool where its own SDK lives, for the shim case above.
+///
+/// No `dart` flag prints the SDK path, so this runs a one-line program that
+/// prints the `<sdk>` of `Platform.resolvedExecutable` (`<sdk>/bin/dart`). A
+/// shim `exec`s the real binary, so `resolvedExecutable` is the true SDK binary
+/// and not the shim script. Any failure returns `None`, so a broken shim
+/// degrades to the warning above rather than to an invalid `sdkPath`.
+fn sdk_root_via_dart(dart: &Path) -> Option<PathBuf> {
+    let scratch = tempfile::tempdir().ok()?;
+    let prog = scratch.path().join("travsr_sdk_probe.dart");
+    std::fs::write(
+        &prog,
+        "import 'dart:io';\n\
+         void main() => print(File(Platform.resolvedExecutable).parent.parent.path);\n",
+    )
+    .ok()?;
+    let out = std::process::Command::new(dart).arg(&prog).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (!path.is_empty()).then(|| PathBuf::from(path))
+}
+
 // ── Plugin ────────────────────────────────────────────────────────────────────
 
 struct DartPhaseB;
@@ -164,33 +254,44 @@ impl Plugin for DartPhaseB {
 ///      handshake, so it is definitely older than this sidecar.
 ///   2. It reports a version other than this sidecar's own package version.
 ///
-/// Runs once per resolved emitter path, so a repeat invoke does not re-spawn it.
+/// Runs once per resolved emitter path and build time, so a repeat invoke does
+/// not re-spawn it, and a rebuild is probed again.
 fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
     // Caches the *verdict*, not just the fact of having run: the probe stays
     // once per emitter, but a repeat invoke still gets the diagnostic to attach
     // to its own response.
     //
-    // Keyed on the emitter path, not process-global: `emitter_path()` resolves
-    // per invoke and can legitimately change mid-process ($TRAVSR_DART_EMITTER,
-    // or a dev build appearing while the daemon keeps this sidecar warm). An
-    // unkeyed cache then returned the first emitter's verdict, naming a binary
-    // that is no longer the one being run.
+    // Keyed on the emitter path AND its build time, not process-global:
+    // `emitter_path()` resolves per invoke and can legitimately change
+    // mid-process ($TRAVSR_DART_EMITTER, or a dev build appearing while the daemon
+    // keeps this sidecar warm). An unkeyed cache then returned the first
+    // emitter's verdict, naming a binary that is no longer the one being run.
+    //
+    // The build time is in the key because rebuilding in place, over the same
+    // path, is the usual way an emitter changes. Keyed on the path alone, a
+    // developer who rebuilt and reinstalled kept being told about a skew that
+    // was already fixed, and a newly stale emitter kept being reported clean,
+    // for as long as the daemon held this sidecar warm.
     #[allow(clippy::type_complexity)]
     static CHECKED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, Option<PluginDiagnostic>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<(PathBuf, Option<u64>), Option<PluginDiagnostic>>,
+        >,
     > = std::sync::OnceLock::new();
-    let cache = CHECKED.get_or_init(Default::default);
-    if let Ok(map) = cache.lock() {
-        if let Some(cached) = map.get(emitter) {
-            return cached.clone();
-        }
-    }
 
     let mtime = std::fs::metadata(emitter)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
+    let key = (emitter.to_path_buf(), mtime);
+
+    let cache = CHECKED.get_or_init(Default::default);
+    if let Ok(map) = cache.lock() {
+        if let Some(cached) = map.get(&key) {
+            return cached.clone();
+        }
+    }
 
     let reported = probe_version(emitter);
 
@@ -247,7 +348,7 @@ fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
         Some(_) => {}
     }
     if let Ok(mut map) = cache.lock() {
-        map.insert(emitter.to_path_buf(), diagnostic.clone());
+        map.insert(key, diagnostic.clone());
     }
     diagnostic
 }
@@ -257,8 +358,15 @@ fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
 /// Compared exactly. A `ends_with` test made `10.4.2` compare equal to `0.4.2`,
 /// so the first release past a single-digit major would have silently stopped
 /// reporting skew.
+///
+/// Only the first line is read. The emitter prints the version line and nothing
+/// else, but taking the last token of the whole output made any extra line a
+/// bogus version and a skew warning that was not real. (CI's handshake pipes
+/// through `tail -n 1` instead, because there it is build output that precedes
+/// the line; here the emitter's stderr is already discarded.)
 fn version_field(line: &str) -> &str {
-    line.split_whitespace().last().unwrap_or(line)
+    let first = line.lines().next().unwrap_or(line).trim();
+    first.split_whitespace().last().unwrap_or(first)
 }
 
 /// Run `<emitter> --version` under its own short deadline and return the
@@ -341,11 +449,22 @@ fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse>
         "run_dart_emitter: launching travsr-dart-index-emitter"
     );
 
-    let mut child = std::process::Command::new(&emitter)
+    let mut command = std::process::Command::new(&emitter);
+    command
         .arg(root)
         .arg(&output_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    // Point the emitter at the real SDK. It reads `DART_SDK` and passes it to
+    // the analyzer as `sdkPath` (`emit.dart:78`); without it the AOT binary
+    // auto-detects relative to its own path, fails to read the SDK, and Dart
+    // Phase B comes back empty. Set only when detection validated an SDK root:
+    // an empty value is ignored by the emitter, but a wrong one is not.
+    if let Some(sdk) = detect_dart_sdk() {
+        tracing::debug!(sdk = %sdk.display(), "run_dart_emitter: DART_SDK");
+        command.env("DART_SDK", sdk);
+    }
+    let mut child = command
         .spawn()
         .with_context(|| format!("failed to spawn {}", emitter.display()))?;
 
@@ -521,4 +640,21 @@ fn main() {
         .init();
 
     run_plugin(DartPhaseB);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The last token of the LAST line used to be taken, so an emitter that
+    /// printed anything after its version line reported a bogus version and a
+    /// skew that was not real.
+    #[test]
+    fn version_field_reads_only_the_first_line() {
+        assert_eq!(version_field("dart-index-emitter 0.4.2"), "0.4.2");
+        assert_eq!(
+            version_field("dart-index-emitter 0.4.2\nwarning: something else"),
+            "0.4.2"
+        );
+    }
 }

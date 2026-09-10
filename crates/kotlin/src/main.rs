@@ -50,8 +50,13 @@ use travsr_plugin_sdk::{
 const TIMEOUT_SECS: u64 = 600;
 // #299 F12: cold Gradle/Maven dependency resolution routinely exceeds 30s, after
 // which references ran against a half-built index and silently under-counted.
-// Scale to the overall session budget and warn on timeout instead of proceeding
-// silently. Overridable via TRAVSR_KLS_PROGRESS_WAIT_SECS for very large repos.
+// Scaled to the overall session budget.
+//
+// This is a ceiling, not the wait: the caller clamps it to half of what is left
+// of the host window, which is always the smaller of the two. So
+// TRAVSR_KLS_PROGRESS_WAIT_SECS can only lower the wait, never raise it, and it
+// is kept for that (a caller who wants to spend less time waiting) rather than
+// as a way to give a very large repo longer.
 const PROGRESS_WAIT_SECS: u64 = 180;
 /// The host watchdogs one `invoke` at `INVOKE_TIMEOUT_SECS`
 /// (travsr-plugin-host `transport.rs`) and discards everything the sidecar
@@ -59,6 +64,11 @@ const PROGRESS_WAIT_SECS: u64 = 180;
 /// that window, or "warn and proceed with a possibly incomplete index" turns
 /// into a crash with no index at all.
 const HOST_INVOKE_TIMEOUT_SECS: u64 = 300;
+/// Kept back from the host's window so that giving up on a request still leaves
+/// time to build the response and write it out. Without it the last request can
+/// run right up to the moment the host kills the process, and a killed invoke
+/// reports nothing at all.
+const HOST_REPLY_MARGIN_SECS: u64 = 15;
 const MAX_REFS_PER_SYMBOL: usize = 500;
 
 // ── Binary lookup ─────────────────────────────────────────────────────────────
@@ -265,6 +275,16 @@ fn read_lsp_msg<R: BufRead>(r: &mut R) -> anyhow::Result<Value> {
 
 // ── LSP session ───────────────────────────────────────────────────────────────
 
+/// How the wait for KLS to finish indexing ended.
+enum WaitOutcome {
+    /// KLS said indexing finished.
+    Ready,
+    /// The wait ran out; KLS is still indexing.
+    TimedOut,
+    /// KLS stopped talking to us before it finished.
+    Stopped,
+}
+
 struct LspSession {
     child: Child,
     stdin: BufWriter<std::process::ChildStdin>,
@@ -371,10 +391,25 @@ impl LspSession {
                     "error": { "code": -32601, "message": format!("{other} is not supported") }
                 }))
             }
-            _ => {
+            // A response to another request of ours: `request` reads the inbox
+            // before the channel, so this has to be kept.
+            (Some(_), None) => {
                 self.inbox.push_back(msg);
                 Ok(())
             }
+            // A notification. `$/progress` is the one `wait_for_progress_end`
+            // replays, so keep it and drop the rest. KLS sends a
+            // `publishDiagnostics` for every document the `didOpen` pass opens
+            // and a `window/logMessage` besides, nothing ever reads one back
+            // out, and the queue is drained only once, at the top of
+            // `wait_for_progress_end`. Buffering them therefore grew the inbox
+            // with the size of the repo while `request` linear-scanned the whole
+            // of it for every single message it received.
+            (None, Some("$/progress")) => {
+                self.inbox.push_back(msg);
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
 
@@ -428,10 +463,20 @@ impl LspSession {
     }
 
     /// Drain `$/progress` notifications until begin+end pair or timeout.
-    /// Wait for KLS indexing to finish. Returns `Ok(true)` when the project's
-    /// progress notifications ended cleanly, `Ok(false)` when the wait timed out
-    /// (KLS still indexing) so the caller can warn: references gathered against a
-    /// half-built index would silently under-count (#299 F12).
+    /// Wait for KLS indexing to finish. `Ready` when the project's progress
+    /// notifications ended cleanly, `TimedOut` when no begin/end pair for KLS's
+    /// reporter arrived in time, `Stopped` when KLS itself went away.
+    ///
+    /// `TimedOut` is not evidence that the index is incomplete. KLS raises its
+    /// one reporter from `SymbolIndex.refresh`, so a run whose lint debouncer
+    /// never schedules it emits no signal at all and lands here with a fully
+    /// built index; a large cold Gradle project that really is still working
+    /// lands here too, and nothing observable here separates the two.
+    ///
+    /// Never fails: a dead server used to propagate out of here, and the host
+    /// turns any error from an invoke into an empty response, so a KLS that ran
+    /// out of memory part way through threw away every symbol already collected.
+    /// The caller keeps them and says what happened instead.
     ///
     /// Call this AFTER the `didOpen`/`documentSymbol` pass, never before it. KLS
     /// 1.3.13 raises its one and only progress ("Kotlin: Indexing") from
@@ -443,7 +488,7 @@ impl LspSession {
     /// a live server on this corpus: zero `$/progress` in 180s with no document
     /// open, versus a begin/end pair roughly 9s after the last `didOpen`. That dead
     /// wait was the whole of the old 180s cost.
-    fn wait_for_progress_end(&mut self, timeout: Duration) -> anyhow::Result<bool> {
+    fn wait_for_progress_end(&mut self, timeout: Duration) -> WaitOutcome {
         let deadline = Instant::now() + timeout;
         let mut active: i32 = 0;
         let mut any_begin = false;
@@ -458,11 +503,19 @@ impl LspSession {
         loop {
             let msg = match parked.pop_front() {
                 Some(msg) => msg,
-                None => match self.recv_one(deadline)? {
-                    Some(msg) => msg,
-                    None => {
+                None => match self.recv_one(deadline) {
+                    Ok(Some(msg)) => msg,
+                    Ok(None) => {
                         tracing::debug!("progress wait timed out (active={active}), proceeding");
-                        return Ok(false);
+                        return WaitOutcome::TimedOut;
+                    }
+                    Err(e) => {
+                        // KLS closed its stdout or stopped being readable: it has
+                        // died (an out-of-memory kill during Gradle dependency
+                        // resolution is the usual way). Stop waiting and let the
+                        // caller keep what it has.
+                        tracing::warn!("KLS read failed during progress wait: {e:#}");
+                        return WaitOutcome::Stopped;
                     }
                 },
             };
@@ -492,15 +545,15 @@ impl LspSession {
                 active = (active - 1).max(0);
                 tracing::debug!("KLS progress end (active={active})");
                 if any_begin && active == 0 {
-                    return Ok(true);
+                    return WaitOutcome::Ready;
                 }
             } else if let Err(e) = self.park(msg) {
                 // Writing to KLS failed, so it has exited or closed stdin. The
-                // session is over either way; take the timeout path rather than
+                // session is over either way; report it as such rather than
                 // propagating, so the caller keeps and emits every symbol it has
                 // already collected instead of returning an empty response.
                 tracing::warn!("KLS write failed during progress wait: {e:#}");
-                return Ok(false);
+                return WaitOutcome::Stopped;
             }
         }
     }
@@ -803,10 +856,13 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
 
     let mut session = LspSession::new(child)?;
     let started = Instant::now();
-    let deadline = started + Duration::from_secs(TIMEOUT_SECS);
-    // Tracked separately from `deadline`: this process's own budget is longer
-    // than the window the host allows the whole invoke.
-    let host_deadline = started + Duration::from_secs(HOST_INVOKE_TIMEOUT_SECS);
+    // The host kills the whole invoke at HOST_INVOKE_TIMEOUT_SECS and keeps
+    // nothing, so every request this session makes has to finish inside that
+    // window, less the margin needed to write the answer back. TIMEOUT_SECS is
+    // this process's own ceiling and stays the cap when it is the shorter one.
+    let host_deadline = started
+        + Duration::from_secs(HOST_INVOKE_TIMEOUT_SECS.saturating_sub(HOST_REPLY_MARGIN_SECS));
+    let deadline = (started + Duration::from_secs(TIMEOUT_SECS)).min(host_deadline);
     let root_uri = path_to_uri(root);
 
     // 1. Initialize
@@ -900,27 +956,33 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let wait = Duration::from_secs(progress_wait_secs)
         .min(host_deadline.saturating_duration_since(Instant::now()) / 2);
     tracing::info!("waiting for KLS to index {} …", root.display());
-    if session.wait_for_progress_end(wait)? {
-        tracing::info!("KLS ready");
-    } else {
-        // #299 F12: timed out while KLS was still indexing. The references below
-        // run against an incomplete index, so the reference counts may under-report.
-        // The host echoes a sidecar's stderr only when the run returns zero nodes,
-        // and this run returns nodes, so a log line alone would never be seen:
-        // carry it as a diagnostic as well.
-        let secs = wait.as_secs();
-        tracing::warn!(
-            "KLS did not finish indexing within {secs}s; \
-             reference results may be incomplete for a cold/large Gradle project"
-        );
-        diagnostics.push(PluginDiagnostic::warning(
-            "kotlin.index-incomplete",
-            format!(
-                "kotlin-language-server had not finished indexing after {secs}s, so Kotlin \
-                 reference and caller results are likely incomplete; raise \
-                 TRAVSR_KLS_PROGRESS_WAIT_SECS and reindex."
-            ),
-        ));
+    match session.wait_for_progress_end(wait) {
+        WaitOutcome::Ready => tracing::info!("KLS ready"),
+        WaitOutcome::TimedOut => {
+            // No diagnostic here. This arm only means the progress signal was not
+            // observed in time, which is not the same as an incomplete index (see
+            // `wait_for_progress_end`), and the remedy the warning used to give
+            // could not work: `wait` is already clamped to half of what is left of
+            // the host window, at most about 142s of the 285s budget, so
+            // TRAVSR_KLS_PROGRESS_WAIT_SECS (default 180) never raises it and can
+            // only lower it. A large Kotlin repo can legitimately need longer than
+            // this wait allows, so captioning its results as unreliable was
+            // guesswork aimed at the users most likely to see it.
+            tracing::debug!(
+                "no KLS indexing progress signal within {}s; proceeding",
+                wait.as_secs()
+            );
+        }
+        WaitOutcome::Stopped => {
+            // The server died while indexing. Everything collected up to here is
+            // still good, so it is emitted with a caveat rather than dropped.
+            tracing::warn!("KLS stopped while indexing; keeping the symbols collected so far");
+            diagnostics.push(PluginDiagnostic::warning(
+                "kotlin.server-stopped",
+                "the Kotlin language server stopped before it finished indexing, so Kotlin \
+                 results are incomplete; check that it has enough memory and reindex.",
+            ));
+        }
     }
 
     // 6. Build nodes + ref/call edges
@@ -1245,30 +1307,73 @@ mod tests {
         session.inbox.push_back(progress("t", "end"));
 
         let started = Instant::now();
-        let ready = session
-            .wait_for_progress_end(Duration::from_secs(60))
-            .expect("wait must not error");
+        let outcome = session.wait_for_progress_end(Duration::from_secs(60));
         let waited = started.elapsed();
         session.shutdown(Instant::now() + Duration::from_secs(5));
 
-        assert!(ready, "a parked begin/end pair means KLS finished indexing");
+        assert!(
+            matches!(outcome, WaitOutcome::Ready),
+            "a parked begin/end pair means KLS finished indexing"
+        );
         assert!(
             waited < Duration::from_secs(5),
             "the pair was already in hand, so the wait must return at once, took {waited:?}"
         );
-        // Non-progress traffic stays queued for whoever reads next. Assert on
-        // that message rather than on a count: `cat` echoes back whatever is
-        // written to it, so the response `park` now sends for the
+        // Non-progress traffic is dropped rather than re-queued: nothing reads a
+        // notification back out of the inbox, and re-parking every one of them
+        // grew a queue that `request` scans in full for each message it
+        // receives. Assert on that message rather than on a count: `cat` echoes
+        // back whatever is written to it, so the response `park` sends for the
         // `window/workDoneProgress/create` request returns down the same pipe
-        // and `shutdown` parks it too. That echo is an artifact of the stand-in
+        // and is parked as a response. That echo is an artifact of the stand-in
         // server, not behaviour worth pinning.
         assert!(
-            session
+            !session
                 .inbox
                 .iter()
                 .any(|m| m["method"] == "window/logMessage"),
-            "the parked notification must survive the wait: {:?}",
+            "an unread notification must not be re-queued: {:?}",
             session.inbox
+        );
+    }
+
+    // The inbox is drained once, at the top of `wait_for_progress_end`, and
+    // `request` scans all of it for every message it receives. Parking traffic
+    // nobody reads therefore costs both memory and time that grow with the repo:
+    // KLS emits a `publishDiagnostics` per opened document. Only what is read
+    // back out is kept.
+    #[cfg(unix)]
+    #[test]
+    fn park_keeps_only_what_is_read_back_out() {
+        let mut session = silent_session();
+        session
+            .park(json!({ "method": "window/logMessage", "params": { "message": "hi" } }))
+            .expect("park a notification");
+        session
+            .park(json!({ "method": "textDocument/publishDiagnostics", "params": {} }))
+            .expect("park a diagnostic");
+        session
+            .park(progress("t", "begin"))
+            .expect("park a progress notification");
+        session
+            .park(json!({ "id": 7, "result": null }))
+            .expect("park a response");
+        let parked: Vec<String> = session
+            .inbox
+            .iter()
+            .map(|m| {
+                m.get("method")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<response>")
+                    .to_string()
+            })
+            .collect();
+        session.shutdown(Instant::now() + Duration::from_secs(5));
+
+        assert_eq!(
+            parked,
+            vec!["$/progress", "<response>"],
+            "only the progress replay and another request's answer are read back out"
         );
     }
 
@@ -1285,14 +1390,38 @@ mod tests {
         session.inbox.push_back(progress("configuring", "begin"));
         session.inbox.push_back(progress("configuring", "end"));
 
-        let ready = session
-            .wait_for_progress_end(Duration::from_millis(200))
-            .expect("wait must not error");
+        let outcome = session.wait_for_progress_end(Duration::from_millis(200));
         session.shutdown(Instant::now() + Duration::from_secs(5));
 
         assert!(
-            !ready,
+            matches!(outcome, WaitOutcome::TimedOut),
             "only the reporter KLS created a token for ends the wait"
+        );
+    }
+
+    // A server that dies mid-wait (an out-of-memory kill during Gradle
+    // dependency resolution is the usual way) used to propagate a read error all
+    // the way out of the invoke, and the host turns any error from an invoke
+    // into an empty response: every symbol already collected was thrown away
+    // with no diagnostic. The wait now reports the stop and the caller keeps
+    // what it has. `true` stands in for the dead server: it exits at once, so
+    // its stdout is already closed when the wait starts reading.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_progress_end_reports_a_server_that_went_away() {
+        let child = Command::new("true")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn the stand-in server");
+        let mut session = LspSession::new(child).expect("build session");
+
+        let outcome = session.wait_for_progress_end(Duration::from_secs(60));
+
+        assert!(
+            matches!(outcome, WaitOutcome::Stopped),
+            "a server that closed its stdout must be reported as stopped, not as a timeout"
         );
     }
 }

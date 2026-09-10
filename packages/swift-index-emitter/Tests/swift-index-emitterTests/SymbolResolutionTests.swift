@@ -28,7 +28,8 @@ final class SymbolResolutionTests: XCTestCase {
                 typeMembers: collector.typeMembers,
                 typeParents: collector.typeParents,
                 typeGenericConstraints: collector.typeGenericConstraints,
-                typePropertyTypes: collector.typePropertyTypes
+                typePropertyTypes: collector.typePropertyTypes,
+                typePaths: collector.typePaths
             )
             visitor.walk(tree)
             symbols.append(contentsOf: visitor.references.map { $0.symbol })
@@ -65,9 +66,11 @@ final class SymbolResolutionTests: XCTestCase {
         )
     }
 
-    /// A nested type is keyed on its own simple name, so two enclosing types can
-    /// declare the same nested name and share one symbol. Pinned because it is
-    /// the ambiguity a qualified-symbol change would have to address.
+    /// Symbols are emitted on a type's simple name, so two enclosing types that
+    /// declare the same nested name share one symbol. The member tables are
+    /// keyed on the nesting path and are no longer shared, but a receiver
+    /// written as the bare name could mean either type, so the symbol falls back
+    /// to the name as written and both members still land on it.
     func testNestedTypeNameIsSharedAcrossEnclosingTypes() {
         let symbols = referenceSymbols([
             "A.swift": """
@@ -81,11 +84,86 @@ final class SymbolResolutionTests: XCTestCase {
         ])
         XCTAssertTrue(
             symbols.contains("swift::Inner.ping"),
-            "nested type keyed on its simple name; got \(symbols)"
+            "symbols are emitted on the simple name; got \(symbols)"
         )
         XCTAssertTrue(
             symbols.contains("swift::Inner.pong"),
-            "both enclosing types contribute members to the same symbol; got \(symbols)"
+            "an ambiguous receiver keeps the name as written; got \(symbols)"
+        )
+    }
+
+    /// Two enclosing types declaring the same nested name must not share one
+    /// property table: `self.svc` in `Outer2.Inner` used to read the `svc` that
+    /// only `Outer1.Inner` declares and emit a call on a type `Outer2.Inner`
+    /// never names. The type that does declare it still resolves.
+    func testNestedTypesDoNotShareAPropertyTable() {
+        let symbols = referenceSymbols([
+            "A.swift": """
+            struct Outer1 { struct Inner {
+                var svc: Svc
+                func use() { self.svc.ping() }
+            } }
+            struct Outer2 { struct Inner {
+                func use() { self.svc.ping() }
+            } }
+            struct Svc { func ping() {} }
+            """
+        ])
+        XCTAssertEqual(
+            symbols.filter { $0 == "swift::Svc.ping" }.count, 1,
+            "only the Inner that declares svc may resolve the call; got \(symbols)"
+        )
+    }
+
+    /// The property is declared on a BASE class, whose generic parameter is what
+    /// `command` names. The guard used to ask the generic parameters of the type
+    /// being visited, which is `Sub`, so the call resolved to whatever real type
+    /// happens to be called `Command`.
+    func testInheritedGenericParameterPropertyTypeDoesNotResolveToARealType() {
+        let symbols = referenceSymbols([
+            "A.swift": """
+            protocol Command { func run() }
+            class Base<Command> {
+                var command: Command
+                init(command: Command) { self.command = command }
+            }
+            class Sub: Base<Int> { func go() { self.command.run() } }
+            struct RealThing: Command { func run() {} }
+            """
+        ])
+        XCTAssertFalse(
+            symbols.contains("swift::Command.run"),
+            "a base class's generic parameter must not resolve to the real Command; got \(symbols)"
+        )
+    }
+
+    /// A local whose written type is a generic parameter names no real type, so
+    /// the call resolves through the parameter's constraint or not at all. The
+    /// metatype form is the one that regressed: unwrapping `T.Type` to `T` bound
+    /// the local, and the branch had no generic guard, so it emitted `swift::T`.
+    func testGenericParameterLocalReceiverDoesNotNameTheParameter() {
+        let symbols = referenceSymbols([
+            "A.swift": """
+            protocol Command { func run() }
+            struct T { func run() {} }
+            func viaMetatype<T: Command>(_ t: T.Type) { t.run() }
+            func viaLocal<T: Command>(_ t: T) { t.run() }
+            func viaUnconstrained<U>(_ u: U) { u.run() }
+            func viaWhere<W>(_ w: W.Type) where W: Command { w.run() }
+            """
+        ])
+        XCTAssertFalse(
+            symbols.contains("swift::T.run"),
+            "a generic parameter receiver must not name the real T; got \(symbols)"
+        )
+        XCTAssertFalse(
+            symbols.contains("swift::U.run"),
+            "an unconstrained parameter names no type at all; got \(symbols)"
+        )
+        XCTAssertEqual(
+            symbols.filter { $0 == "swift::Command.run" }.count, 3,
+            "every constrained receiver resolves through the constraint, and a where clause "
+                + "constrains exactly as an inline one does; got \(symbols)"
         )
     }
 

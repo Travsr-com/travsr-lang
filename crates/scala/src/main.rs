@@ -127,14 +127,21 @@ fn find_sbt_root(root: &Path, max_depth: usize) -> Option<PathBuf> {
         }
         if depth < max_depth {
             if let Ok(entries) = std::fs::read_dir(&dir) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
+                // Sorted before enqueuing: `read_dir` order decides which of two
+                // sibling directories that both hold a `build.sbt` is picked as
+                // the root, and the whole index is built from that one choice.
+                let mut children: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .filter(|p| {
                         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !matches!(name, "target" | ".git" | "node_modules" | ".travsr") {
-                            queue.push_back((p, depth + 1));
-                        }
-                    }
+                        !matches!(name, "target" | ".git" | "node_modules" | ".travsr")
+                    })
+                    .collect();
+                children.sort();
+                for p in children {
+                    queue.push_back((p, depth + 1));
                 }
             }
         }
@@ -183,6 +190,15 @@ fn find_semanticdb_files(sbt_root: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // `read_dir` hands entries back in filesystem order, so without this the
+    // documents are parsed in a different order on every run. That order is
+    // load-bearing: a cross-built sbt project compiles the SAME sources into
+    // `jvm/target`, `native/target` and `js/target`, and `build_edges` keeps the
+    // FIRST definition it sees for a symbol, so whichever variant came back
+    // first owns the def node and the `dst` of every cross-file edge flips
+    // between runs. Sorting here fixes both the parse order and the node
+    // emission order that follows it.
+    found.sort();
     found
 }
 
@@ -966,11 +982,10 @@ mod tests {
         // Not build output: a `.semanticdb` sitting in a source tree.
         touch(root, "jvm/src/main/scala/D.scala.semanticdb");
 
-        let mut found = find_semanticdb_files(root);
-        found.sort();
-        let mut want = vec![jvm, native];
-        want.sort();
-        assert_eq!(found, want);
+        // Asserted in order, not sorted first: the caller keeps the first
+        // definition it sees for a symbol, so a cross-built project needs this
+        // list to come back the same way every run. `jvm` sorts before `native`.
+        assert_eq!(find_semanticdb_files(root), vec![jvm, native]);
     }
 
     #[test]

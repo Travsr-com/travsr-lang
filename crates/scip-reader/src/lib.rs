@@ -948,23 +948,49 @@ fn is_dark_test_scope(files: Option<&[String]>, resp: &InvokeResponse) -> bool {
 ///
 /// Directory-segment match first (`src/test/...`, `tests/`, `spec/`,
 /// `__tests__/`), then the common filename conventions (`FooTest.java`,
-/// `foo_test.go`, `test_foo.py`, `Foo.spec.ts`). Heuristic by construction: it
-/// only ever decides whether to emit a diagnostic, never what enters the graph.
+/// `foo_test.go`, `test_foo.py`, `Foo.spec.ts`). A suffix counts only at a word
+/// boundary, so `latest.rb` and `contest.go` are ordinary sources. Heuristic by
+/// construction: it only ever decides whether to emit a diagnostic, never what
+/// enters the graph.
 fn is_test_path(path: &str) -> bool {
     // `InvokeRequest::files` leaves the separator unspecified, so a Windows
     // daemon can hand over `src\test\java\Helper.java`. Without this the
     // directory rule never fires on it, while the SCIP-side paths it is compared
     // against are always `/`, which is a false negative in both gates at once.
-    let lower = path.to_ascii_lowercase().replace('\\', "/");
+    let normalized = path.replace('\\', "/");
+    let lower = normalized.to_ascii_lowercase();
     let mut segments = lower.split('/');
     let file = segments.next_back().unwrap_or("");
     if segments.any(|seg| matches!(seg, "test" | "tests" | "spec" | "specs" | "__tests__")) {
         return true;
     }
     let stem = file.split('.').next().unwrap_or("");
-    stem.ends_with("test")
-        || stem.ends_with("tests")
-        || stem.ends_with("spec")
+    // The boundary is spelled two ways, and only one of them survives the
+    // lowercasing. `foo_test.go` keeps its separator; `FooTest.java` carries the
+    // boundary in its capital, so that one is read off the original spelling.
+    // Matching a bare `test` suffix on the lowercased stem instead called
+    // `latest.rb` and `contest.go` test sources, which both inflates the reported
+    // count and can raise a test-blind warning on a repo that has no tests here
+    // at all.
+    let raw_stem = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .split('.')
+        .next()
+        .unwrap_or("");
+    const WORDS: [&str; 4] = ["test", "tests", "spec", "specs"];
+    let separated = WORDS.iter().any(|word| {
+        stem == *word
+            || stem
+                .strip_suffix(word)
+                .is_some_and(|head| head.ends_with('_') || head.ends_with('-'))
+    });
+    let capitalised = ["Test", "Tests", "Spec", "Specs"]
+        .iter()
+        .any(|word| raw_stem.ends_with(word));
+    separated
+        || capitalised
         || stem.starts_with("test_")
         || file.contains(".test.")
         || file.contains(".spec.")
@@ -1875,6 +1901,9 @@ mod dark_scope_tests {
             "src/main/java/org/json/JSONObject.java",
             "AFNetworking/AFURLSessionManager.m",
             "crates/store/src/lib.rs",
+            // A suffix without a word boundary is not a test.
+            "lib/latest.rb",
+            "pkg/contest.go",
         ] {
             assert!(!is_test_path(p), "{p} should not read as a test path");
         }

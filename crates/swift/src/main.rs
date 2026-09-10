@@ -175,33 +175,44 @@ impl Plugin for SwiftPhaseB {
 ///      handshake, so it is definitely older than this sidecar.
 ///   2. It reports a version other than this sidecar's own package version.
 ///
-/// Runs once per resolved emitter path, so a repeat invoke does not re-spawn it.
+/// Runs once per resolved emitter path and build time, so a repeat invoke does
+/// not re-spawn it, and a rebuild is probed again.
 fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
     // Caches the *verdict*, not just the fact of having run: the probe stays
     // once per emitter, but a repeat invoke still gets the diagnostic to attach
     // to its own response.
     //
-    // Keyed on the emitter path, not process-global: `emitter_path()` resolves
-    // per invoke and can legitimately change mid-process ($TRAVSR_SWIFT_EMITTER,
-    // or a dev build appearing while the daemon keeps this sidecar warm). An
-    // unkeyed cache then returned the first emitter's verdict, naming a binary
-    // that is no longer the one being run.
+    // Keyed on the emitter path AND its build time, not process-global:
+    // `emitter_path()` resolves per invoke and can legitimately change
+    // mid-process ($TRAVSR_SWIFT_EMITTER, or a dev build appearing while the daemon
+    // keeps this sidecar warm). An unkeyed cache then returned the first
+    // emitter's verdict, naming a binary that is no longer the one being run.
+    //
+    // The build time is in the key because rebuilding in place, over the same
+    // path, is the usual way an emitter changes. Keyed on the path alone, a
+    // developer who rebuilt and reinstalled kept being told about a skew that
+    // was already fixed, and a newly stale emitter kept being reported clean,
+    // for as long as the daemon held this sidecar warm.
     #[allow(clippy::type_complexity)]
     static CHECKED: std::sync::OnceLock<
-        std::sync::Mutex<std::collections::HashMap<PathBuf, Option<PluginDiagnostic>>>,
+        std::sync::Mutex<
+            std::collections::HashMap<(PathBuf, Option<u64>), Option<PluginDiagnostic>>,
+        >,
     > = std::sync::OnceLock::new();
-    let cache = CHECKED.get_or_init(Default::default);
-    if let Ok(map) = cache.lock() {
-        if let Some(cached) = map.get(emitter) {
-            return cached.clone();
-        }
-    }
 
     let mtime = std::fs::metadata(emitter)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
+    let key = (emitter.to_path_buf(), mtime);
+
+    let cache = CHECKED.get_or_init(Default::default);
+    if let Ok(map) = cache.lock() {
+        if let Some(cached) = map.get(&key) {
+            return cached.clone();
+        }
+    }
 
     let reported = probe_version(emitter);
 
@@ -258,7 +269,7 @@ fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
         Some(_) => {}
     }
     if let Ok(mut map) = cache.lock() {
-        map.insert(emitter.to_path_buf(), diagnostic.clone());
+        map.insert(key, diagnostic.clone());
     }
     diagnostic
 }
@@ -268,8 +279,15 @@ fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
 /// Compared exactly. A `ends_with` test made `10.4.2` compare equal to `0.4.2`,
 /// so the first release past a single-digit major would have silently stopped
 /// reporting skew.
+///
+/// Only the first line is read. The emitter prints the version line and nothing
+/// else, but taking the last token of the whole output made any extra line a
+/// bogus version and a skew warning that was not real. (CI's handshake pipes
+/// through `tail -n 1` instead, because there it is build output that precedes
+/// the line; here the emitter's stderr is already discarded.)
 fn version_field(line: &str) -> &str {
-    line.split_whitespace().last().unwrap_or(line)
+    let first = line.lines().next().unwrap_or(line).trim();
+    first.split_whitespace().last().unwrap_or(first)
 }
 
 /// Run `<emitter> --version` under its own short deadline and return the
@@ -619,6 +637,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last token of the LAST line used to be taken, so an emitter that
+    /// printed anything after its version line reported a bogus version and a
+    /// skew that was not real.
+    #[test]
+    fn version_field_reads_only_the_first_line() {
+        assert_eq!(version_field("swift-index-emitter 0.4.2"), "0.4.2");
+        assert_eq!(
+            version_field("swift-index-emitter 0.4.2\nwarning: something else"),
+            "0.4.2"
+        );
+    }
 
     fn parse(json: &str) -> InvokeResponse {
         let dir = tempfile::tempdir().expect("tempdir");

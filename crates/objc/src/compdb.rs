@@ -117,16 +117,8 @@ fn glob_fallback(root: &Path, files: Option<&[String]>) -> Vec<CompilationEntry>
     // The root is always a search path (matches the previous behavior).
     header_dirs.insert(root.to_path_buf());
     walk_tree(root, &mut sources, &mut header_dirs);
-    // `read_dir` returns entries in whatever order the filesystem hands back, so
-    // without this the TU processing order varies between machines and between
-    // runs. `visit_top_level` has no primary-file filter, so a project header's
-    // `@interface` is re-handled once per including TU and its symbols
-    // accumulate in TU order: the emitted SCIP bytes are only reproducible once
-    // this order is. The `compile_commands.json` path already preserves the
-    // file's own order and needs no sort.
-    sources.sort();
 
-    let source_files: Vec<PathBuf> = if let Some(list) = files {
+    let mut source_files: Vec<PathBuf> = if let Some(list) = files {
         list.iter()
             .map(|f| root.join(f))
             .filter(|p| {
@@ -139,6 +131,15 @@ fn glob_fallback(root: &Path, files: Option<&[String]>) -> Vec<CompilationEntry>
     } else {
         sources
     };
+    // Sorted after the branch, so both ways of choosing the sources are covered.
+    // The daemon sends an explicit file list, so that branch is the one that
+    // runs in practice and it inherits the caller's order, which is not stable.
+    // Order matters here: `visit_top_level` has no primary-file filter, so a
+    // project header's `@interface` is re-handled once per including TU and its
+    // symbols accumulate in TU order. The emitted SCIP bytes are only
+    // reproducible once this order is. The `compile_commands.json` path already
+    // preserves the file's own order and needs no sort.
+    source_files.sort();
 
     // Search paths + sysroot + framework paths are identical for every TU, so
     // build them once and share.

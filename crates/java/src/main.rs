@@ -169,11 +169,39 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     // invocation this call was written to stop making. When a repo's test scope
     // does not compile, the `test-scope-dark` diagnostic from the SCIP ingest
     // says so.
+    //
+    // `clean` and `--batch-mode` have to be passed here because a build command
+    // given to scip-java REPLACES its default one, it does not extend it:
+    // `IndexCommand.finalBuildCommand` returns the default
+    // (`--batch-mode clean verify -DskipTests`) only when the build command is
+    // empty. So anything the default supplied and this still needs must be
+    // repeated.
+    //
+    // `clean` is the load-bearing one. scip-java always passes
+    // `-Dmaven.compiler.useIncrementalCompilation=false`, which selects
+    // maven-compiler-plugin's stale-source check, so only sources newer than
+    // their class files recompile. This sidecar runs on the developer's live
+    // working tree, where an already-built `target/classes` is the normal case,
+    // not the edge case. Without `clean` maven then logs "Nothing to compile",
+    // javac never runs, SemanticDB writes no `.semanticdb`, scip-java still
+    // exits 0, and Phase B reports success with zero nodes.
+    //
+    // `--batch-mode` because the sandbox gives maven no terminal: interactive
+    // mode colours the output with escape codes and can stop on a prompt that
+    // nothing will ever answer.
+    //
+    // The leading `--` is required. Without it scip-java's own parser claims
+    // `--batch-mode` and exits with "no such option"; `--` ends its options so
+    // the rest is passed through to maven.
+    //
+    // `verify` and `-DskipTests` are deliberately not restored: dropping
+    // `verify` is the whole point of naming a phase here, and `test-compile`
+    // runs no tests, so skipping them is moot.
     let maven = matches!(detect_build_system(root), Some(BuildSystem::Maven));
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("index").arg("--output").arg(&output_path);
     if maven {
-        cmd.arg("test-compile");
+        cmd.args(["--", "--batch-mode", "clean", "test-compile"]);
     }
     cmd.current_dir(root);
     run_to_completion(cmd, "scip-java")?;

@@ -1065,10 +1065,18 @@ fn apply_error_tu_recovery(builder: &mut IndexBuilder) -> usize {
         if !seen.insert((c.rel_path.clone(), target.clone(), line)) {
             continue;
         }
+        // `selector` is the whole `setFoo:bar:`, while `col` is the start of its
+        // first keyword only, and the source at that column reads `setFoo:`
+        // followed by the argument. Ending the range at the full selector length
+        // therefore ran the span into the argument expression, so a consumer
+        // slicing the line by this range read back text that is not the symbol.
+        // Cover the first keyword, which is the identifier that actually sits at
+        // `col`. A unary selector has no colon, so its length is unchanged.
+        let name_len = c.selector.split(':').next().unwrap_or(&c.selector).len() as i32;
         let occ = Occurrence {
             symbol: target,
             symbol_roles: 0, // reference
-            range: vec![line, start_col, start_col + c.selector.len() as i32],
+            range: vec![line, start_col, start_col + name_len],
             ..Default::default()
         };
         builder.add_occurrence(&c.rel_path, occ);
@@ -1681,5 +1689,86 @@ mod document_order_tests {
         let mut sorted = first.clone();
         sorted.sort();
         assert_eq!(first, sorted, "documents must be emitted in path order");
+    }
+}
+
+#[cfg(test)]
+mod recovery_range_tests {
+    use super::*;
+
+    /// A recovered send's occurrence must span the identifier that sits at its
+    /// recorded column, not the whole selector.
+    ///
+    /// `SendCandidate::col` is the start of the first keyword, and the source
+    /// there reads `policyWithPinningMode:` followed by the argument, so ending
+    /// the range at `selector.len()` (which counts every later keyword and every
+    /// colon) ran the span across the argument list into unrelated text.
+    #[test]
+    fn recovered_send_spans_only_the_first_selector_keyword() {
+        let selector = "policyWithPinningMode:validatesCertificateChain:";
+        let mut builder = IndexBuilder::new(Path::new("/tmp"), "test/objc");
+        let target = symbol::method_symbol("test/objc", "AFSecurityPolicy", selector);
+        builder.add_symbol_info(
+            "src/AFSecurityPolicy.m",
+            SymbolInformation {
+                symbol: target.clone(),
+                ..Default::default()
+            },
+        );
+        builder.recovery.push(SendCandidate {
+            rel_path: "src/Caller.m".to_string(),
+            line: 12,
+            col: 5,
+            receiver: "AFSecurityPolicy".to_string(),
+            selector: selector.to_string(),
+        });
+
+        assert_eq!(apply_error_tu_recovery(&mut builder), 1);
+
+        let index = builder.finish();
+        let doc = index
+            .documents
+            .iter()
+            .find(|d| d.relative_path == "src/Caller.m")
+            .expect("the recovered send lands in the calling file");
+        let occ = doc.occurrences.first().expect("one recovered occurrence");
+        // 0-indexed line/col, and the span covers `policyWithPinningMode` only.
+        assert_eq!(
+            occ.range,
+            vec![11, 4, 4 + "policyWithPinningMode".len() as i32]
+        );
+    }
+
+    /// A unary selector has no colon, so its span is the whole selector and this
+    /// change leaves it exactly as it was.
+    #[test]
+    fn recovered_unary_send_spans_the_whole_selector() {
+        let mut builder = IndexBuilder::new(Path::new("/tmp"), "test/objc");
+        let target = symbol::method_symbol("test/objc", "AFSecurityPolicy", "defaultPolicy");
+        builder.add_symbol_info(
+            "src/AFSecurityPolicy.m",
+            SymbolInformation {
+                symbol: target,
+                ..Default::default()
+            },
+        );
+        builder.recovery.push(SendCandidate {
+            rel_path: "src/Caller.m".to_string(),
+            line: 3,
+            col: 9,
+            receiver: "AFSecurityPolicy".to_string(),
+            selector: "defaultPolicy".to_string(),
+        });
+
+        assert_eq!(apply_error_tu_recovery(&mut builder), 1);
+
+        let index = builder.finish();
+        let doc = index
+            .documents
+            .iter()
+            .find(|d| d.relative_path == "src/Caller.m")
+            .expect("the recovered send lands in the calling file");
+        let occ = doc.occurrences.first().expect("one recovered occurrence");
+        assert_eq!(occ.range, vec![2, 8, 8 + "defaultPolicy".len() as i32]);
     }
 }
