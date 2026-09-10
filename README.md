@@ -461,8 +461,16 @@ Each spawner asks its emitter for `--version` on the first invoke and logs the
 resolved path and version at info, warning when the emitter reports a different
 version than the sidecar or does not understand the flag at all (an emitter that
 predates the handshake). The version string lives in the emitter source
-(`emitterVersion` in `Sources/main.swift` and `bin/emit.dart`) and must be
-bumped alongside the Cargo workspace version at release.
+(`emitterVersion` in `Sources/main.swift` and `bin/emit.dart`, plus `version:`
+in `packages/dart-scip-emitter/pubspec.yaml`) and must be bumped alongside the
+Cargo workspace version at release. CI fails the build when any of the three
+disagrees with `Cargo.toml`, so a forgotten bump is caught before it makes every
+freshly built emitter report a skew that is not real.
+
+The Swift emitter's symbol resolution has unit tests: `cd
+packages/swift-index-emitter && swift test`. They pin the resolution rules
+rather than the reference count, which does not move when a resolution change
+retargets a symbol.
 
 ---
 

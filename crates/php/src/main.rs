@@ -81,9 +81,42 @@ fn scip_php_available() -> bool {
     find_scip_php().is_some()
 }
 
+/// Deletes scip-php's in-repo artifact on every exit path.
+///
+/// scip-php hardcodes its output to `./index.scip`, so the artifact lands in
+/// the checkout and the next invoke refuses to run while it is there. Cleanup
+/// used to sit only on the success path, so one timeout or one non-zero exit
+/// left the file behind and wedged PHP Phase B for good: the guard below
+/// tripped, `invoke_phase_b` swallowed the error, and every later run reported
+/// a silent zero-node success. `remove_file` unlinks a symlink rather than
+/// following it, which is what the guard wants here too.
+struct RepoArtifact(std::path::PathBuf);
+
+impl Drop for RepoArtifact {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Last `max_bytes` bytes of `s`, on a char boundary, prefixed with an elision
+/// marker when truncated. scip-php is chatty (PHP deprecation notices from its
+/// parser), and its stderr rides out on an error string.
+fn tail(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let mut start = s.len() - max_bytes;
+    while start < s.len() && !s.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("...(truncated)...\n{}", &s[start..])
+}
+
 /// `scratch` is the sandbox-authorized writable directory from the invoke
-/// request. Used instead of a self-minted `tempfile::tempdir()` so the path is
-/// one the sandbox actually granted, matching every other sidecar.
+/// request, used so the artifact lands somewhere the sandbox actually granted.
+/// It is `#[serde(default)]` on the wire, so an empty value falls back to a
+/// tempdir rather than joining onto a relative path that would resolve against
+/// the process CWD, exactly as the ruby and c sidecars do.
 fn run_scip_php(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<InvokeResponse> {
     let bin = find_scip_php().ok_or_else(|| {
         anyhow::anyhow!(
@@ -105,13 +138,28 @@ fn run_scip_php(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<Inv
     let produced = root.join("index.scip");
     // Never clobber a file the repo already carries: a pre-existing index.scip
     // is someone's committed artifact, and this function would delete it below.
+    // `symlink_metadata`, not `exists()`: the latter follows symlinks and is
+    // false for a dangling one, so a repo committing index.scip as a dangling
+    // symlink passed the guard and the rename below moved the LINK, leaving its
+    // out-of-repo target to be ingested.
     anyhow::ensure!(
-        !produced.exists(),
+        std::fs::symlink_metadata(&produced).is_err(),
         "refusing to run scip-php: {} already exists and would be overwritten",
         produced.display()
     );
-    let output_path = scratch.join("index.scip");
+
+    let _fallback_scratch;
+    let output_dir = if !scratch.as_os_str().is_empty() {
+        scratch
+    } else {
+        _fallback_scratch = tempfile::tempdir().context("failed to create temp dir")?;
+        _fallback_scratch.path()
+    };
+    let output_path = output_dir.join("index.scip");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
+
+    // Armed before the spawn, so the artifact is removed however this returns.
+    let _artifact = RepoArtifact(produced.clone());
 
     let mut child = std::process::Command::new(bin)
         .current_dir(root)
@@ -126,7 +174,7 @@ fn run_scip_php(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<Inv
 
     // Drain stderr on a reader thread so the child never blocks on a full pipe
     // while we poll for exit.
-    let stderr_reader = child.stderr.take().map(|mut err| {
+    let mut stderr_reader = child.stderr.take().map(|mut err| {
         std::thread::spawn(move || {
             use std::io::Read;
             let mut buf = String::new();
@@ -140,6 +188,11 @@ fn run_scip_php(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<Inv
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
+                // Reap it: a killed child left unwaited stays a zombie for the
+                // lifetime of this sidecar process.
+                let _ = child.wait();
+                // The reader thread ends at EOF, which the kill has now caused.
+                let _ = stderr_reader.take().and_then(|h| h.join().ok());
                 anyhow::bail!("scip-php timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
@@ -147,19 +200,22 @@ fn run_scip_php(root: &Path, corpus: &str, scratch: &Path) -> anyhow::Result<Inv
     };
 
     let stderr_out = stderr_reader
+        .take()
         .and_then(|h| h.join().ok())
         .unwrap_or_default();
 
     anyhow::ensure!(
         status.success(),
-        "scip-php exited with {status}: {stderr_out}"
+        "scip-php exited with {status}: {}",
+        tail(&stderr_out, 4000)
     );
 
     // Move the artifact out of the repo so the checkout is left as it was found.
+    // `RepoArtifact` removes whatever is still there afterwards, including the
+    // source of a `copy` fallback.
     std::fs::rename(&produced, &output_path)
         .or_else(|_| std::fs::copy(&produced, &output_path).map(|_| ()))
         .with_context(|| format!("scip-php wrote no index at {}", produced.display()))?;
-    let _ = std::fs::remove_file(&produced);
 
     let output_size = std::fs::metadata(&output_path)
         .map(|m| m.len())

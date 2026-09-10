@@ -160,34 +160,23 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     // fixture: the default fails outright, `test-compile` succeeds and the index
     // gains 59 test files.
     //
-    // Falls back to the default on failure rather than giving up, because a repo
-    // whose tests genuinely do not compile should still get its main scope
-    // indexed. Same shape as the scala sidecar's `Test/compile` fallback.
+    // There is deliberately no fallback to the default lifecycle when
+    // `test-compile` fails. The default is a superset of `test-compile`, so it
+    // cannot succeed where `test-compile` failed on the test sources, which is
+    // the only case a fallback would be for. What it would do is run the rest of
+    // the project's own lifecycle inside the sandbox: its tests, and any verify,
+    // signing or deploy plugin, all repo-controlled. That is the exact
+    // invocation this call was written to stop making. When a repo's test scope
+    // does not compile, the `test-scope-dark` diagnostic from the SCIP ingest
+    // says so.
     let maven = matches!(detect_build_system(root), Some(BuildSystem::Maven));
-    let mut ran = false;
+    let mut cmd = std::process::Command::new(bin);
+    cmd.arg("index").arg("--output").arg(&output_path);
     if maven {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.arg("index")
-            .arg("--output")
-            .arg(&output_path)
-            .arg("test-compile")
-            .current_dir(root);
-        match run_to_completion(cmd, "scip-java") {
-            Ok(()) => ran = true,
-            Err(e) => tracing::warn!(
-                "scip-java `test-compile` failed, retrying with the project's \
-                 default build command (test call sites will be missing): {e:#}"
-            ),
-        }
+        cmd.arg("test-compile");
     }
-    if !ran {
-        let mut cmd = std::process::Command::new(bin);
-        cmd.arg("index")
-            .arg("--output")
-            .arg(&output_path)
-            .current_dir(root);
-        run_to_completion(cmd, "scip-java")?;
-    }
+    cmd.current_dir(root);
+    run_to_completion(cmd, "scip-java")?;
 
     let output_size = std::fs::metadata(&output_path)
         .map(|m| m.len())
@@ -529,6 +518,14 @@ fn jar_exe() -> Option<PathBuf> {
 /// EOF, which the child reaching exit (or being killed) produces by closing its
 /// write ends.
 fn run_to_completion(mut cmd: std::process::Command, what: &str) -> anyhow::Result<()> {
+    // Put the build in its own process group so the timeout path can signal the
+    // whole tree. `Child::kill` reaches only the launcher; the JVM it starts, and
+    // the `mvn`/`gradle` JVM under that, are what actually keep running.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -566,6 +563,15 @@ fn run_to_completion(mut cmd: std::process::Command, what: &str) -> anyhow::Resu
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 kill_process_tree(&mut child);
+                // Reap it: `Child::drop` does not wait, so bailing straight out
+                // left a zombie behind. The drain threads are deliberately NOT
+                // joined here. A grandchild that outlived the tree kill still
+                // holds the write end of its pipe, and joining would then block
+                // this sidecar until the host's own watchdog fired, turning one
+                // language's clean failure into a crash that discards the whole
+                // invoke. A detached thread on an abandoned process is a bounded
+                // leak for the rest of this invocation; a wedged sidecar is not.
+                let _ = child.wait();
                 anyhow::bail!("{what} timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
@@ -594,10 +600,16 @@ fn tail_lines(stderr: &str, stdout: &str) -> String {
     };
     const MAX: usize = 4000;
     if src.len() <= MAX {
-        src.to_string()
-    } else {
-        format!("…{}", &src[src.len() - MAX..])
+        return src.to_string();
     }
+    // Slicing a `&str` at a raw byte offset panics when the offset lands inside a
+    // multibyte character, which any build printing a non-ASCII path or a
+    // localized JVM message can produce. Walk forward to the next boundary.
+    let mut start = src.len() - MAX;
+    while start < src.len() && !src.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &src[start..])
 }
 
 /// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`).
@@ -615,14 +627,26 @@ fn strip_windows_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Terminate a spawned build process and its descendants. On Windows,
-/// `Child::kill` terminates only the immediate child (the gradlew launcher),
-/// leaving the Gradle/JVM grandchildren running; `taskkill /T` kills the tree.
+/// Terminate a spawned build process and its descendants. `Child::kill`
+/// terminates only the immediate child (the gradlew/mvn launcher), leaving the
+/// Gradle/JVM grandchildren running: on Windows `taskkill /T` kills the tree,
+/// and on unix `run_to_completion` gives the child its own process group, so a
+/// negative pid signals every descendant that has not left it.
 fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // `kill(2)` needs either libc or nix, neither of which this crate
+        // depends on, so shell out the same way the Windows branch does.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &format!("-{}", child.id())])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();

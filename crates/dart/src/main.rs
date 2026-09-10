@@ -31,6 +31,12 @@ use travsr_plugin_sdk::{
 };
 
 const TIMEOUT_SECS: u64 = 300;
+/// Budget for the `--version` handshake. Short on purpose: it answers in
+/// milliseconds when it answers at all, and it must never be able to consume
+/// the invoke budget the host watchdogs at TIMEOUT_SECS.
+const VERSION_PROBE_SECS: u64 = 10;
+/// Cap on how much of the probe's stdout is read. A version line is one line.
+const VERSION_LINE_MAX_BYTES: u64 = 256;
 
 // ── Emitter discovery ─────────────────────────────────────────────────────────
 
@@ -158,14 +164,26 @@ impl Plugin for DartPhaseB {
 ///      handshake, so it is definitely older than this sidecar.
 ///   2. It reports a version other than this sidecar's own package version.
 ///
-/// Runs once per process (`OnceLock`), so a repeat invoke does not re-spawn it.
+/// Runs once per resolved emitter path, so a repeat invoke does not re-spawn it.
 fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
     // Caches the *verdict*, not just the fact of having run: the probe stays
-    // once-per-process, but a repeat invoke still gets the diagnostic to attach
+    // once per emitter, but a repeat invoke still gets the diagnostic to attach
     // to its own response.
-    static CHECKED: std::sync::OnceLock<Option<PluginDiagnostic>> = std::sync::OnceLock::new();
-    if let Some(cached) = CHECKED.get() {
-        return cached.clone();
+    //
+    // Keyed on the emitter path, not process-global: `emitter_path()` resolves
+    // per invoke and can legitimately change mid-process ($TRAVSR_DART_EMITTER,
+    // or a dev build appearing while the daemon keeps this sidecar warm). An
+    // unkeyed cache then returned the first emitter's verdict, naming a binary
+    // that is no longer the one being run.
+    #[allow(clippy::type_complexity)]
+    static CHECKED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Option<PluginDiagnostic>>>,
+    > = std::sync::OnceLock::new();
+    let cache = CHECKED.get_or_init(Default::default);
+    if let Ok(map) = cache.lock() {
+        if let Some(cached) = map.get(emitter) {
+            return cached.clone();
+        }
     }
 
     let mtime = std::fs::metadata(emitter)
@@ -174,13 +192,7 @@ fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_secs());
 
-    let reported = std::process::Command::new(emitter)
-        .arg("--version")
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|s| !s.is_empty());
+    let reported = probe_version(emitter);
 
     // Always say which binary actually ran. Benchmarking against an emitter you
     // did not build is the failure this exists to prevent, and the path plus the
@@ -204,7 +216,7 @@ fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
                 emitter.display()
             ),
         )),
-        Some(line) if !line.ends_with(expected) => Some(PluginDiagnostic::warning(
+        Some(line) if version_field(line) != expected => Some(PluginDiagnostic::warning(
             "emitter.version-mismatch",
             format!(
                 "the dart index emitter at {} reports {line}, but this sidecar is v{expected}. \
@@ -224,7 +236,7 @@ fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
              `cd packages/dart-scip-emitter && dart compile exe bin/emit.dart -o bin/emit-native` and reinstall it to \
              ~/.travsr/bin/travsr-dart-index-emitter."
         ),
-        Some(line) if !line.ends_with(expected) => tracing::warn!(
+        Some(line) if version_field(&line) != expected => tracing::warn!(
             emitter = %emitter.display(),
             reported = %line,
             expected = %expected,
@@ -234,8 +246,79 @@ fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
         ),
         Some(_) => {}
     }
-    let _ = CHECKED.set(diagnostic.clone());
+    if let Ok(mut map) = cache.lock() {
+        map.insert(emitter.to_path_buf(), diagnostic.clone());
+    }
     diagnostic
+}
+
+/// The version field of a `--version` line: `"dart-index-emitter 0.4.2"` -> `"0.4.2"`.
+///
+/// Compared exactly. A `ends_with` test made `10.4.2` compare equal to `0.4.2`,
+/// so the first release past a single-digit major would have silently stopped
+/// reporting skew.
+fn version_field(line: &str) -> &str {
+    line.split_whitespace().last().unwrap_or(line)
+}
+
+/// Run `<emitter> --version` under its own short deadline and return the
+/// trimmed line it printed.
+///
+/// `Command::output()` waits for exit with no bound and reads both pipes
+/// unbounded, so an emitter that hangs on startup held this sidecar until the
+/// plugin host SIGKILLed it at 300s. The language was then lost to a timeout
+/// that gave no hint a version probe caused it. A version line is one short
+/// line, so the read is capped too.
+fn probe_version(emitter: &Path) -> Option<String> {
+    let mut child = std::process::Command::new(emitter)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let mut reader = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = out.take(VERSION_LINE_MAX_BYTES).read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(VERSION_PROBE_SECS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.take().and_then(|h| h.join().ok());
+                tracing::warn!(
+                    emitter = %emitter.display(),
+                    "`--version` did not answer within {VERSION_PROBE_SECS}s; treating this \
+                     emitter as one that does not support the flag"
+                );
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+
+    let out = reader
+        .take()
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    if !status.success() {
+        return None;
+    }
+    let line = out.trim().to_string();
+    (!line.is_empty()).then_some(line)
 }
 
 // ── Emitter invocation ────────────────────────────────────────────────────────
@@ -266,22 +349,36 @@ fn run_dart_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse>
         .spawn()
         .with_context(|| format!("failed to spawn {}", emitter.display()))?;
 
+    // Drain stderr on a reader thread so the emitter never blocks on a full pipe
+    // while we poll for exit. It is piped but was read only after the loop, so
+    // an emitter writing more than a pipe buffer (~64KB) of diagnostics blocked
+    // forever and burned the whole invoke budget as a spurious timeout. Same
+    // hazard, and the same fix, as in the PHP sidecar.
+    let mut stderr_reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
+
     let status = loop {
         match child.try_wait().context("polling dart emitter")? {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stderr_reader.take().and_then(|h| h.join().ok());
                 anyhow::bail!("dart-index-emitter timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
         }
     };
 
-    let mut stderr_buf = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_buf);
-    }
+    let stderr_buf = stderr_reader
+        .take()
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     tracing::debug!(exit_code = %status, "run_dart_emitter: subprocess exited");
     if !stderr_buf.is_empty() {

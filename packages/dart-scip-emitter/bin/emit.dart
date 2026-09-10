@@ -46,7 +46,8 @@ import 'package:path/path.dart' as p;
 /// spawner (`crates/dart`) compares this against its own package version and
 /// warns when they disagree, because `cargo build` does NOT rebuild this
 /// binary and a stale emitter is otherwise indistinguishable from a current
-/// one. Bump both together at release.
+/// one. Bump this, `version:` in pubspec.yaml, and the Cargo workspace version
+/// together at release; CI fails when they disagree.
 const emitterVersion = '0.4.2';
 
 Future<void> main(List<String> args) async {

@@ -42,6 +42,14 @@ struct IndexBuilder {
     /// that re-declares a category method) is resolved first-document-wins, so
     /// a randomized document order made identical input produce a different
     /// edge target from run to run.
+    ///
+    /// Reproducible, not necessarily right. `travsr-lang-scip-reader` already
+    /// prefers a `.m` definition over a `.h` declaration, so the header case is
+    /// handled; between two implementation files it is first-document-wins, and
+    /// ascending byte order puts `Tests/FooTests.m` (`T`) before `src/Foo.m`
+    /// (`s`). For that case the stable winner is the test file. Deciding it the
+    /// other way is a definition-preference question, and it belongs where the
+    /// header preference already lives, not in this emitter's document order.
     docs: BTreeMap<String, DocData>,
     /// #833 phase 1: class-message sends recovered lexically from translation
     /// units clang reported errors on. Held aside until every TU is processed,
@@ -967,7 +975,27 @@ fn scan_body_for_sends(ctx: &mut RecoveryCtx, cursor: CXCursor) {
 
     // Unlike the #831 fallback, the extent here is a whole body, so every `[`
     // is a candidate send opener rather than exactly one message.
+    //
+    // `clang_tokenize` is a raw lexer over the source text: it yields the
+    // contents of preprocessor regions this build never compiles, so a body
+    // holding `#if 0 [Legacy start]; #endif` would otherwise recover a send
+    // that does not exist in this configuration. Nothing here knows which
+    // branch is live (the raw token stream carries no macro state), so every
+    // conditional region is declined rather than guessed at. Declining costs
+    // recall only inside error TUs, where the alternative is a wrong edge.
+    let mut cond_depth = 0usize;
     for (i, tok) in toks.iter().enumerate() {
+        if tok.spelling == "#" {
+            match toks.get(i + 1).map(|t| t.spelling.as_str()) {
+                Some("if") | Some("ifdef") | Some("ifndef") => cond_depth += 1,
+                Some("endif") => cond_depth = cond_depth.saturating_sub(1),
+                _ => {}
+            }
+            continue;
+        }
+        if cond_depth > 0 {
+            continue;
+        }
         if tok.spelling != "[" {
             continue;
         }
@@ -1539,6 +1567,81 @@ mod ref_recovery_tests {
             1,
             "a send that parsed must not be counted twice; got {:?}",
             ref_symbols(&index)
+        );
+    }
+
+    #[test]
+    fn error_tu_recovery_skips_inactive_preprocessor_regions() {
+        // #833 PRECISION GUARD. `clang_tokenize` is a raw lexer: it returns the
+        // text of a `#if 0` region, which the compiler never sees. Verified
+        // against libclang directly: the token stream for the method below
+        // contains `[ Legacy start ]`. Recovering it would emit an edge to a
+        // call that does not exist in this build configuration.
+        if !crate::libclang_available() {
+            eprintln!("skipping: libclang not available");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("Legacy.h"),
+            "@interface Legacy\n+ (void)start;\n@end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Legacy.m"),
+            "#import \"Legacy.h\"\n\
+             @implementation Legacy\n\
+             + (void)start {}\n\
+             @end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Modern.h"),
+            "@interface Modern\n+ (void)start;\n@end\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("Modern.m"),
+            "#import \"Modern.h\"\n\
+             @implementation Modern\n\
+             + (void)start {}\n\
+             @end\n",
+        )
+        .unwrap();
+        // `@import` is a hard error under the glob-fallback flags, which is what
+        // puts this TU on the lexical recovery path in the first place.
+        std::fs::write(root.join("Bad.h"), "@import NoSuchModuleAnywhere;\n").unwrap();
+        std::fs::write(
+            root.join("Use.m"),
+            "#import \"Bad.h\"\n\
+             @interface U\n\
+             + (void)go;\n\
+             @end\n\
+             @implementation U\n\
+             + (void)go {\n\
+             [Modern start];\n\
+             #if 0\n\
+             [Legacy start];\n\
+             #endif\n\
+             }\n\
+             @end\n",
+        )
+        .unwrap();
+
+        let index = build(root);
+        let refs = ref_symbols(&index);
+        // Positive control: `Modern` is never imported here, so this send cannot
+        // parse and only the lexical recovery can produce it. It proves the
+        // recovery pass really ran on this TU.
+        assert!(
+            refs.iter().any(|s| s.ends_with("Modern#start().")),
+            "recovery must still emit the send outside the conditional; got {refs:?}"
+        );
+        // The guard itself.
+        assert!(
+            !refs.iter().any(|s| s.contains("Legacy#start")),
+            "a send inside an inactive #if region must not be recovered; got {refs:?}"
         );
     }
 }

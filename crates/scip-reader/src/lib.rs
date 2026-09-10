@@ -951,7 +951,11 @@ fn is_dark_test_scope(files: Option<&[String]>, resp: &InvokeResponse) -> bool {
 /// `foo_test.go`, `test_foo.py`, `Foo.spec.ts`). Heuristic by construction: it
 /// only ever decides whether to emit a diagnostic, never what enters the graph.
 fn is_test_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
+    // `InvokeRequest::files` leaves the separator unspecified, so a Windows
+    // daemon can hand over `src\test\java\Helper.java`. Without this the
+    // directory rule never fires on it, while the SCIP-side paths it is compared
+    // against are always `/`, which is a false negative in both gates at once.
+    let lower = path.to_ascii_lowercase().replace('\\', "/");
     let mut segments = lower.split('/');
     let file = segments.next_back().unwrap_or("");
     if segments.any(|seg| matches!(seg, "test" | "tests" | "spec" | "specs" | "__tests__")) {

@@ -117,6 +117,14 @@ fn glob_fallback(root: &Path, files: Option<&[String]>) -> Vec<CompilationEntry>
     // The root is always a search path (matches the previous behavior).
     header_dirs.insert(root.to_path_buf());
     walk_tree(root, &mut sources, &mut header_dirs);
+    // `read_dir` returns entries in whatever order the filesystem hands back, so
+    // without this the TU processing order varies between machines and between
+    // runs. `visit_top_level` has no primary-file filter, so a project header's
+    // `@interface` is re-handled once per including TU and its symbols
+    // accumulate in TU order: the emitted SCIP bytes are only reproducible once
+    // this order is. The `compile_commands.json` path already preserves the
+    // file's own order and needs no sort.
+    sources.sort();
 
     let source_files: Vec<PathBuf> = if let Some(list) = files {
         list.iter()

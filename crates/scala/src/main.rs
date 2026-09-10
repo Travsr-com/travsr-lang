@@ -31,7 +31,17 @@ use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
 };
 
-const TIMEOUT_SECS: u64 = 600;
+// Per-attempt sbt budgets. The plugin host watchdogs a Phase B invoke at 300s
+// and SIGKILLs past it, so a single 600s budget could never be reached: the
+// sidecar died without ever reporting why. These two are sized so both attempts
+// plus the SemanticDB scan and parse that follow them fit inside that 300s and
+// the sidecar gets to return a real error instead.
+const COMPILE_TIMEOUT_SECS: u64 = 180;
+// The Compile-only retry gets its own budget rather than what is left of the
+// first attempt's. Sharing one deadline meant a `Test/compile` that failed at
+// 590s left the fallback ten seconds, so the fallback was lost exactly on the
+// slow builds it exists for.
+const FALLBACK_TIMEOUT_SECS: u64 = 60;
 // #832: enable SemanticDB across *every* project in the build, passed as an sbt
 // command rather than an injected `.sbt` setting. A bare `semanticdbEnabled :=
 // true` in a root settings file binds only to the root project, and even
@@ -237,7 +247,6 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         .ok_or_else(|| anyhow::anyhow!("no build.sbt found under {}", root.display()))?;
     tracing::info!(sbt_root = %sbt_root.display(), "found sbt project root");
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
     // Compile the Test configuration too. `compile` alone builds only the
     // Compile config, so no test source ever gets a `.semanticdb` and every
     // caller that lives in a test is invisible: on scala-parser-combinators all
@@ -246,7 +255,7 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     // in every scope (#832) does not compile test sources, it only means they
     // would carry SemanticDB if something built them.
     let (mut status, mut stdout_out, mut stderr_out) =
-        run_sbt_compile(&sbt_root, sbt_bin, deadline, true)?;
+        run_sbt_compile(&sbt_root, sbt_bin, COMPILE_TIMEOUT_SECS, true)?;
     if !status.success() {
         // A repo whose tests do not compile must still get its main-scope
         // graph rather than nothing: sbt runs the commands in sequence and
@@ -254,13 +263,16 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         // take `compile` down with it. Retry without the test scope.
         tracing::warn!(
             "sbt compile including Test scope failed, retrying with the Compile \
-             scope only; test-source references will be missing:\n{stderr_out}"
+             scope only; test-source references will be missing:\n{}",
+            tail(&stderr_out, 4000)
         );
-        (status, stdout_out, stderr_out) = run_sbt_compile(&sbt_root, sbt_bin, deadline, false)?;
+        (status, stdout_out, stderr_out) =
+            run_sbt_compile(&sbt_root, sbt_bin, FALLBACK_TIMEOUT_SECS, false)?;
     }
     anyhow::ensure!(
         status.success(),
-        "sbt compile exited with {status}:\n{stderr_out}"
+        "sbt compile exited with {status}:\n{}",
+        tail(&stderr_out, 4000)
     );
 
     let semanticdb_files = find_semanticdb_files(&sbt_root);
@@ -313,12 +325,17 @@ fn tail(s: &str, max_bytes: usize) -> String {
 /// `with_tests` also compiles the Test configuration, so test sources get
 /// SemanticDB output and their call sites enter the graph. Retried as `false` by
 /// the caller when a repo's tests do not compile.
+///
+/// `budget_secs` is this attempt's own budget, started here. The retry must not
+/// inherit the first attempt's remaining time, or a first attempt that runs
+/// nearly to its limit leaves the retry none.
 fn run_sbt_compile(
     sbt_root: &Path,
     sbt_bin: &Path,
-    deadline: std::time::Instant,
+    budget_secs: u64,
     with_tests: bool,
 ) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget_secs);
     // #S3: plain `sbt compile` uses sbt 2.x's thin-client/background-server
     // split (`sbtn`), which talks to the server over a loopback socket. Windows
     // AppContainer blocks loopback for a sandboxed process unless separately
@@ -372,7 +389,7 @@ fn run_sbt_compile(
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 kill_process_tree(&mut child);
-                anyhow::bail!("sbt compile timed out after {TIMEOUT_SECS}s");
+                anyhow::bail!("sbt compile timed out after {budget_secs}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(500)),
         }
