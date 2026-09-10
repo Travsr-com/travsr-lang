@@ -558,5 +558,15 @@ jobs:
           expected=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
           echo "reported: $out / expected: dart-index-emitter $expected"
           test "$out" = "dart-index-emitter $expected"
-          ./bin/emit-native /tmp/dart_smoke /tmp/dart_smoke_aot.json
+          # #299 E1: an AOT binary resolves the SDK from Platform.resolvedExecutable,
+          # which is the binary itself, so the analyzer looks for lib/_internal next
+          # to it and dies with PathNotFoundException. The daemon passes DART_SDK for
+          # exactly this reason; the smoke test has to do the same or it is not
+          # exercising how the shipped binary is actually invoked.
+          # readlink -f first: `dart` on PATH is commonly a symlink into the real
+          # SDK, and dirname twice on the link gives the wrong root.
+          DART_SDK="$(dirname "$(dirname "$(readlink -f "$(command -v dart)")")")"
+          test -f "$DART_SDK/version" && test -d "$DART_SDK/lib" || {
+            echo "DART_SDK does not look like an SDK root: $DART_SDK"; exit 1; }
+          DART_SDK="$DART_SDK" ./bin/emit-native /tmp/dart_smoke /tmp/dart_smoke_aot.json
           grep -q '"version"' /tmp/dart_smoke_aot.json
