@@ -5,6 +5,12 @@ on:
     branches: [main, master]
   pull_request:
 
+# Least privilege by default: nothing here publishes, comments, or writes to
+# the repo, so read access to the contents is all any job needs. A job that
+# later needs more must ask for it explicitly.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -14,7 +20,7 @@ jobs:
     name: rust (check + test)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # travsr-core is patched from a sibling repo (../travsr) because Language::Dart
       # and Language::Swift are not yet published to crates.io. Cargo resolves the
@@ -23,7 +29,11 @@ jobs:
       # actions/checkout@v4 blocks paths outside $GITHUB_WORKSPACE, so we check out
       # into _travsr (inside the workspace) and symlink it to ../travsr so Cargo's
       # [patch.crates-io] paths resolve without touching Cargo.toml.
-      - uses: actions/checkout@v4
+      # Deliberately floating: this repo builds against travsr's master, so a
+      # pin here would silently stop testing the pair that actually ships
+      # together. The cost is real and accepted: a push to Travsr-com/travsr
+      # can turn this workflow red without a change here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Travsr-com/travsr
           ref: master
@@ -32,11 +42,34 @@ jobs:
       - name: Symlink _travsr as ../travsr for Cargo patch resolution
         run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The emitter version literals are hand maintained and compared at runtime
+      # against the Rust crate version, and nothing enforced the pair: the dart
+      # pubspec had already drifted to 0.1.0. A release that bumps Cargo.toml and
+      # forgets one of these makes every freshly built emitter report a skew that
+      # is not real, which is cry wolf on the feature's first outing.
+      - name: emitter version literals match the crate version
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          swift=$(sed -n 's/^let emitterVersion = "\(.*\)"/\1/p' \
+            packages/swift-index-emitter/Sources/main.swift)
+          dart=$(sed -n "s/^const emitterVersion = '\(.*\)';/\1/p" \
+            packages/dart-scip-emitter/bin/emit.dart)
+          pubspec=$(sed -n 's/^version: \(.*\)/\1/p' packages/dart-scip-emitter/pubspec.yaml)
+          echo "crate=$crate swift=$swift dart=$dart pubspec=$pubspec"
+          fail=0
+          for pair in "swift-index-emitter:$swift" "dart-scip-emitter:$dart" "pubspec.yaml:$pubspec"; do
+            if [ "${pair#*:}" != "$crate" ]; then
+              echo "MISMATCH: ${pair%%:*} says '${pair#*:}', Cargo.toml workspace version is '$crate'"
+              fail=1
+            fi
+          done
+          exit $fail
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2025-11-13
         with:
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: fmt
         run: cargo fmt --all -- --check
@@ -58,9 +91,13 @@ jobs:
     name: rust (Windows build)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/checkout@v4
+      # Deliberately floating: this repo builds against travsr's master, so a
+      # pin here would silently stop testing the pair that actually ships
+      # together. The cost is real and accepted: a push to Travsr-com/travsr
+      # can turn this workflow red without a change here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Travsr-com/travsr
           ref: master
@@ -73,11 +110,11 @@ jobs:
         shell: bash
         run: sed -i.bak 's|path = "\.\./travsr/|path = "_travsr/|g' Cargo.toml && rm -f Cargo.toml.bak
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2025-11-13
         with:
           targets: x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: windows-msvc
 
@@ -132,9 +169,13 @@ jobs:
     name: objc emitter (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: actions/checkout@v4
+      # Deliberately floating: this repo builds against travsr's master, so a
+      # pin here would silently stop testing the pair that actually ships
+      # together. The cost is real and accepted: a push to Travsr-com/travsr
+      # can turn this workflow red without a change here.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           repository: Travsr-com/travsr
           ref: master
@@ -143,7 +184,7 @@ jobs:
       - name: Symlink _travsr as ../travsr for Cargo patch resolution
         run: ln -s "$GITHUB_WORKSPACE/_travsr" "$GITHUB_WORKSPACE/../travsr"
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable, 2025-11-13
 
       - name: Locate libclang and set runtime path
         run: |
@@ -157,7 +198,7 @@ jobs:
           LIBCLANG_DIR=$(realpath "$CLANG_LIB")
           echo "LIBCLANG_PATH=${LIBCLANG_DIR}" >> "$GITHUB_ENV"
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: objc
 
@@ -176,11 +217,30 @@ jobs:
     name: swift emitter (macOS)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: build
         working-directory: packages/swift-index-emitter
         run: swift build -c release
+
+      # The reference COUNT does not move when a resolution change retargets a
+      # symbol, so the smoke test below cannot see one. These unit tests pin the
+      # resolution rules themselves.
+      - name: test
+        working-directory: packages/swift-index-emitter
+        run: swift test
+
+      # The headline feature of this pair is the --version handshake, and
+      # nothing exercised it: an emitter that cannot answer the flag makes the
+      # sidecar warn on every single run. Assert the exact line shape the Rust
+      # side parses, "<name> <version>", and that the version is the crate's.
+      - name: version handshake
+        working-directory: packages/swift-index-emitter
+        run: |
+          out=$(.build/release/swift-index-emitter --version | tail -n 1)
+          expected=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
+          echo "reported: $out / expected: swift-index-emitter $expected"
+          test "$out" = "swift-index-emitter $expected"
 
       - name: smoke test
         working-directory: packages/swift-index-emitter
@@ -206,6 +266,19 @@ jobs:
               let combo: Box & Shape
               func cast(_ any: Any) -> Box? { any as? Box }
           }
+          protocol Runner {}
+          extension Runner {
+              static func launch() -> Int { 0 }
+              static func chain() -> Int { launch() }
+          }
+          struct Job: Runner {}
+          class Base { class func baseStatic() {} }
+          class Derived: Base {}
+          func inheritedCalls() -> Int {
+              Derived.baseStatic()
+              return Job.launch()
+          }
+          func genericCall<T: Runner>(_ t: T.Type) -> Int { T.launch() }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
@@ -251,6 +324,28 @@ jobs:
           box = occ('swift::Box')
           if len(box) < 2:
               errs.append('swift::Box undercounted (composition/return/as-cast): %d' % len(box))
+          # A static/type-method call is written on the receiver but may be
+          # declared on a supertype or protocol extension. The emitter keyed the
+          # symbol on the receiver, so every inherited call named a symbol no
+          # definition carried and was dropped: 33% of all references on
+          # swift-argument-parser, and `references parseAsRoot` found none of its
+          # 11 caller files. Each case below must key on the DECLARING type.
+          if not occ('swift::Runner.launch'):
+              errs.append('inherited protocol-extension call not keyed on the declaring type')
+          if occ('swift::Job.launch'):
+              errs.append('call keyed on the receiver (swift::Job.launch) instead of the declarer')
+          if not occ('swift::Base.baseStatic'):
+              errs.append('inherited superclass call not keyed on the declaring type')
+          if occ('swift::Derived.baseStatic'):
+              errs.append('call keyed on the subclass instead of the declarer')
+          # A bare call inside the declaring extension is implicit-self static
+          # dispatch, not a top-level function.
+          if occ('swift::launch'):
+              errs.append('bare call in the declaring extension emitted as a free function')
+          # A generic parameter names no real type: it must resolve through its
+          # constraint, and never be emitted as a type reference of its own.
+          if occ('swift::T'):
+              errs.append('generic parameter emitted as a real type reference')
           for r in payload + occ('swift::Shape') + box:
               if r.get('is_call', True):
                   errs.append('type-position ref %s flagged is_call' % r['symbol'])
@@ -264,15 +359,34 @@ jobs:
     name: swift emitter (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: swift-actions/setup-swift@v2
+      - uses: swift-actions/setup-swift@7ca6abe6b3b0e8b5421b88be48feee39cbf52c6a # v2.4.0
         with:
           swift-version: "5.10"
 
       - name: build
         working-directory: packages/swift-index-emitter
         run: swift build -c release
+
+      # The reference COUNT does not move when a resolution change retargets a
+      # symbol, so the smoke test below cannot see one. These unit tests pin the
+      # resolution rules themselves.
+      - name: test
+        working-directory: packages/swift-index-emitter
+        run: swift test
+
+      # The headline feature of this pair is the --version handshake, and
+      # nothing exercised it: an emitter that cannot answer the flag makes the
+      # sidecar warn on every single run. Assert the exact line shape the Rust
+      # side parses, "<name> <version>", and that the version is the crate's.
+      - name: version handshake
+        working-directory: packages/swift-index-emitter
+        run: |
+          out=$(.build/release/swift-index-emitter --version | tail -n 1)
+          expected=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
+          echo "reported: $out / expected: swift-index-emitter $expected"
+          test "$out" = "swift-index-emitter $expected"
 
       - name: smoke test
         working-directory: packages/swift-index-emitter
@@ -298,6 +412,19 @@ jobs:
               let combo: Box & Shape
               func cast(_ any: Any) -> Box? { any as? Box }
           }
+          protocol Runner {}
+          extension Runner {
+              static func launch() -> Int { 0 }
+              static func chain() -> Int { launch() }
+          }
+          struct Job: Runner {}
+          class Base { class func baseStatic() {} }
+          class Derived: Base {}
+          func inheritedCalls() -> Int {
+              Derived.baseStatic()
+              return Job.launch()
+          }
+          func genericCall<T: Runner>(_ t: T.Type) -> Int { T.launch() }
           EOF
           .build/release/swift-index-emitter /tmp/swift_smoke /tmp/swift_smoke_out.json
           grep -q '"version"' /tmp/swift_smoke_out.json
@@ -343,6 +470,28 @@ jobs:
           box = occ('swift::Box')
           if len(box) < 2:
               errs.append('swift::Box undercounted (composition/return/as-cast): %d' % len(box))
+          # A static/type-method call is written on the receiver but may be
+          # declared on a supertype or protocol extension. The emitter keyed the
+          # symbol on the receiver, so every inherited call named a symbol no
+          # definition carried and was dropped: 33% of all references on
+          # swift-argument-parser, and `references parseAsRoot` found none of its
+          # 11 caller files. Each case below must key on the DECLARING type.
+          if not occ('swift::Runner.launch'):
+              errs.append('inherited protocol-extension call not keyed on the declaring type')
+          if occ('swift::Job.launch'):
+              errs.append('call keyed on the receiver (swift::Job.launch) instead of the declarer')
+          if not occ('swift::Base.baseStatic'):
+              errs.append('inherited superclass call not keyed on the declaring type')
+          if occ('swift::Derived.baseStatic'):
+              errs.append('call keyed on the subclass instead of the declarer')
+          # A bare call inside the declaring extension is implicit-self static
+          # dispatch, not a top-level function.
+          if occ('swift::launch'):
+              errs.append('bare call in the declaring extension emitted as a free function')
+          # A generic parameter names no real type: it must resolve through its
+          # constraint, and never be emitted as a type reference of its own.
+          if occ('swift::T'):
+              errs.append('generic parameter emitted as a real type reference')
           for r in payload + occ('swift::Shape') + box:
               if r.get('is_call', True):
                   errs.append('type-position ref %s flagged is_call' % r['symbol'])
@@ -356,9 +505,9 @@ jobs:
     name: dart emitter (Linux)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
-      - uses: dart-lang/setup-dart@v1
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
         with:
           sdk: stable
 
@@ -386,3 +535,38 @@ jobs:
           EOF
           dart run bin/emit.dart /tmp/dart_smoke /tmp/dart_smoke_out.json
           grep -q '"version"' /tmp/dart_smoke_out.json
+
+      # Same gap as the swift jobs: the --version handshake was never exercised.
+      # `dart run` prints its own build chatter first, so take the last line.
+      - name: version handshake
+        working-directory: packages/dart-scip-emitter
+        run: |
+          out=$(dart run bin/emit.dart --version | tail -n 1)
+          expected=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
+          echo "reported: $out / expected: dart-index-emitter $expected"
+          test "$out" = "dart-index-emitter $expected"
+
+      # release.yml ships the AOT binary, not the JIT entry point, and nothing
+      # on a PR compiled it. The compile is the slowest step in this job (the
+      # analyzer package is large), and it is the only thing that proves the
+      # artifact users actually get still builds and answers --version.
+      - name: compile AOT and re-check the handshake
+        working-directory: packages/dart-scip-emitter
+        run: |
+          dart compile exe bin/emit.dart -o bin/emit-native
+          out=$(./bin/emit-native --version)
+          expected=$(sed -n 's/^version = "\(.*\)"/\1/p' ../../Cargo.toml | head -1)
+          echo "reported: $out / expected: dart-index-emitter $expected"
+          test "$out" = "dart-index-emitter $expected"
+          # #299 E1: an AOT binary resolves the SDK from Platform.resolvedExecutable,
+          # which is the binary itself, so the analyzer looks for lib/_internal next
+          # to it and dies with PathNotFoundException. The daemon passes DART_SDK for
+          # exactly this reason; the smoke test has to do the same or it is not
+          # exercising how the shipped binary is actually invoked.
+          # readlink -f first: `dart` on PATH is commonly a symlink into the real
+          # SDK, and dirname twice on the link gives the wrong root.
+          DART_SDK="$(dirname "$(dirname "$(readlink -f "$(command -v dart)")")")"
+          test -f "$DART_SDK/version" && test -d "$DART_SDK/lib" || {
+            echo "DART_SDK does not look like an SDK root: $DART_SDK"; exit 1; }
+          DART_SDK="$DART_SDK" ./bin/emit-native /tmp/dart_smoke /tmp/dart_smoke_aot.json
+          grep -q '"version"' /tmp/dart_smoke_aot.json

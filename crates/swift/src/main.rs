@@ -15,6 +15,17 @@
 //! Or set env var:
 //!   TRAVSR_SWIFT_EMITTER=/path/to/swift-index-emitter
 //!
+//! ## `cargo build` does NOT build the emitter
+//!
+//! This crate is a spawner. The analyzer is the SwiftPM package above, and
+//! nothing in the Cargo workspace builds it, so rebuilding the workspace after
+//! editing `Sources/main.swift` leaves a new spawner driving the previously
+//! installed emitter. Its output is still well formed, so the skew is invisible
+//! at the result level. `check_emitter_version` makes it visible: it asks the
+//! resolved emitter for `--version` once per process, logs the path and version
+//! at info, and warns when the version does not match this crate's, or when the
+//! emitter is old enough not to know the flag.
+//!
 //! Emitter location resolution order:
 //!   1. $TRAVSR_SWIFT_EMITTER (explicit binary path)
 //!   2. <binary-dir>/../../../packages/swift-index-emitter/.build/release/swift-index-emitter (dev/monorepo)
@@ -26,9 +37,16 @@ use std::path::{Path, PathBuf};
 use travsr_core::{Edge, EdgeKind, Language, Node, NodeId, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
+    PluginDiagnostic,
 };
 
 const TIMEOUT_SECS: u64 = 300;
+/// Budget for the `--version` handshake. Short on purpose: it answers in
+/// milliseconds when it answers at all, and it must never be able to consume
+/// the invoke budget the host watchdogs at TIMEOUT_SECS.
+const VERSION_PROBE_SECS: u64 = 10;
+/// Cap on how much of the probe's stdout is read. A version line is one line.
+const VERSION_LINE_MAX_BYTES: u64 = 256;
 
 // ── Emitter discovery ─────────────────────────────────────────────────────────
 
@@ -138,6 +156,200 @@ impl Plugin for SwiftPhaseB {
     }
 }
 
+// ── Emitter version handshake ─────────────────────────────────────────────────
+
+/// Ask the resolved emitter what it is, then log it and warn if it is not the
+/// build this sidecar expects.
+///
+/// The trap this closes: `cargo build --release` at the repo root does NOT
+/// build `packages/swift-index-emitter`. A developer who rebuilds the workspace
+/// therefore gets a new Rust spawner talking to whatever emitter binary is
+/// already installed at `~/.travsr/bin/travsr-swift-index-emitter`, with no
+/// signal that the pair is skewed. A stale emitter emits well-formed output,
+/// so the only symptom is results that quietly do not reflect the source.
+///
+/// Two signals, both WARN and never fatal (a version-skewed emitter still
+/// produces a usable index, and refusing to run would take Phase B away from
+/// someone whose only problem is a missing rebuild):
+///   1. The emitter does not understand `--version` at all. It predates this
+///      handshake, so it is definitely older than this sidecar.
+///   2. It reports a version other than this sidecar's own package version.
+///
+/// Runs once per resolved emitter path and build time, so a repeat invoke does
+/// not re-spawn it, and a rebuild is probed again.
+fn check_emitter_version(emitter: &Path) -> Option<PluginDiagnostic> {
+    // Caches the *verdict*, not just the fact of having run: the probe stays
+    // once per emitter, but a repeat invoke still gets the diagnostic to attach
+    // to its own response.
+    //
+    // Keyed on the emitter path AND its build time, not process-global:
+    // `emitter_path()` resolves per invoke and can legitimately change
+    // mid-process ($TRAVSR_SWIFT_EMITTER, or a dev build appearing while the daemon
+    // keeps this sidecar warm). An unkeyed cache then returned the first
+    // emitter's verdict, naming a binary that is no longer the one being run.
+    //
+    // The build time is in the key because rebuilding in place, over the same
+    // path, is the usual way an emitter changes. Keyed on the path alone, a
+    // developer who rebuilt and reinstalled kept being told about a skew that
+    // was already fixed, and a newly stale emitter kept being reported clean,
+    // for as long as the daemon held this sidecar warm.
+    #[allow(clippy::type_complexity)]
+    static CHECKED: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<(PathBuf, Option<u64>), Option<PluginDiagnostic>>,
+        >,
+    > = std::sync::OnceLock::new();
+
+    let mtime = std::fs::metadata(emitter)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs());
+    let key = (emitter.to_path_buf(), mtime);
+
+    let cache = CHECKED.get_or_init(Default::default);
+    if let Ok(map) = cache.lock() {
+        if let Some(cached) = map.get(&key) {
+            return cached.clone();
+        }
+    }
+
+    let reported = probe_version(emitter);
+
+    // Always say which binary actually ran. Benchmarking against an emitter you
+    // did not build is the failure this exists to prevent, and the path plus the
+    // build identity is what makes that visible.
+    tracing::info!(
+        emitter = %emitter.display(),
+        version = reported.as_deref().unwrap_or("unknown"),
+        mtime_unix = mtime,
+        sidecar_version = env!("CARGO_PKG_VERSION"),
+        "swift emitter resolved"
+    );
+
+    let expected = env!("CARGO_PKG_VERSION");
+    let diagnostic = match &reported {
+        None => Some(PluginDiagnostic::warning(
+            "emitter.version-unsupported",
+            format!(
+                "the swift index emitter at {} does not support `--version`, so it predates \
+                 this sidecar (v{expected}) and its output may not reflect the current emitter \
+                 source. `cargo build` does not rebuild it.",
+                emitter.display()
+            ),
+        )),
+        Some(line) if version_field(line) != expected => Some(PluginDiagnostic::warning(
+            "emitter.version-mismatch",
+            format!(
+                "the swift index emitter at {} reports {line}, but this sidecar is v{expected}. \
+                 Its output may not reflect the current emitter source; `cargo build` does not \
+                 rebuild it.",
+                emitter.display()
+            ),
+        )),
+        Some(_) => None,
+    };
+    match reported {
+        None => tracing::warn!(
+            emitter = %emitter.display(),
+            "swift emitter does not support `--version`, so it predates this \
+             sidecar (v{expected}) and its output may not reflect the current \
+             emitter source. `cargo build` does not rebuild it: run \
+             `cd packages/swift-index-emitter && swift build -c release` and reinstall it to \
+             ~/.travsr/bin/travsr-swift-index-emitter."
+        ),
+        Some(line) if version_field(&line) != expected => tracing::warn!(
+            emitter = %emitter.display(),
+            reported = %line,
+            expected = %expected,
+            "swift emitter version does not match this sidecar. Rebuild it with \
+             `cd packages/swift-index-emitter && swift build -c release` and reinstall it to \
+             ~/.travsr/bin/travsr-swift-index-emitter."
+        ),
+        Some(_) => {}
+    }
+    if let Ok(mut map) = cache.lock() {
+        map.insert(key, diagnostic.clone());
+    }
+    diagnostic
+}
+
+/// The version field of a `--version` line: `"swift-index-emitter 0.4.2"` -> `"0.4.2"`.
+///
+/// Compared exactly. A `ends_with` test made `10.4.2` compare equal to `0.4.2`,
+/// so the first release past a single-digit major would have silently stopped
+/// reporting skew.
+///
+/// Only the first line is read. The emitter prints the version line and nothing
+/// else, but taking the last token of the whole output made any extra line a
+/// bogus version and a skew warning that was not real. (CI's handshake pipes
+/// through `tail -n 1` instead, because there it is build output that precedes
+/// the line; here the emitter's stderr is already discarded.)
+fn version_field(line: &str) -> &str {
+    let first = line.lines().next().unwrap_or(line).trim();
+    first.split_whitespace().last().unwrap_or(first)
+}
+
+/// Run `<emitter> --version` under its own short deadline and return the
+/// trimmed line it printed.
+///
+/// `Command::output()` waits for exit with no bound and reads both pipes
+/// unbounded, so an emitter that hangs on startup held this sidecar until the
+/// plugin host SIGKILLed it at 300s. The language was then lost to a timeout
+/// that gave no hint a version probe caused it. A version line is one short
+/// line, so the read is capped too.
+fn probe_version(emitter: &Path) -> Option<String> {
+    let mut child = std::process::Command::new(emitter)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let mut reader = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = out.take(VERSION_LINE_MAX_BYTES).read_to_string(&mut buf);
+            buf
+        })
+    });
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(VERSION_PROBE_SECS);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => break s,
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.take().and_then(|h| h.join().ok());
+                tracing::warn!(
+                    emitter = %emitter.display(),
+                    "`--version` did not answer within {VERSION_PROBE_SECS}s; treating this \
+                     emitter as one that does not support the flag"
+                );
+                return None;
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+
+    let out = reader
+        .take()
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    if !status.success() {
+        return None;
+    }
+    let line = out.trim().to_string();
+    (!line.is_empty()).then_some(line)
+}
+
 // ── Emitter invocation ────────────────────────────────────────────────────────
 
 fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
@@ -146,6 +358,7 @@ fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse
          `cd packages/swift-index-emitter && swift build -c release` \
          or set $TRAVSR_SWIFT_EMITTER",
     )?;
+    let version_diagnostic = check_emitter_version(&emitter);
 
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = scratch.path().join("index.json");
@@ -166,22 +379,36 @@ fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse
         .spawn()
         .with_context(|| format!("failed to spawn {}", emitter.display()))?;
 
+    // Drain stderr on a reader thread so the emitter never blocks on a full pipe
+    // while we poll for exit. It is piped but was read only after the loop, so
+    // an emitter writing more than a pipe buffer (~64KB) of diagnostics blocked
+    // forever and burned the whole invoke budget as a spurious timeout. Same
+    // hazard, and the same fix, as in the PHP sidecar.
+    let mut stderr_reader = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = err.read_to_string(&mut buf);
+            buf
+        })
+    });
+
     let status = loop {
         match child.try_wait().context("polling swift emitter")? {
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = stderr_reader.take().and_then(|h| h.join().ok());
                 anyhow::bail!("swift emitter timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
         }
     };
 
-    let mut stderr_buf = String::new();
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr_buf);
-    }
+    let stderr_buf = stderr_reader
+        .take()
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
 
     tracing::debug!(exit_code = %status, "run_swift_emitter: subprocess exited");
     if !stderr_buf.is_empty() {
@@ -193,7 +420,13 @@ fn run_swift_emitter(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse
         "swift emitter exited with {status}: {stderr_buf}"
     );
 
-    parse_emitter_output(&output_path, corpus, root)
+    // A version-skewed emitter still produces a usable index, so this rides out
+    // on the response rather than failing the run. Attaching it here is the point:
+    // the host only echoes sidecar stderr when a run yields zero nodes, and a
+    // stale emitter yields plenty, just not of the current source.
+    let mut resp = parse_emitter_output(&output_path, corpus, root)?;
+    resp.diagnostics.extend(version_diagnostic);
+    Ok(resp)
 }
 
 // ── JSON parsing ──────────────────────────────────────────────────────────────
@@ -379,6 +612,7 @@ fn parse_emitter_output(
     );
 
     Ok(InvokeResponse {
+        diagnostics: Vec::new(),
         nodes,
         edges,
         refs: refs_out,
@@ -403,6 +637,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The last token of the LAST line used to be taken, so an emitter that
+    /// printed anything after its version line reported a bogus version and a
+    /// skew that was not real.
+    #[test]
+    fn version_field_reads_only_the_first_line() {
+        assert_eq!(version_field("swift-index-emitter 0.4.2"), "0.4.2");
+        assert_eq!(
+            version_field("swift-index-emitter 0.4.2\nwarning: something else"),
+            "0.4.2"
+        );
+    }
 
     fn parse(json: &str) -> InvokeResponse {
         let dir = tempfile::tempdir().expect("tempdir");

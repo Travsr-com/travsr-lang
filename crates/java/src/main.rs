@@ -48,6 +48,22 @@ use travsr_plugin_sdk::{
 /// JVM builds (Gradle/Maven) can be slow on a cold dependency cache.
 const TIMEOUT_SECS: u64 = 600;
 
+/// Why a Java repo's test sources can be entirely missing from an otherwise
+/// healthy SCIP index.
+///
+/// scip-java analyses with SemanticDB, which is a javac plugin: it only ever
+/// sees the sources the build actually hands to javac. If the build skips test
+/// compilation then `testCompile` is a no-op, no `.semanticdb` file is written
+/// for any test source, the SCIP index carries no Document for it, and no
+/// semantic edge can originate in a test file. scip-java exits 0 throughout,
+/// so the only visible symptom is a graph that quietly knows nothing about the
+/// tests.
+const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
+     source the build never compiles produces no index at all. The usual cause \
+     is a build that skips test compilation: `-Dmaven.test.skip=true` (on the \
+     command line or in `.mvn/maven.config`), `<maven.test.skip>` or \
+     `<skipTests>` in the pom, or `-x compileTestJava` for Gradle.";
+
 struct JavaPhaseB;
 
 impl Plugin for JavaPhaseB {
@@ -74,7 +90,15 @@ impl Plugin for JavaPhaseB {
             run_scip_java(&req.root, req.corpus.as_str())
         };
         match result {
-            Ok(resp) => resp,
+            Ok(mut resp) => {
+                travsr_lang_scip_reader::warn_if_test_scope_dark(
+                    Language::Java,
+                    req.files.as_deref(),
+                    &mut resp,
+                    TEST_SCOPE_CAUSE_HINT,
+                );
+                resp
+            }
             Err(e) => {
                 tracing::warn!("scip-java failed for {}: {e:#}", req.root.display());
                 InvokeResponse::default()
@@ -118,11 +142,87 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let scratch = tempfile::tempdir().context("failed to create temp dir")?;
     let output_path = scratch.path().join("index.scip");
 
+    // Maven: ask for `test-compile` explicitly instead of letting scip-java run
+    // the project's default lifecycle.
+    //
+    // Two things go wrong with the default. It runs far past what SemanticDB
+    // needs, so a goal that has nothing to do with indexing can fail the whole
+    // run: on the pinned JSON-java fixture it reached maven-gpg-plugin and died
+    // with `Cannot run program "gpg"`, producing an empty index and a Phase B
+    // that knew nothing about the repo. And a project that skips test
+    // compilation (`-Dmaven.test.skip=true` in `.mvn/maven.config`, a common
+    // way to make such a build pass) never compiles its tests, so SemanticDB,
+    // being a javac plugin, sees none of them and no call site in any test file
+    // reaches the graph.
+    //
+    // `test-compile` is the earliest phase that compiles BOTH source roots and
+    // it runs no tests, no javadoc, no signing and no deploy. Measured on that
+    // fixture: the default fails outright, `test-compile` succeeds and the index
+    // gains 59 test files.
+    //
+    // There is deliberately no fallback to the default lifecycle when
+    // `test-compile` fails. The default is a superset of `test-compile`, so it
+    // cannot succeed where `test-compile` failed on the test sources, which is
+    // the only case a fallback would be for. What it would do is run the rest of
+    // the project's own lifecycle inside the sandbox: its tests, and any verify,
+    // signing or deploy plugin, all repo-controlled. That is the exact
+    // invocation this call was written to stop making. When a repo's test scope
+    // does not compile, the `test-scope-dark` diagnostic from the SCIP ingest
+    // says so.
+    //
+    // `clean` and `--batch-mode` have to be passed here because a build command
+    // given to scip-java REPLACES its default one, it does not extend it:
+    // `IndexCommand.finalBuildCommand` returns the default
+    // (`--batch-mode clean verify -DskipTests`) only when the build command is
+    // empty. So anything the default supplied and this still needs must be
+    // repeated.
+    //
+    // `clean` is the load-bearing one. scip-java always passes
+    // `-Dmaven.compiler.useIncrementalCompilation=false`, which selects
+    // maven-compiler-plugin's stale-source check, so only sources newer than
+    // their class files recompile. This sidecar runs on the developer's live
+    // working tree, where an already-built `target/classes` is the normal case,
+    // not the edge case. Without `clean` maven then logs "Nothing to compile",
+    // javac never runs, SemanticDB writes no `.semanticdb`, scip-java still
+    // exits 0, and Phase B reports success with zero nodes.
+    //
+    // `--batch-mode` because the sandbox gives maven no terminal: interactive
+    // mode colours the output with escape codes and can stop on a prompt that
+    // nothing will ever answer.
+    //
+    // The leading `--` is required. Without it scip-java's own parser claims
+    // `--batch-mode` and exits with "no such option"; `--` ends its options so
+    // the rest is passed through to maven.
+    //
+    // `verify` and `-DskipTests` are deliberately not restored: dropping
+    // `verify` is the whole point of naming a phase here, and `test-compile`
+    // runs no tests, so skipping them is moot.
+    let maven = matches!(detect_build_system(root), Some(BuildSystem::Maven));
     let mut cmd = std::process::Command::new(bin);
-    cmd.arg("index")
-        .arg("--output")
-        .arg(&output_path)
-        .current_dir(root);
+    cmd.arg("index").arg("--output").arg(&output_path);
+    if maven {
+        // `-Dmaven.clean.failOnError=false` is what lets `clean` run inside the
+        // sandbox. The host grants `target/` as a bind over a read-only repo
+        // root, so maven-clean-plugin can delete everything INSIDE target/ but
+        // not the `target` directory itself, and by default that one failure is
+        // fatal: "Failed to delete /repo/target", BUILD FAILURE, no index.
+        //
+        // Measured on Linux (bwrap, arm64, maven 3.9): with the flag, clean
+        // still clears the contents, the undeletable directory degrades to a
+        // WARNING, javac runs and the build succeeds. Contents are all `clean`
+        // was ever needed for here: scip-java passes
+        // `-Dmaven.compiler.useIncrementalCompilation=false`, which selects the
+        // stale-source check, and clearing the classes is what makes every
+        // source stale again.
+        cmd.args([
+            "--",
+            "--batch-mode",
+            "-Dmaven.clean.failOnError=false",
+            "clean",
+            "test-compile",
+        ]);
+    }
+    cmd.current_dir(root);
     run_to_completion(cmd, "scip-java")?;
 
     let output_size = std::fs::metadata(&output_path)
@@ -465,6 +565,14 @@ fn jar_exe() -> Option<PathBuf> {
 /// EOF, which the child reaching exit (or being killed) produces by closing its
 /// write ends.
 fn run_to_completion(mut cmd: std::process::Command, what: &str) -> anyhow::Result<()> {
+    // Put the build in its own process group so the timeout path can signal the
+    // whole tree. `Child::kill` reaches only the launcher; the JVM it starts, and
+    // the `mvn`/`gradle` JVM under that, are what actually keep running.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
     let mut child = cmd
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -502,6 +610,15 @@ fn run_to_completion(mut cmd: std::process::Command, what: &str) -> anyhow::Resu
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 kill_process_tree(&mut child);
+                // Reap it: `Child::drop` does not wait, so bailing straight out
+                // left a zombie behind. The drain threads are deliberately NOT
+                // joined here. A grandchild that outlived the tree kill still
+                // holds the write end of its pipe, and joining would then block
+                // this sidecar until the host's own watchdog fired, turning one
+                // language's clean failure into a crash that discards the whole
+                // invoke. A detached thread on an abandoned process is a bounded
+                // leak for the rest of this invocation; a wedged sidecar is not.
+                let _ = child.wait();
                 anyhow::bail!("{what} timed out after {TIMEOUT_SECS}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(200)),
@@ -530,10 +647,16 @@ fn tail_lines(stderr: &str, stdout: &str) -> String {
     };
     const MAX: usize = 4000;
     if src.len() <= MAX {
-        src.to_string()
-    } else {
-        format!("…{}", &src[src.len() - MAX..])
+        return src.to_string();
     }
+    // Slicing a `&str` at a raw byte offset panics when the offset lands inside a
+    // multibyte character, which any build printing a non-ASCII path or a
+    // localized JVM message can produce. Walk forward to the next boundary.
+    let mut start = src.len() - MAX;
+    while start < src.len() && !src.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &src[start..])
 }
 
 /// Strip the Windows extended-length verbatim prefix (`\\?\`, `\\?\UNC\`).
@@ -551,14 +674,32 @@ fn strip_windows_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
-/// Terminate a spawned build process and its descendants. On Windows,
-/// `Child::kill` terminates only the immediate child (the gradlew launcher),
-/// leaving the Gradle/JVM grandchildren running; `taskkill /T` kills the tree.
+/// Terminate a spawned build process and its descendants. `Child::kill`
+/// terminates only the immediate child (the gradlew/mvn launcher), leaving the
+/// Gradle/JVM grandchildren running: on Windows `taskkill /T` kills the tree,
+/// and on unix `run_to_completion` gives the child its own process group, so a
+/// negative pid signals every descendant that has not left it.
+///
+/// PRECONDITION (unix): `child` MUST have been spawned with
+/// `process_group(0)`. `run_to_completion` is the only spawner here and does
+/// set it. Without it the child stays in THIS process's group, `-child.id()`
+/// names that group, and the `kill -9` below takes the sidecar down with the
+/// build it was trying to stop. Any new caller must set it too.
 fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
         let _ = std::process::Command::new("taskkill")
             .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    #[cfg(unix)]
+    {
+        // `kill(2)` needs either libc or nix, neither of which this crate
+        // depends on, so shell out the same way the Windows branch does.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &format!("-{}", child.id())])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status();
@@ -571,7 +712,11 @@ fn main() {
         .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("travsr_lang_java=info".parse().unwrap()),
+                .add_directive("travsr_lang_java=info".parse().unwrap())
+                // The shared SCIP ingest crate is a different tracing target, so
+                // without this its own diagnostics (empty index, test-blind
+                // index) are filtered out and never reach stderr.
+                .add_directive("travsr_lang_scip_reader=info".parse().unwrap()),
         )
         .init();
 

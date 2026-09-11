@@ -126,9 +126,25 @@ struct Output: Encodable {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/// Build identity of this emitter, reported by `--version`.
+///
+/// Keep in sync with the Cargo workspace version in `Cargo.toml`: the Rust
+/// spawner (`crates/swift`) compares this against its own package version and
+/// warns when they disagree, because `cargo build` does NOT rebuild this
+/// binary and a stale emitter is otherwise indistinguishable from a current
+/// one. Bump both together at release; CI fails when they disagree.
+let emitterVersion = "0.4.2"
+
 let args = CommandLine.arguments
+
+if args.count >= 2, args[1] == "--version" {
+    print("swift-index-emitter \(emitterVersion)")
+    exit(0)
+}
+
 guard args.count >= 3 else {
     fputs("usage: swift-index-emitter <root-path> <output-json-path>\n", stderr)
+    fputs("       swift-index-emitter --version\n", stderr)
     exit(1)
 }
 
@@ -175,13 +191,18 @@ func relativePath(_ fileURL: URL) -> String {
 
 let orderedFiles = swiftFiles.sorted(by: { $0.path < $1.path })
 
-// Pre-pass: type name → its generic parameter / associatedtype names.
+// Pre-pass: type name → its generic parameter / associatedtype names, the
+// members each type declares, and each type's supertypes. Members and
+// supertypes are collected here rather than during emission because the type
+// that declares an inherited member usually lives in a different file.
 let genericCollector = GenericCollector()
 for fileURL in orderedFiles {
     guard let source = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
     genericCollector.walk(Parser.parse(source: source))
 }
 let typeGenerics = genericCollector.typeGenerics
+let typeMembers = genericCollector.typeMembers
+let typeParents = genericCollector.typeParents
 
 // Emission pass.
 var documents: [Document] = []
@@ -197,7 +218,15 @@ for fileURL in orderedFiles {
     let relPath = relativePath(fileURL)
     let tree = Parser.parse(source: source)
     let converter = SourceLocationConverter(fileName: relPath, tree: tree)
-    let visitor = ScipVisitor(converter: converter, typeGenerics: typeGenerics)
+    let visitor = ScipVisitor(
+        converter: converter,
+        typeGenerics: typeGenerics,
+        typeMembers: typeMembers,
+        typeParents: typeParents,
+        typeGenericConstraints: genericCollector.typeGenericConstraints,
+        typePropertyTypes: genericCollector.typePropertyTypes,
+        typePaths: genericCollector.typePaths
+    )
     visitor.walk(tree)
 
     if !visitor.definitions.isEmpty || !visitor.references.isEmpty || !visitor.inheritances.isEmpty {
@@ -239,47 +268,225 @@ func isGenerated(_ name: String) -> Bool {
 /// the type it extends can live in different files.
 final class GenericCollector: SyntaxVisitor {
     var typeGenerics: [String: Set<String>] = [:]
+    /// Nesting path (`Foo`, `Outer.Inner`) -> the member names it declares,
+    /// extensions included.
+    ///
+    /// Keyed on the path and not on the simple name because two enclosing types
+    /// can declare the same nested name: with one shared table, `self.svc` in
+    /// `Outer2.Inner` read a `svc` that only `Outer1.Inner` declares and emitted
+    /// an edge to a type the source never names. `Inner`, `Options`, `Storage`
+    /// and `Configuration` are common nested names.
+    ///
+    /// A Swift static/type-method call is written on the receiver
+    /// (`Concrete.parseAsRoot()`) but the member may be declared on a supertype
+    /// or a protocol extension. The emitter keyed the symbol on the receiver, so
+    /// every inherited call named a symbol no definition carried and the wrapper
+    /// dropped it: 33% of all references on swift-argument-parser, and
+    /// `references parseAsRoot` returned 0 of its 11 caller files. Collected in
+    /// this pre-pass because the declaring type usually lives in another file.
+    var typeMembers: [String: Set<String>] = [:]
+    /// Type name -> (generic parameter or associatedtype name -> its
+    /// constraint). `T.parse()` under `<T: ParsableCommand>` is really a call on
+    /// `ParsableCommand`, so the constraint is the only real type the receiver
+    /// can name. Without it such a call names `swift::T`, which matches no
+    /// definition (or worse, an unrelated type that happens to be called `T`).
+    var typeGenericConstraints: [String: [String: String]] = [:]
+    /// Nesting path -> (property name -> the simple name of the type EXPLICITLY
+    /// declared for it). Keyed on the path for the reason `typeMembers` is.
+    /// Only annotated properties declared directly in a type's member block are
+    /// recorded: `self.foo.bar()` can only be resolved when the
+    /// source states what `foo` is, and an initializer expression is never read
+    /// as evidence of a type. Collected here because the property and the call
+    /// through it are often in different files.
+    var typePropertyTypes: [String: [String: String]] = [:]
+    /// Nesting path -> its declared superclass and conformances, extensions
+    /// included (`extension Foo: Bar` adds `Bar` to `Foo`). The parents are the
+    /// names as written, which is what an inheritance clause states; the
+    /// emission pass resolves each to a path. Walked by
+    /// `owningType(of:on:)` to find which type actually declares a member.
+    ///
+    /// An ordered array, not a `Set`: Swift seeds its `Hasher` randomly per
+    /// process, so iterating a `Set` here gave a different supertype order in
+    /// every run of the same unmodified repo. With two protocol default
+    /// implementations of one member, the breadth-first walk then picked a
+    /// different declarer, and the emitted symbol (and the edge target) flipped
+    /// between runs. Declaration order is also the right tie-break: a
+    /// superclass is written before the conformances, and the conformances in
+    /// the order the source states them.
+    var typeParents: [String: [String]] = [:]
+    /// Every nesting path declared anywhere in the repo. The emission pass needs
+    /// it to tell a name it can resolve to exactly one type from one that two
+    /// nested types share.
+    var typePaths: Set<String> = []
+    /// Enclosing nesting paths, innermost last.
     private var typeStack: [String] = []
 
     init() { super.init(viewMode: .sourceAccurate) }
 
+    /// Push `name` as a path under the enclosing type, and record it as declared.
+    private func pushType(_ name: String) {
+        let path = typeStack.isEmpty ? name : "\(typeStack[typeStack.count - 1]).\(name)"
+        typePaths.insert(path)
+        typeStack.append(path)
+    }
+
+    /// Record `Type: Parent, Other` so the member lookup can walk upward.
+    /// Keyed on the type just pushed, so call it after the push.
+    private func recordParents(_ clause: InheritanceClauseSyntax?) {
+        guard let clause = clause, let typeName = typeStack.last else { return }
+        var parents = typeParents[typeName] ?? []
+        for item in clause.inheritedTypes {
+            let name = GenericCollector.simpleName(item.type)
+            if !name.isEmpty, !parents.contains(name) { parents.append(name) }
+        }
+        typeParents[typeName] = parents
+    }
+
+    private func recordMember(_ name: String) {
+        guard let owner = typeStack.last else { return }
+        var members = typeMembers[owner] ?? []
+        members.insert(name)
+        typeMembers[owner] = members
+    }
+
+    /// Record the declared type of a property against its enclosing type, so
+    /// `self.foo` inside `struct A` never reads a `foo` declared in `struct B`.
+    private func recordPropertyType(_ name: String, _ typeName: String) {
+        guard let owner = typeStack.last, !name.isEmpty, !typeName.isEmpty else { return }
+        var props = typePropertyTypes[owner] ?? [:]
+        props[name] = typeName
+        typePropertyTypes[owner] = props
+    }
+
+    /// The last component of a nesting path: `Outer.Inner` -> `Inner`. Symbols
+    /// are emitted on this name, so a path is reduced to it before it reaches one.
+    static func rightmostName(_ path: String) -> String {
+        path.components(separatedBy: ".").last ?? path
+    }
+
+    /// The path an extension states for the type it extends: `Array<Element>` ->
+    /// `Array`, `Outer.Inner` -> `Outer.Inner`. The qualification is kept so an
+    /// extension of a nested type keys the same table its declaration does.
+    static func extendedTypePath(_ type: TypeSyntax) -> String {
+        let full = type.trimmedDescription
+        return full.components(separatedBy: "<").first ?? full
+    }
+
+    /// `Foo` from `Foo`, `Foo<T>`, `Foo?` or `Outer.Inner` (rightmost), matching
+    /// how `ScipVisitor` keys extension and nested-type symbols.
+    static func simpleName(_ type: TypeSyntax) -> String {
+        if let id = type.as(IdentifierTypeSyntax.self) { return id.name.text }
+        if let member = type.as(MemberTypeSyntax.self) { return member.name.text }
+        if let opt = type.as(OptionalTypeSyntax.self) { return simpleName(opt.wrappedType) }
+        if let iuo = type.as(ImplicitlyUnwrappedOptionalTypeSyntax.self) {
+            return simpleName(iuo.wrappedType)
+        }
+        // `Foo.Type`: a property declared as `static var asCommand:
+        // ParsableCommand.Type` is a receiver for `ParsableCommand`'s members,
+        // exactly as `ScipVisitor.simpleTypeName` already unwraps it for a
+        // parameter. Metatypes cannot appear in an inheritance clause or an
+        // extended type, so the other callers are unaffected.
+        if let meta = type.as(MetatypeTypeSyntax.self) {
+            return simpleName(meta.baseType)
+        }
+        return ""
+    }
+
+    override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
+        // Only a func directly inside a type's member block is a member. A
+        // function nested in a method body is a local that happens to sit under
+        // the same typeStack frame, and recording it made a bare call to a free
+        // function of the same name resolve to `swift::T.name` instead.
+        if node.parent?.is(MemberBlockItemSyntax.self) == true {
+            recordMember(node.name.text)
+        }
+        return .visitChildren
+    }
+
+    override func visit(_ node: VariableDeclSyntax) -> SyntaxVisitorContinueKind {
+        // A `var` directly inside a type's member block is a property; one
+        // inside a function body is a local that happens to nest under the same
+        // typeStack frame, and must not be recorded as a property of it.
+        let isProperty = node.parent?.is(MemberBlockItemSyntax.self) == true
+        guard isProperty else { return .visitChildren }
+        for binding in node.bindings {
+            if let pattern = binding.pattern.as(IdentifierPatternSyntax.self) {
+                recordMember(pattern.identifier.text)
+                if let annotation = binding.typeAnnotation {
+                    recordPropertyType(
+                        pattern.identifier.text,
+                        GenericCollector.simpleName(annotation.type)
+                    )
+                }
+            }
+        }
+        return .visitChildren
+    }
+
+    /// `extension ParsableCommand { static func parseAsRoot }` declares
+    /// `parseAsRoot` on `ParsableCommand`, which is exactly the case the
+    /// receiver-keyed symbol got wrong. Keyed on the path the extension writes,
+    /// as `ScipVisitor` does for the same declaration.
+    override func visit(_ node: ExtensionDeclSyntax) -> SyntaxVisitorContinueKind {
+        // Not pushType: an extension is not a declaration. It keys on the path
+        // it writes, which is the declaration's own path when the extended type
+        // is nested and qualified.
+        typeStack.append(GenericCollector.extendedTypePath(node.extendedType))
+        recordParents(node.inheritanceClause)
+        return .visitChildren
+    }
+    override func visitPost(_ node: ExtensionDeclSyntax) { typeStack.removeLast() }
+
     private func record(_ typeName: String, _ clause: GenericParameterClauseSyntax?) {
         guard let clause = clause else { return }
         var names = typeGenerics[typeName] ?? []
-        for param in clause.parameters { names.insert(param.name.text) }
+        var constraints = typeGenericConstraints[typeName] ?? [:]
+        for param in clause.parameters {
+            names.insert(param.name.text)
+            if let inherited = param.inheritedType {
+                let c = GenericCollector.simpleName(inherited)
+                if !c.isEmpty { constraints[param.name.text] = c }
+            }
+        }
         typeGenerics[typeName] = names
+        typeGenericConstraints[typeName] = constraints
     }
 
     override func visit(_ node: ClassDeclSyntax) -> SyntaxVisitorContinueKind {
         record(node.name.text, node.genericParameterClause)
-        typeStack.append(node.name.text)
+        pushType(node.name.text)
+        recordParents(node.inheritanceClause)
         return .visitChildren
     }
     override func visitPost(_ node: ClassDeclSyntax) { typeStack.removeLast() }
 
     override func visit(_ node: StructDeclSyntax) -> SyntaxVisitorContinueKind {
         record(node.name.text, node.genericParameterClause)
-        typeStack.append(node.name.text)
+        pushType(node.name.text)
+        recordParents(node.inheritanceClause)
         return .visitChildren
     }
     override func visitPost(_ node: StructDeclSyntax) { typeStack.removeLast() }
 
     override func visit(_ node: EnumDeclSyntax) -> SyntaxVisitorContinueKind {
         record(node.name.text, node.genericParameterClause)
-        typeStack.append(node.name.text)
+        pushType(node.name.text)
+        recordParents(node.inheritanceClause)
         return .visitChildren
     }
     override func visitPost(_ node: EnumDeclSyntax) { typeStack.removeLast() }
 
     override func visit(_ node: ActorDeclSyntax) -> SyntaxVisitorContinueKind {
         record(node.name.text, node.genericParameterClause)
-        typeStack.append(node.name.text)
+        pushType(node.name.text)
+        recordParents(node.inheritanceClause)
         return .visitChildren
     }
     override func visitPost(_ node: ActorDeclSyntax) { typeStack.removeLast() }
 
     override func visit(_ node: ProtocolDeclSyntax) -> SyntaxVisitorContinueKind {
-        typeStack.append(node.name.text)
+        pushType(node.name.text)
+        recordParents(node.inheritanceClause)
         return .visitChildren
     }
     override func visitPost(_ node: ProtocolDeclSyntax) { typeStack.removeLast() }
@@ -287,10 +494,18 @@ final class GenericCollector: SyntaxVisitor {
     // `associatedtype Element` inside a protocol is a generic-like name that
     // shows up unrestated in the protocol's own extensions / default methods.
     override func visit(_ node: AssociatedTypeDeclSyntax) -> SyntaxVisitorContinueKind {
-        if let owner = typeStack.last {
+        if let owner = typeStack.last.map(GenericCollector.rightmostName) {
             var names = typeGenerics[owner] ?? []
             names.insert(node.name.text)
             typeGenerics[owner] = names
+            if let inherited = node.inheritanceClause?.inheritedTypes.first?.type {
+                let c = GenericCollector.simpleName(inherited)
+                if !c.isEmpty {
+                    var constraints = typeGenericConstraints[owner] ?? [:]
+                    constraints[node.name.text] = c
+                    typeGenericConstraints[owner] = constraints
+                }
+            }
         }
         return .visitChildren
     }
@@ -304,9 +519,12 @@ final class ScipVisitor: SyntaxVisitor {
     var references: [Reference] = []
     var inheritances: [Inheritance] = []
 
-    // Stack of enclosing type names; extensions push the extended type name.
-    private var typeStack: [String] = []
-    private var currentType: String? { typeStack.last }
+    // Stack of enclosing types: the simple name symbols are emitted on, and the
+    // nesting path the pre-pass tables are keyed on (`Outer.Inner`). Extensions
+    // push the path they write.
+    private var typeStack: [(simple: String, path: String)] = []
+    private var currentType: String? { typeStack.last?.simple }
+    private var currentTypePath: String? { typeStack.last?.path }
 
     // Scope stack for instance-call resolution.
     // Each frame maps a local name to its simple (unqualified) type name.
@@ -348,10 +566,154 @@ final class ScipVisitor: SyntaxVisitor {
         "UnsafePointer": ["Pointee"], "UnsafeMutablePointer": ["Pointee"],
     ]
 
-    init(converter: SourceLocationConverter, typeGenerics: [String: Set<String>] = [:]) {
+    /// From the pre-pass: which type declares which members, and each type's
+    /// supertypes, keyed on the nesting path. Used by `owningType(of:on:)`.
+    private let typeMembers: [String: Set<String>]
+    private let typeParents: [String: [String]]
+    private let typeGenericConstraints: [String: [String: String]]
+    /// From the pre-pass: each type's properties whose type is explicitly
+    /// declared in source. Used to resolve `self.<property>.<method>()`.
+    private let typePropertyTypes: [String: [String: String]]
+    /// From the pre-pass: every declared nesting path, and the paths each simple
+    /// name could mean. Together they turn a name written at a call site into
+    /// the table key it means, or into nothing when it is ambiguous.
+    private let typePaths: Set<String>
+    private let pathsBySimpleName: [String: [String]]
+    /// Parallel to `genericParamStack`: the constraint for each generic name in
+    /// that frame, when it declared one.
+    private var genericConstraintStack: [[String: String]] = []
+
+    init(
+        converter: SourceLocationConverter,
+        typeGenerics: [String: Set<String>] = [:],
+        typeMembers: [String: Set<String>] = [:],
+        typeParents: [String: [String]] = [:],
+        typeGenericConstraints: [String: [String: String]] = [:],
+        typePropertyTypes: [String: [String: String]] = [:],
+        typePaths: Set<String> = []
+    ) {
         self.converter = converter
         self.typeGenerics = typeGenerics
+        self.typeMembers = typeMembers
+        self.typeParents = typeParents
+        self.typeGenericConstraints = typeGenericConstraints
+        self.typePropertyTypes = typePropertyTypes
+        self.typePaths = typePaths
+        var bySimpleName: [String: [String]] = [:]
+        for path in typePaths.sorted() {
+            bySimpleName[GenericCollector.rightmostName(path), default: []].append(path)
+        }
+        self.pathsBySimpleName = bySimpleName
         super.init(viewMode: .sourceAccurate)
+    }
+
+    /// Push an enclosing type: `name` is what symbols are emitted on, the path
+    /// is what the pre-pass tables are keyed on.
+    private func pushType(_ name: String) {
+        let path = typeStack.isEmpty ? name : "\(typeStack[typeStack.count - 1].path).\(name)"
+        typeStack.append((simple: name, path: path))
+    }
+
+    /// The pre-pass keys a written type name could mean: the path itself when
+    /// the source writes one, every declared path ending in that name otherwise,
+    /// and the name itself when the repo declares no such type, which is where
+    /// an extension of an outside type (`extension String`) records its members.
+    ///
+    /// More than one only when two nested types under different enclosing types
+    /// share a simple name (`Inner`, `Options`, `Storage`, `Configuration`).
+    /// Callers ask every one of them and answer only when they agree, so a name
+    /// the source does not pin down produces nothing rather than one of the two.
+    private func candidateTypeKeys(_ name: String) -> [String] {
+        if typePaths.contains(name) { return [name] }
+        let simple = GenericCollector.rightmostName(name)
+        let matches = pathsBySimpleName[simple] ?? []
+        return matches.isEmpty ? [simple] : matches
+    }
+
+    /// The key of the type that declares `member`, starting at `start` and
+    /// walking its supertypes breadth-first so the nearest declarer wins. A
+    /// supertype is named as written in the inheritance clause, so each name is
+    /// expanded to the keys it could mean, in declaration order.
+    ///
+    /// nil when nothing in the chain declares it, i.e. an external or stdlib
+    /// member.
+    private func declarerKey(of member: String, startingAt start: String) -> String? {
+        if typeMembers[start]?.contains(member) == true { return start }
+        var seen: Set<String> = [start]
+        var queue = (typeParents[start] ?? []).flatMap(candidateTypeKeys)
+        while !queue.isEmpty {
+            let t = queue.removeFirst()
+            if !seen.insert(t).inserted { continue }
+            if typeMembers[t]?.contains(member) == true { return t }
+            queue.append(contentsOf: (typeParents[t] ?? []).flatMap(candidateTypeKeys))
+        }
+        return nil
+    }
+
+    /// The name the symbol of `member` is emitted on when the receiver is
+    /// `recv`, or nil when the source does not settle it: nothing in the chain
+    /// declares `member`, or `recv` names two nested types that declare it on
+    /// different types.
+    private func declaringTypeName(of member: String, on recv: String) -> String? {
+        var answer: String?
+        for key in candidateTypeKeys(recv) {
+            guard let found = declarerKey(of: member, startingAt: key) else { return nil }
+            let name = GenericCollector.rightmostName(found)
+            if let previous = answer, previous != name { return nil }
+            answer = name
+        }
+        return answer
+    }
+
+    /// The name to emit the symbol of `member` on, given the receiver `recv`.
+    ///
+    /// Falls back to `recv`'s own name when `declaringTypeName` cannot settle it.
+    /// That keeps the existing behaviour for an external or stdlib member: the
+    /// symbol names no definition, the wrapper drops it, and the miss stays a
+    /// safe miss rather than becoming a wrong edge.
+    private func owningType(of member: String, on recv: String) -> String {
+        declaringTypeName(of: member, on: recv) ?? GenericCollector.rightmostName(recv)
+    }
+
+    /// The type explicitly declared for property `member` of `recv`, and the key
+    /// of the type that declares it, walking `recv`'s supertypes breadth-first as
+    /// `declarerKey(of:startingAt:)` does, so a property declared on a base class
+    /// or a protocol resolves too. The declaring type is returned because only its
+    /// own generic parameters say whether the declared type names a real type.
+    ///
+    /// `nil` when nothing in the chain declares `member` with an explicit type
+    /// annotation. That is the point: an inferred property type is not knowable
+    /// at parse level, and the emitter says nothing rather than guessing one
+    /// from the initializer expression or from the property name.
+    private func declaredPropertyType(
+        of member: String, on recv: String
+    ) -> (type: String, declaredBy: String)? {
+        var answer: (type: String, declaredBy: String)?
+        for key in candidateTypeKeys(recv) {
+            guard let found = declaredPropertyType(of: member, startingAt: key) else { return nil }
+            if let previous = answer, previous != found { return nil }
+            answer = found
+        }
+        return answer
+    }
+
+    private func declaredPropertyType(
+        of member: String, startingAt start: String
+    ) -> (type: String, declaredBy: String)? {
+        if let declared = typePropertyTypes[start]?[member] {
+            return (type: declared, declaredBy: start)
+        }
+        var seen: Set<String> = [start]
+        var queue = (typeParents[start] ?? []).flatMap(candidateTypeKeys)
+        while !queue.isEmpty {
+            let t = queue.removeFirst()
+            if !seen.insert(t).inserted { continue }
+            if let declared = typePropertyTypes[t]?[member] {
+                return (type: declared, declaredBy: t)
+            }
+            queue.append(contentsOf: (typeParents[t] ?? []).flatMap(candidateTypeKeys))
+        }
+        return nil
     }
 
     private func colOf(_ node: some SyntaxProtocol) -> Int {
@@ -416,13 +778,20 @@ final class ScipVisitor: SyntaxVisitor {
     private func pushGenerics(_ clause: GenericParameterClauseSyntax?) {
         guard let clause = clause else {
             genericParamStack.append([])
+            genericConstraintStack.append([:])
             return
         }
         var names: Set<String> = []
+        var constraints: [String: String] = [:]
         for param in clause.parameters {
             names.insert(param.name.text)
+            if let inherited = param.inheritedType {
+                let c = GenericCollector.simpleName(inherited)
+                if !c.isEmpty { constraints[param.name.text] = c }
+            }
         }
         genericParamStack.append(names)
+        genericConstraintStack.append(constraints)
         // Recorded after the frame is pushed so a constraint that mentions an
         // earlier parameter of the same clause is not emitted as a type.
         for param in clause.parameters {
@@ -430,7 +799,32 @@ final class ScipVisitor: SyntaxVisitor {
         }
     }
 
+    /// Record `where A: P` as A's constraint, exactly as `<A: P>` is recorded.
+    ///
+    /// Both spellings are the same statement about A, but only the inline one
+    /// reached `genericConstraint`, so a receiver declared `A.Type` under a
+    /// where clause resolved to nothing at all.
+    ///
+    /// Only a bare identifier on the left is taken, and only when it is already
+    /// a generic parameter in scope. `where A.Element: P` constrains an
+    /// associated type of A, not a parameter called `Element`, and binding that
+    /// name would be the guess this emitter exists not to make. An inline
+    /// constraint on the same name wins, since it is the one the declaration
+    /// itself states.
+    private func noteWhereConstraint(_ left: TypeSyntax, _ right: TypeSyntax) {
+        guard let id = left.as(IdentifierTypeSyntax.self), isGenericParam(id.name.text) else {
+            return
+        }
+        let constraint = simpleTypeName(right)
+        guard !constraint.isEmpty, !genericConstraintStack.isEmpty else { return }
+        let top = genericConstraintStack.count - 1
+        if genericConstraintStack[top][id.name.text] == nil {
+            genericConstraintStack[top][id.name.text] = constraint
+        }
+    }
+
     private func popGenerics() {
+        if !genericConstraintStack.isEmpty { genericConstraintStack.removeLast() }
         if !genericParamStack.isEmpty { genericParamStack.removeLast() }
     }
 
@@ -444,6 +838,15 @@ final class ScipVisitor: SyntaxVisitor {
         let fromDecl = typeGenerics[simpleName] ?? []
         let fromStdlib = Self.stdlibTypeGenerics[simpleName] ?? []
         genericParamStack.append(fromDecl.union(fromStdlib))
+        genericConstraintStack.append(typeGenericConstraints[simpleName] ?? [:])
+    }
+
+    /// The constraint a generic parameter or associatedtype declared, if any.
+    private func genericConstraint(_ name: String) -> String? {
+        for frame in genericConstraintStack.reversed() {
+            if let c = frame[name] { return c }
+        }
+        return nil
     }
 
     private func isGenericParam(_ name: String) -> Bool {
@@ -451,6 +854,36 @@ final class ScipVisitor: SyntaxVisitor {
             return true
         }
         return false
+    }
+
+    /// Whether `name` is a generic parameter or associatedtype of the type at
+    /// `path`, or of a type it nests in, which may lend its parameters to it.
+    ///
+    /// The frame-based `isGenericParam` above asks about the type being visited,
+    /// which is the wrong question for a property found on a supertype:
+    /// `class Sub: Base<Int>` inheriting `var command: Command` from
+    /// `class Base<Command>` passed that guard, and `self.command.run()` then
+    /// resolved to whatever real type happens to be called `Command`.
+    private func isGenericParam(_ name: String, ofTypeAt path: String) -> Bool {
+        // Generic names are collected per simple type name, so each component of
+        // the path is asked for its own.
+        for component in path.components(separatedBy: ".") {
+            if typeGenerics[component]?.contains(name) == true { return true }
+        }
+        return false
+    }
+
+    /// The real type a written receiver type names, or nil when it names none.
+    ///
+    /// A local declared `t: T` (or `t: T.Type`) under `<T: Command>` holds a
+    /// generic parameter, not a type: the constraint is the only real type the
+    /// receiver can name, and with no constraint there is nothing to say. The
+    /// `T.parse()` receiver branches already apply this rule; the typed-local
+    /// branch did not, and unwrapping `T.Type` made that reachable, so `t.run()`
+    /// named `swift::T.run` and any repo type called `T` collected the edge.
+    private func receiverType(_ written: String) -> String? {
+        guard isGenericParam(written) else { return written }
+        return genericConstraint(written)
     }
 
     // ── Type name extraction ───────────────────────────────────────────────────
@@ -470,6 +903,16 @@ final class ScipVisitor: SyntaxVisitor {
         }
         if let iuo = type.as(ImplicitlyUnwrappedOptionalTypeSyntax.self) {
             return simpleTypeName(iuo.wrappedType)
+        }
+        // `Foo.Type` (a metatype) is how a caller passes a type to dispatch
+        // statically on: `func f(_ root: ParsableCommand.Type)` then
+        // `root.parseAsRoot(args)`. Unwrapping to `Foo` makes the receiver
+        // resolvable; the emitted symbol is the same `swift::Foo.member` shape a
+        // static call on the type itself produces. Left unhandled, the binding
+        // was never recorded, the receiver looked like an untyped local, and the
+        // call was dropped.
+        if let meta = type.as(MetatypeTypeSyntax.self) {
+            return simpleTypeName(meta.baseType)
         }
         return ""
     }
@@ -565,6 +1008,7 @@ final class ScipVisitor: SyntaxVisitor {
             case .conformanceRequirement(let c):
                 recordTypeReference(c.leftType)
                 recordTypeReference(c.rightType)
+                noteWhereConstraint(c.leftType, c.rightType)
             case .sameTypeRequirement(let s):
                 recordTypeReference(s.leftType)
                 recordTypeReference(s.rightType)
@@ -628,7 +1072,7 @@ final class ScipVisitor: SyntaxVisitor {
         pushGenerics(node.genericParameterClause)
         recordWhereClause(node.genericWhereClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
-        typeStack.append(name)
+        pushType(name)
         return .visitChildren
     }
     override func visitPost(_ node: ClassDeclSyntax) {
@@ -642,7 +1086,7 @@ final class ScipVisitor: SyntaxVisitor {
         pushGenerics(node.genericParameterClause)
         recordWhereClause(node.genericWhereClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
-        typeStack.append(name)
+        pushType(name)
         return .visitChildren
     }
     override func visitPost(_ node: StructDeclSyntax) {
@@ -656,7 +1100,7 @@ final class ScipVisitor: SyntaxVisitor {
         pushGenerics(node.genericParameterClause)
         recordWhereClause(node.genericWhereClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
-        typeStack.append(name)
+        pushType(name)
         return .visitChildren
     }
     override func visitPost(_ node: EnumDeclSyntax) {
@@ -672,9 +1116,13 @@ final class ScipVisitor: SyntaxVisitor {
         // as a frame to keep `func f() -> Element` from referencing a real type
         // named Element.
         genericParamStack.append(typeGenerics[name] ?? [])
+        // Paired with the frame above: `popGenerics` removes one from each
+        // stack, so pushing only the names left every constraint frame inside a
+        // protocol body belonging to an enclosing declaration.
+        genericConstraintStack.append(typeGenericConstraints[name] ?? [:])
         recordWhereClause(node.genericWhereClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
-        typeStack.append(name)
+        pushType(name)
         return .visitChildren
     }
     override func visitPost(_ node: ProtocolDeclSyntax) {
@@ -688,7 +1136,7 @@ final class ScipVisitor: SyntaxVisitor {
         pushGenerics(node.genericParameterClause)
         recordWhereClause(node.genericWhereClause)
         emitInheritances(for: name, clause: node.inheritanceClause)
-        typeStack.append(name)
+        pushType(name)
         return .visitChildren
     }
     override func visitPost(_ node: ActorDeclSyntax) {
@@ -704,9 +1152,8 @@ final class ScipVisitor: SyntaxVisitor {
         // how nested type definitions are emitted (`swift::Inner`); otherwise the
         // members and the IsImplementation child would name `swift::Outer.Inner`,
         // which no definition carries and the wrapper drops.
-        let fullName = node.extendedType.trimmedDescription
-        let strippedGenerics = fullName.components(separatedBy: "<").first ?? fullName
-        let typeName = strippedGenerics.components(separatedBy: ".").last ?? strippedGenerics
+        let extendedPath = GenericCollector.extendedTypePath(node.extendedType)
+        let typeName = GenericCollector.rightmostName(extendedPath)
         // #830: the extended type is itself a type-position use, and an
         // extension's inheritance clause is a real conformance. Neither was
         // recorded, so `extension Foo: Proto {}` was invisible to both
@@ -719,7 +1166,9 @@ final class ScipVisitor: SyntaxVisitor {
         // never restated by the extension, so bring them in before visiting it.
         pushExtensionGenerics(typeName)
         recordWhereClause(node.genericWhereClause)
-        typeStack.append(typeName)
+        // The path as written is the table key the pre-pass used; the rightmost
+        // name is what symbols are emitted on.
+        typeStack.append((simple: typeName, path: extendedPath))
         return .visitChildren
     }
     override func visitPost(_ node: ExtensionDeclSyntax) {
@@ -752,7 +1201,7 @@ final class ScipVisitor: SyntaxVisitor {
         ))
         pushScope()
         pushGenerics(node.genericParameterClause)
-        if let t = currentType { bindLocal("self", type: t) }
+        if let t = currentTypePath { bindLocal("self", type: t) }
         bindParameters(node.signature.parameterClause.parameters)
         // #830: the declared return type is a use of that type.
         recordTypeReference(node.signature.returnClause?.type)
@@ -776,7 +1225,7 @@ final class ScipVisitor: SyntaxVisitor {
         }
         pushScope()
         pushGenerics(node.genericParameterClause)
-        if let t = currentType { bindLocal("self", type: t) }
+        if let t = currentTypePath { bindLocal("self", type: t) }
         bindParameters(node.signature.parameterClause.parameters)
         recordWhereClause(node.genericWhereClause)
         return .visitChildren
@@ -912,21 +1361,46 @@ final class ScipVisitor: SyntaxVisitor {
                         // Checked before the uppercase heuristic so an uppercase-named
                         // local (`let Config = …; Config.count`) is resolved as an
                         // instance access, not mistaken for a static access on a type.
-                        references.append(Reference(
-                            symbol: "swift::\(resolvedType).\(memberName)",
-                            line: ln,
-                            col: cl
-                        ))
+                        // Keyed on the declaring type, as in the static path: a
+                        // typed local calling an inherited member is the same
+                        // problem as `Concrete.inheritedStatic()`.
+                        if let recv = receiverType(resolvedType) {
+                            references.append(Reference(
+                                symbol: "swift::\(owningType(of: memberName, on: recv)).\(memberName)",
+                                line: ln,
+                                col: cl
+                            ))
+                        }
                     } else if isLocalName(baseName) {
                         // In-scope local of unknown (inferred) type: the member
                         // cannot be resolved, and the local shadows any type of the
                         // same name, so an uppercase name here is not a type access.
+                    } else if isGenericParam(baseName) {
+                        // `T.parse()` / `Command.parseAsRoot()`: the receiver is a
+                        // generic parameter or associatedtype, which names no real
+                        // type. #830's receiver capture emitted `swift::Command`
+                        // here, resolving to unrelated types that share the name.
+                        // Its constraint IS a real type and is where the member is
+                        // declared, so resolve through that; with no constraint
+                        // there is nothing to say, so say nothing. The receiver
+                        // type reference is never emitted either way.
+                        if let constraint = genericConstraint(baseName) {
+                            let owner = owningType(of: memberName, on: constraint)
+                            references.append(Reference(
+                                symbol: "swift::\(owner).\(memberName)", line: ln, col: cl))
+                        }
                     } else if baseName.first?.isUppercase == true {
-                        // Static or type method call: SomeType.method()
-                        references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln, col: cl))
+                        // Static or type method call: SomeType.method(). Keyed on
+                        // the type that DECLARES the member, which for an
+                        // inherited or protocol-extension member is not the
+                        // receiver written at the call site.
+                        let owner = owningType(of: memberName, on: baseName)
+                        references.append(Reference(symbol: "swift::\(owner).\(memberName)", line: ln, col: cl))
                         // #830: the receiver type itself is used here too, so a
                         // query for `SomeType` finds this qualified access. #813: the
                         // column names the receiver type, so point at the base.
+                        // Stays keyed on the receiver as written: that is the type
+                        // the source names here.
                         if !Self.builtinTypes.contains(baseName) {
                             references.append(Reference(
                                 symbol: "swift::\(baseName)", line: ln,
@@ -934,8 +1408,38 @@ final class ScipVisitor: SyntaxVisitor {
                         }
                     }
                     // Unresolvable (inferred-type local, chained call): skip rather than guess.
+                } else if let propertyAccess = base.as(MemberAccessExprSyntax.self),
+                          let propertyBase = propertyAccess.base?
+                              .as(DeclReferenceExprSyntax.self),
+                          propertyBase.baseName.text == "self",
+                          let selfType = lookupType("self"),
+                          let property = declaredPropertyType(
+                              of: propertyAccess.declName.baseName.text,
+                              on: selfType
+                          ),
+                          !isGenericParam(property.type, ofTypeAt: property.declaredBy) {
+                    // `self.<property>.<method>()`. The receiver is one level of
+                    // member access deeper than the paths above, so it fell into
+                    // the complex-base skip: `self.asCommand.parseAsRoot(...)`
+                    // was the last miss on swift-argument-parser. Resolvable only
+                    // when the property's own type is written in source, which
+                    // the pre-pass table records per enclosing type. Keyed on the
+                    // declaring type as every other resolved path is, so an
+                    // inherited or protocol-extension member still lands on the
+                    // symbol its definition carries.
+                    // A property whose declared type is a generic parameter of the
+                    // type that declares it (`struct Box<Element> { var item:
+                    // Element }`) names no real type, so `self.item.foo()` must not
+                    // resolve to a repo type that happens to be called `Element`.
+                    // Same guard the sibling receiver branches apply, asked of the
+                    // declaring type because the property can come from a supertype.
+                    references.append(Reference(
+                        symbol: "swift::\(owningType(of: memberName, on: property.type)).\(memberName)",
+                        line: ln,
+                        col: cl
+                    ))
                 }
-                // Complex base (subscript, nested call, etc.): skip.
+                // Complex base (subscript, nested call, deeper chain): skip.
             } else {
                 // No explicit base → implicit self inside a method body.
                 if let t = currentType {
@@ -948,7 +1452,11 @@ final class ScipVisitor: SyntaxVisitor {
             // bare `Foo()` / `foo()`, but stated the same way as the member
             // paths above so the rule does not have to be re-derived.
             let cl = colOf(declRef.baseName)
-            if name.first?.isUppercase == true {
+            if isGenericParam(name) {
+                // `T(argument:)` constructs whatever the generic parameter is
+                // bound to, which is not a type named `T`. Emitting it made
+                // `references T` resolve to unrelated types that share the name.
+            } else if name.first?.isUppercase == true {
                 // Constructor call: MyType() → the type itself, not its `.init`
                 // member (#449). find_references/get_callers query by type name
                 // ("ClassA", not "ClassA.init"), and every type is guaranteed to
@@ -956,6 +1464,15 @@ final class ScipVisitor: SyntaxVisitor {
                 // declares an explicit initializer, unlike `.init`, which only
                 // exists in def_ids when the type has one.
                 references.append(Reference(symbol: "swift::\(name)", line: ln, col: cl))
+            } else if let t = currentTypePath,
+                      let owner = declaringTypeName(of: name, on: t) {
+                // Bare `foo()` inside a type or extension body is implicit-self
+                // or same-type static dispatch, not a top-level function:
+                // `parseAsRoot(arguments)` inside `extension ParsableCommand`
+                // named `swift::parseAsRoot`, which no definition carries. Only
+                // taken when the enclosing type's chain really declares it,
+                // otherwise it is a free function and keeps the bare symbol.
+                references.append(Reference(symbol: "swift::\(owner).\(name)", line: ln, col: cl))
             } else {
                 // Top-level or local function call: foo()
                 references.append(Reference(symbol: "swift::\(name)", line: ln, col: cl))
@@ -988,13 +1505,29 @@ final class ScipVisitor: SyntaxVisitor {
             // Property access on an explicitly-typed local: svc.total. Checked
             // before the uppercase heuristic so an uppercase-named local
             // (`let Config: Foo = …; Config.count`) is not mistaken for a type access.
-            references.append(Reference(symbol: "swift::\(resolvedType).\(memberName)", line: ln, col: cl))
+            // Through receiverType for the same reason the call path is: a local
+            // whose written type is a generic parameter names no real type.
+            if let recv = receiverType(resolvedType) {
+                references.append(Reference(
+                    symbol: "swift::\(owningType(of: memberName, on: recv)).\(memberName)",
+                    line: ln, col: cl))
+            }
         } else if isLocalName(baseName) {
             // In-scope local of unknown (inferred) type: it shadows any type of the
             // same name, so an uppercase base here is not a static type access.
+        } else if isGenericParam(baseName) {
+            // Generic parameter / associatedtype receiver: names no real type.
+            // See the matching branch in the call path.
+            if let constraint = genericConstraint(baseName) {
+                let owner = owningType(of: memberName, on: constraint)
+                references.append(Reference(
+                    symbol: "swift::\(owner).\(memberName)", line: ln, col: cl))
+            }
         } else if baseName.first?.isUppercase == true {
             // Static member access without a call: ClassC.shared, Color.red.
-            references.append(Reference(symbol: "swift::\(baseName).\(memberName)", line: ln, col: cl))
+            // Keyed on the declaring type, as in the call path.
+            let owner = owningType(of: memberName, on: baseName)
+            references.append(Reference(symbol: "swift::\(owner).\(memberName)", line: ln, col: cl))
             // #830: the receiver type itself is used here too. #813: the column
             // names the receiver type, so point at the base.
             if !Self.builtinTypes.contains(baseName) {

@@ -440,6 +440,38 @@ cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 ```
 
+### The two emitters cargo does not build
+
+`cargo build --workspace` builds every Rust crate, but the Swift and Dart
+analyzers are not Rust. `crates/swift` and `crates/dart` are thin spawners; the
+code that actually reads source lives in:
+
+| Package | Build | Installed as |
+|---|---|---|
+| `packages/swift-index-emitter` | `cd packages/swift-index-emitter && swift build -c release` | `~/.travsr/bin/travsr-swift-index-emitter` |
+| `packages/dart-scip-emitter` | `cd packages/dart-scip-emitter && dart compile exe bin/emit.dart -o bin/emit-native` | `~/.travsr/bin/travsr-dart-index-emitter` |
+
+So a `cargo build` after editing `Sources/main.swift` or `bin/emit.dart` gives
+you a new spawner talking to the old emitter. The output stays well formed, so
+nothing looks wrong: you are simply measuring code you did not build. Rebuild
+the emitter and copy it over `~/.travsr/bin/travsr-<lang>-index-emitter`
+whenever you touch it.
+
+Each spawner asks its emitter for `--version` on the first invoke and logs the
+resolved path and version at info, warning when the emitter reports a different
+version than the sidecar or does not understand the flag at all (an emitter that
+predates the handshake). The version string lives in the emitter source
+(`emitterVersion` in `Sources/main.swift` and `bin/emit.dart`, plus `version:`
+in `packages/dart-scip-emitter/pubspec.yaml`) and must be bumped alongside the
+Cargo workspace version at release. CI fails the build when any of the three
+disagrees with `Cargo.toml`, so a forgotten bump is caught before it makes every
+freshly built emitter report a skew that is not real.
+
+The Swift emitter's symbol resolution has unit tests: `cd
+packages/swift-index-emitter && swift test`. They pin the resolution rules
+rather than the reference count, which does not move when a resolution change
+retargets a symbol.
+
 ---
 
 ## Security

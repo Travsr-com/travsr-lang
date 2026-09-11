@@ -19,5 +19,14 @@ let package = Package(
             ],
             path: "Sources"
         ),
+        .testTarget(
+            name: "swift-index-emitterTests",
+            dependencies: [
+                "swift-index-emitter",
+                .product(name: "SwiftSyntax", package: "swift-syntax"),
+                .product(name: "SwiftParser", package: "swift-syntax"),
+            ],
+            path: "Tests"
+        ),
     ]
 )

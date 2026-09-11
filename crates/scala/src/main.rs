@@ -23,15 +23,48 @@
 //! ```
 
 use anyhow::Context as _;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 use travsr_core::{Edge, EdgeKind, Node, NodeId, ScipRef, VName};
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
+    PluginDiagnostic,
 };
 
-const TIMEOUT_SECS: u64 = 600;
+/// The plugin host watchdogs one Phase B `invoke` at `INVOKE_TIMEOUT_SECS`
+/// (travsr-plugin-host `transport.rs`) and SIGKILLs past it, discarding
+/// everything the sidecar collected. Every wait in this process has to fit
+/// inside that window, or a reportable failure turns into a crash with no index
+/// and no reason for it. Same name and same reasoning as the kotlin sidecar,
+/// which already solved this, so the two agree.
+const HOST_INVOKE_TIMEOUT_SECS: u64 = 300;
+/// Kept back from the host's window so that giving up still leaves time to build
+/// the response and write it out. A killed invoke reports nothing at all, so the
+/// diagnostics and the error string go with it.
+const HOST_REPLY_MARGIN_SECS: u64 = 15;
+/// Kept back on top of the reply margin for the work that follows the compile:
+/// `find_semanticdb_files` walks the whole sbt tree, then every file it found is
+/// read and protobuf-parsed (150 of them on the pinned scala-parser-combinators
+/// fixture). 60s is the reserve the old 180 + 60 split implied without naming it.
+const POST_COMPILE_RESERVE_SECS: u64 = 60;
+/// Ceiling on one `sbt compile`, clamped by `attempt_budget_secs` to what is
+/// really left of the run's deadline. It is the whole of the compile window
+/// today (300 - 15 - 60): a cold build resolving a fresh dependency tree through
+/// coursier needs most of that, and the old 180 failed such builds outright
+/// under a host ceiling that would have allowed them. Nothing is held back for a
+/// second attempt, because a timeout ends the run: `run_sbt_compile` bails on
+/// one, so the `!status.success()` retry below is only ever reached on a genuine
+/// non-zero exit. The clamp, not this ceiling, is what keeps the run inside the
+/// host window.
+const COMPILE_TIMEOUT_SECS: u64 = 225;
+/// Floor below which an attempt is skipped rather than started. `--server` means
+/// every attempt spawns its own sbt JVM and reloads the build before it compiles
+/// anything, so with less than this it would expire during the reload and its
+/// only effect would be to spend the reserve the scan, the parse and the reply
+/// need.
+const MIN_ATTEMPT_SECS: u64 = 45;
 // #832: enable SemanticDB across *every* project in the build, passed as an sbt
 // command rather than an injected `.sbt` setting. A bare `semanticdbEnabled :=
 // true` in a root settings file binds only to the root project, and even
@@ -62,14 +95,31 @@ impl Plugin for ScalaPhaseB {
         ParseResponse::default()
     }
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_semanticdb(&req.root, req.corpus.as_str()) {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::warn!("semanticdb failed for {}: {e}", req.root.display());
-                InvokeResponse::default()
-            }
-        }
+        // Collected outside the response so they survive the error path too, as
+        // in the php sidecar. The sbt-root caveat below is raised for a layout
+        // whose build is then expected to fail, so hanging it off the `Ok` value
+        // would drop it in exactly the case it is written for.
+        let mut diagnostics = Vec::new();
+        let result = run_semanticdb(&req.root, req.corpus.as_str(), &mut diagnostics);
+        into_response(result, &req.root, diagnostics)
     }
+}
+
+/// Folds a run's outcome and its diagnostics into one response.
+fn into_response(
+    result: anyhow::Result<InvokeResponse>,
+    root: &Path,
+    diagnostics: Vec<PluginDiagnostic>,
+) -> InvokeResponse {
+    let mut resp = match result {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!("semanticdb failed for {}: {e}", root.display());
+            InvokeResponse::default()
+        }
+    };
+    resp.diagnostics.extend(diagnostics);
+    resp
 }
 
 static SBT_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
@@ -117,14 +167,21 @@ fn find_sbt_root(root: &Path, max_depth: usize) -> Option<PathBuf> {
         }
         if depth < max_depth {
             if let Ok(entries) = std::fs::read_dir(&dir) {
-                for e in entries.flatten() {
-                    let p = e.path();
-                    if p.is_dir() {
+                // Sorted before enqueuing: `read_dir` order decides which of two
+                // sibling directories that both hold a `build.sbt` is picked as
+                // the root, and the whole index is built from that one choice.
+                let mut children: Vec<PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .filter(|p| {
                         let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                        if !matches!(name, "target" | ".git" | "node_modules" | ".travsr") {
-                            queue.push_back((p, depth + 1));
-                        }
-                    }
+                        !matches!(name, "target" | ".git" | "node_modules" | ".travsr")
+                    })
+                    .collect();
+                children.sort();
+                for p in children {
+                    queue.push_back((p, depth + 1));
                 }
             }
         }
@@ -173,6 +230,15 @@ fn find_semanticdb_files(sbt_root: &Path) -> Vec<PathBuf> {
             }
         }
     }
+    // `read_dir` hands entries back in filesystem order, so without this the
+    // documents are parsed in a different order on every run. That order is
+    // load-bearing: a cross-built sbt project compiles the SAME sources into
+    // `jvm/target`, `native/target` and `js/target`, and `build_edges` keeps the
+    // FIRST definition it sees for a symbol, so whichever variant came back
+    // first owns the def node and the `dst` of every cross-file edge flips
+    // between runs. Sorting here fixes both the parse order and the node
+    // emission order that follows it.
+    found.sort();
     found
 }
 
@@ -222,7 +288,24 @@ fn kill_process_tree(child: &mut std::process::Child) {
     let _ = child.kill();
 }
 
-fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+fn run_semanticdb(
+    root: &Path,
+    corpus: &str,
+    diagnostics: &mut Vec<PluginDiagnostic>,
+) -> anyhow::Result<InvokeResponse> {
+    // One deadline for the whole run, not a fixed budget per attempt. The host
+    // keeps nothing from an invoke it kills, so both compiles, the SemanticDB
+    // scan, the parse and the reply have to fit inside its window together, and
+    // two independent budgets cannot express that: 180 + 60 could overrun it (a
+    // non-zero exit at 170s followed by a full 60s fallback is 230s before the
+    // scan even starts) while also underspending it, since a fast failure at 20s
+    // still left the fallback only 60s of a window with 200s free.
+    let deadline = Instant::now()
+        + Duration::from_secs(
+            HOST_INVOKE_TIMEOUT_SECS
+                .saturating_sub(HOST_REPLY_MARGIN_SECS)
+                .saturating_sub(POST_COMPILE_RESERVE_SECS),
+        );
     let root_str = root.display().to_string();
     let root_stripped = strip_windows_verbatim_prefix(&root_str);
     let root = Path::new(root_stripped.as_ref());
@@ -236,12 +319,65 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     let sbt_root = find_sbt_root(root, 4)
         .ok_or_else(|| anyhow::anyhow!("no build.sbt found under {}", root.display()))?;
     tracing::info!(sbt_root = %sbt_root.display(), "found sbt project root");
+    if let Some(d) = build_root_not_granted(root, &sbt_root) {
+        diagnostics.push(d);
+    }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS);
-    let (status, stdout_out, stderr_out) = run_sbt_compile(&sbt_root, sbt_bin, deadline)?;
+    // Compile the Test configuration too. `compile` alone builds only the
+    // Compile config, so no test source ever gets a `.semanticdb` and every
+    // caller that lives in a test is invisible: on scala-parser-combinators all
+    // 78 files were `src/main` and `references parseAll` returned 0 of its 4
+    // real callers, every one of them a test. Enabling the SemanticDB *setting*
+    // in every scope (#832) does not compile test sources, it only means they
+    // would carry SemanticDB if something built them.
+    let budget = attempt_budget_secs(
+        deadline.saturating_duration_since(Instant::now()),
+        COMPILE_TIMEOUT_SECS,
+        MIN_ATTEMPT_SECS,
+    )
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "under {MIN_ATTEMPT_SECS}s of the host's {HOST_INVOKE_TIMEOUT_SECS}s invoke window \
+             was left by the time sbt could be started"
+        )
+    })?;
+    let (mut status, mut stdout_out, mut stderr_out) =
+        run_sbt_compile(&sbt_root, sbt_bin, budget, true)?;
+    if !status.success() {
+        // A repo whose tests do not compile must still get its main-scope
+        // graph rather than nothing: sbt runs the commands in sequence and
+        // aborts at the first failure, so a broken test tree would otherwise
+        // take `compile` down with it. Retry without the test scope, on what is
+        // left of the shared deadline rather than a fresh fixed budget.
+        match attempt_budget_secs(
+            deadline.saturating_duration_since(Instant::now()),
+            COMPILE_TIMEOUT_SECS,
+            MIN_ATTEMPT_SECS,
+        ) {
+            Some(budget) => {
+                tracing::warn!(
+                    "sbt compile including Test scope failed, retrying with the Compile \
+                     scope only for {budget}s; test-source references will be missing:\n{}",
+                    tail(&stderr_out, 4000)
+                );
+                (status, stdout_out, stderr_out) =
+                    run_sbt_compile(&sbt_root, sbt_bin, budget, false)?;
+            }
+            // Reporting the first failure is worth more than starting a retry
+            // that cannot finish: an attempt that runs into the host's watchdog
+            // loses the whole response, this diagnostic included.
+            None => tracing::warn!(
+                "sbt compile including Test scope failed and under {MIN_ATTEMPT_SECS}s of the \
+                 host's {HOST_INVOKE_TIMEOUT_SECS}s window is left, so the Compile-scope retry \
+                 is skipped and the failure is reported as is:\n{}",
+                tail(&stderr_out, 4000)
+            ),
+        }
+    }
     anyhow::ensure!(
         status.success(),
-        "sbt compile exited with {status}:\n{stderr_out}"
+        "sbt compile exited with {status}:\n{}",
+        tail(&stderr_out, 4000)
     );
 
     let semanticdb_files = find_semanticdb_files(&sbt_root);
@@ -278,6 +414,50 @@ fn run_semanticdb(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     Ok(build_edges(&all_docs, corpus, &sbt_root))
 }
 
+/// This attempt's sbt budget in seconds: `ceiling_secs`, clamped to what is left
+/// of the run's overall deadline. `None` when under `floor_secs` remains, which
+/// is the caller's signal to skip the attempt rather than start one that would
+/// expire before sbt has reloaded the build and take the reply reserve with it.
+///
+/// Pure so the arithmetic is testable without an sbt install: the clock lives at
+/// the call site.
+fn attempt_budget_secs(remaining: Duration, ceiling_secs: u64, floor_secs: u64) -> Option<u64> {
+    let remaining = remaining.as_secs();
+    (remaining >= floor_secs).then_some(remaining.min(ceiling_secs))
+}
+
+/// Caveat for the layout where `find_sbt_root` resolves below the repo root.
+///
+/// The host's repo-write grants for scala are all anchored at the repo root
+/// (travsr-plugin-host `sandbox/toolchain.rs`, `repo_write_subpaths("scala")`:
+/// `target`, `project/target`, `project/project/target`, `js|jvm|native/target`,
+/// each joined to the repo root). `find_sbt_root` BFSes DOWN up to four levels
+/// and `run_sbt_compile` then runs with `current_dir(sbt_root)`, so a build.sbt
+/// below the repo root makes sbt write `<sbt_root>/target/`, which no grant
+/// covers. On Linux the repo root is a bwrap `--ro-bind`, so those writes take
+/// EROFS and the user gets sbt's stderr tail with nothing pointing at travsr's
+/// own sandbox as the cause.
+///
+/// Widening the grants is a security-policy change in the other repo and needs
+/// an ADR amendment, so this only makes the cause visible. `None` for the common
+/// layout where the two paths agree: a caveat, not routine chatter.
+fn build_root_not_granted(repo_root: &Path, sbt_root: &Path) -> Option<PluginDiagnostic> {
+    if sbt_root == repo_root {
+        return None;
+    }
+    Some(PluginDiagnostic::warning(
+        "scala.build-root-not-granted",
+        format!(
+            "Scala indexing is expected to fail on Linux for this layout: build.sbt is at {}, \
+             not at the repo root {}, so sbt writes its build output under a directory the \
+             travsr sandbox does not grant (the grants cover target/ and project/target/ \
+             relative to the repo root only) and the writes are denied.",
+            sbt_root.display(),
+            repo_root.display()
+        ),
+    ))
+}
+
 /// Last `max_bytes` bytes of `s`, on a char boundary, prefixed with an elision
 /// marker when truncated. Used to bound sbt output echoed into a log line.
 fn tail(s: &str, max_bytes: usize) -> String {
@@ -291,11 +471,23 @@ fn tail(s: &str, max_bytes: usize) -> String {
     format!("...(truncated)...\n{}", &s[start..])
 }
 
+/// `with_tests` also compiles the Test configuration, so test sources get
+/// SemanticDB output and their call sites enter the graph. Retried as `false` by
+/// the caller when a repo's tests do not compile.
+///
+/// `budget_secs` is this attempt's own budget, started here. The caller derives
+/// it from one deadline shared by the whole run (`attempt_budget_secs`), so the
+/// retry gets what is genuinely left instead of a fixed budget that could push
+/// the run past the host's watchdog, and is skipped outright when too little is
+/// left for it to finish. A timeout here bails rather than returning a status,
+/// so it ends the run: the caller's retry is reached only on a non-zero exit.
 fn run_sbt_compile(
     sbt_root: &Path,
     sbt_bin: &Path,
-    deadline: std::time::Instant,
+    budget_secs: u64,
+    with_tests: bool,
 ) -> anyhow::Result<(std::process::ExitStatus, String, String)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(budget_secs);
     // #S3: plain `sbt compile` uses sbt 2.x's thin-client/background-server
     // split (`sbtn`), which talks to the server over a loopback socket. Windows
     // AppContainer blocks loopback for a sandboxed process unless separately
@@ -307,7 +499,11 @@ fn run_sbt_compile(
     // the same whether sandboxed or not; confirmed identical real compiles
     // (real elapsed time, `.semanticdb` output) with and without the sandbox.
     let mut child = std::process::Command::new(sbt_bin)
-        .args(["--server", SEMANTICDB_ENABLE_CMD, "compile"])
+        .args(if with_tests {
+            &["--server", SEMANTICDB_ENABLE_CMD, "compile", "Test/compile"][..]
+        } else {
+            &["--server", SEMANTICDB_ENABLE_CMD, "compile"][..]
+        })
         .current_dir(sbt_root)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -345,7 +541,7 @@ fn run_sbt_compile(
             Some(s) => break s,
             None if std::time::Instant::now() >= deadline => {
                 kill_process_tree(&mut child);
-                anyhow::bail!("sbt compile timed out after {TIMEOUT_SECS}s");
+                anyhow::bail!("sbt compile timed out after {budget_secs}s");
             }
             None => std::thread::sleep(std::time::Duration::from_millis(500)),
         }
@@ -628,6 +824,12 @@ fn kind_str(kind: u32) -> &'static str {
     }
 }
 
+/// A symbol whose fully-qualified name sits under a standard-library namespace.
+///
+/// Only meaningful together with the set of symbols this repo defines: see
+/// [`is_noise_symbol`]. A SemanticDB symbol carries no package or provenance
+/// prefix, so the namespace alone cannot say whether `scala/util/…` is the
+/// standard library or the repo's own code.
 fn is_stdlib_symbol(symbol: &str) -> bool {
     symbol.starts_with("scala/")
         || symbol.starts_with("java/")
@@ -652,10 +854,22 @@ fn is_parameter_descriptor(symbol: &str) -> bool {
     symbol.ends_with(')')
 }
 
-/// Symbols that must not become graph nodes or edge endpoints: stdlib, anonymous
-/// locals, and parameter descriptors.
-fn is_noise_symbol(symbol: &str) -> bool {
-    is_stdlib_symbol(symbol) || is_local_symbol(symbol) || is_parameter_descriptor(symbol)
+/// Symbols that must not become graph nodes or edge endpoints: anonymous
+/// locals, parameter descriptors, and *external* standard-library symbols.
+///
+/// `defined` is every symbol carrying a `SymbolInformation` entry in some parsed
+/// `TextDocument`, which is exactly the set this repo defines. A SCIP symbol
+/// carries a package moniker that separates the stdlib from the repo's own code;
+/// a SemanticDB symbol does not, it is a bare fully-qualified name. So the
+/// namespace prefix can only be trusted for a symbol the repo does not define
+/// itself. Without that gate, a repo published under `scala.*` has 100% of its
+/// own symbols classified as stdlib and indexes to zero nodes: on
+/// scala-parser-combinators all 3460 non-local symbols were dropped, `def_ids`
+/// came out empty, and Phase B reported success with an empty graph.
+fn is_noise_symbol(symbol: &str, defined: &HashSet<&str>) -> bool {
+    is_local_symbol(symbol)
+        || is_parameter_descriptor(symbol)
+        || (!defined.contains(symbol) && is_stdlib_symbol(symbol))
 }
 
 fn sdb_vname(symbol: &str, path: &str, corpus: &str) -> VName {
@@ -679,10 +893,18 @@ fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> Invok
     // symbol defined in another resolves to the correct callee node (the per-doc
     // edge builder below keys dst on the *reference's* uri, which is wrong across
     // files; refs use this map instead).
+    // Every symbol this repo defines, so `is_noise_symbol` can tell the repo's
+    // own `scala/…` code from the actual standard library.
+    let defined: HashSet<&str> = docs
+        .iter()
+        .flat_map(|d| d.symbols.iter())
+        .map(|s| s.symbol.as_str())
+        .collect();
+
     let mut def_ids: HashMap<String, NodeId> = HashMap::new();
     for doc in docs {
         for sym in &doc.symbols {
-            if is_noise_symbol(&sym.symbol) {
+            if is_noise_symbol(&sym.symbol, &defined) {
                 continue;
             }
             def_ids
@@ -716,7 +938,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> Invok
 
         // Emit a node for every user-defined symbol
         for sym in &doc.symbols {
-            if is_noise_symbol(&sym.symbol) {
+            if is_noise_symbol(&sym.symbol, &defined) {
                 continue;
             }
             let vname = sdb_vname(&sym.symbol, uri, corpus);
@@ -742,7 +964,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> Invok
             if occ.role != 1 {
                 continue; // only REFERENCEs
             }
-            if is_noise_symbol(&occ.symbol) {
+            if is_noise_symbol(&occ.symbol, &defined) {
                 continue;
             }
             // #299 F3: a range-less reference occurrence has no real position;
@@ -817,6 +1039,7 @@ fn build_edges(docs: &[TextDocument], corpus: &str, source_root: &Path) -> Invok
     );
 
     InvokeResponse {
+        diagnostics: Vec::new(),
         nodes,
         edges,
         refs,
@@ -839,6 +1062,92 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The three shapes the clamp has to get right: ceiling binds, remaining
+    /// binds, and the floor refuses.
+    #[test]
+    fn attempt_budget_clamps_to_the_smaller_of_ceiling_and_remaining() {
+        assert_eq!(
+            attempt_budget_secs(Duration::from_secs(300), 225, 45),
+            Some(225)
+        );
+        assert_eq!(
+            attempt_budget_secs(Duration::from_secs(80), 225, 45),
+            Some(80)
+        );
+        assert_eq!(attempt_budget_secs(Duration::from_secs(44), 225, 45), None);
+        // The floor is inclusive: exactly enough is enough.
+        assert_eq!(
+            attempt_budget_secs(Duration::from_secs(45), 225, 45),
+            Some(45)
+        );
+        assert_eq!(attempt_budget_secs(Duration::ZERO, 225, 45), None);
+    }
+
+    /// The property the shared deadline exists for: whatever the first attempt
+    /// spends, the retry can only get what is left, so the two together never
+    /// exceed the compile window. The 180 + 60 pair this replaced could total
+    /// 230s before the SemanticDB scan had even started.
+    #[test]
+    fn a_retry_can_only_have_what_the_first_attempt_left() {
+        let window = HOST_INVOKE_TIMEOUT_SECS - HOST_REPLY_MARGIN_SECS - POST_COMPILE_RESERVE_SECS;
+        for spent in 0..=window {
+            let retry = attempt_budget_secs(
+                Duration::from_secs(window - spent),
+                COMPILE_TIMEOUT_SECS,
+                MIN_ATTEMPT_SECS,
+            )
+            .unwrap_or(0);
+            assert!(spent + retry <= window, "spent {spent}, retry {retry}");
+        }
+    }
+
+    /// A cold coursier resolve needs more than the 180s this replaced, and the
+    /// host's 300s kill less both reserves is the only real ceiling.
+    #[test]
+    fn compile_ceiling_fills_the_window_without_overrunning_it() {
+        assert_eq!(
+            COMPILE_TIMEOUT_SECS,
+            HOST_INVOKE_TIMEOUT_SECS - HOST_REPLY_MARGIN_SECS - POST_COMPILE_RESERVE_SECS
+        );
+    }
+
+    #[test]
+    fn sbt_root_at_the_repo_root_raises_no_caveat() {
+        let root = Path::new("/repo");
+        assert!(build_root_not_granted(root, root).is_none());
+    }
+
+    #[test]
+    fn sbt_root_below_the_repo_root_warns_with_both_paths() {
+        let d = build_root_not_granted(Path::new("/repo"), Path::new("/repo/backend/svc"))
+            .expect("a nested build.sbt is outside every repo-root-anchored grant");
+        assert_eq!(d.code, "scala.build-root-not-granted");
+        assert!(d.message.contains("/repo/backend/svc"), "{}", d.message);
+        assert!(d.message.contains("/repo"), "{}", d.message);
+    }
+
+    /// The caveat is raised for a layout whose sbt build is then expected to
+    /// fail, so it only earns its keep if it survives the `Err` path.
+    #[test]
+    fn diagnostics_survive_the_error_path() {
+        let diagnostics = vec![
+            build_root_not_granted(Path::new("/repo"), Path::new("/repo/sub"))
+                .expect("nested root"),
+        ];
+        let resp = into_response(
+            Err(anyhow::anyhow!("sbt compile exited with 1")),
+            Path::new("/repo"),
+            diagnostics,
+        );
+        assert_eq!(
+            resp.diagnostics
+                .iter()
+                .map(|d| d.code.as_str())
+                .collect::<Vec<_>>(),
+            ["scala.build-root-not-granted"]
+        );
+    }
 
     #[test]
     fn strip_verbatim_prefix_handles_drive_unc_and_plain() {
@@ -895,11 +1204,10 @@ mod tests {
         // Not build output: a `.semanticdb` sitting in a source tree.
         touch(root, "jvm/src/main/scala/D.scala.semanticdb");
 
-        let mut found = find_semanticdb_files(root);
-        found.sort();
-        let mut want = vec![jvm, native];
-        want.sort();
-        assert_eq!(found, want);
+        // Asserted in order, not sorted first: the caller keeps the first
+        // definition it sees for a symbol, so a cross-built project needs this
+        // list to come back the same way every run. `jvm` sorts before `native`.
+        assert_eq!(find_semanticdb_files(root), vec![jvm, native]);
     }
 
     #[test]
@@ -1006,6 +1314,30 @@ mod tests {
             .edges
             .iter()
             .any(|e| e.src == src && e.dst == dst && e.kind == EdgeKind::RefCall));
+    }
+
+    // SemanticDB symbols carry no package/provenance prefix, so a namespace
+    // prefix alone cannot tell the stdlib from a repo that publishes under that
+    // same namespace. scala-parser-combinators lives in `scala.util.parsing.*`,
+    // so every one of its 3460 symbols was classified stdlib and dropped: an
+    // empty `def_ids`, no nodes, and a Phase B "success" with an empty graph.
+    #[test]
+    fn repo_defined_stdlib_namespace_symbol_is_kept() {
+        let own = "scala/util/parsing/combinator/Parsers#phrase().";
+        let external = "scala/Predef#println().";
+        let defined: HashSet<&str> = [own].into_iter().collect();
+
+        assert!(
+            !is_noise_symbol(own, &defined),
+            "a `scala/...` symbol this repo defines is the repo's own code"
+        );
+        assert!(
+            is_noise_symbol(external, &defined),
+            "a `scala/...` symbol the repo does not define is the real stdlib"
+        );
+        // The other two classes are unaffected by the `defined` set.
+        assert!(is_noise_symbol("local0", &defined));
+        assert!(is_noise_symbol("com/demo/Greeter#greet().(name)", &defined));
     }
 
     #[test]
