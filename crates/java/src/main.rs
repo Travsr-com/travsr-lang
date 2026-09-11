@@ -679,6 +679,12 @@ fn strip_windows_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
 /// Gradle/JVM grandchildren running: on Windows `taskkill /T` kills the tree,
 /// and on unix `run_to_completion` gives the child its own process group, so a
 /// negative pid signals every descendant that has not left it.
+///
+/// PRECONDITION (unix): `child` MUST have been spawned with
+/// `process_group(0)`. `run_to_completion` is the only spawner here and does
+/// set it. Without it the child stays in THIS process's group, `-child.id()`
+/// names that group, and the `kill -9` below takes the sidecar down with the
+/// build it was trying to stop. Any new caller must set it too.
 fn kill_process_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
