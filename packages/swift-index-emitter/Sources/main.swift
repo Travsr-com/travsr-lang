@@ -137,7 +137,7 @@ struct Output: Encodable {
 /// warns when they disagree, because `cargo build` does NOT rebuild this
 /// binary and a stale emitter is otherwise indistinguishable from a current
 /// one. Bump both together at release; CI fails when they disagree.
-let emitterVersion = "0.4.2"
+let emitterVersion = "0.5.0"
 
 let args = CommandLine.arguments
 
