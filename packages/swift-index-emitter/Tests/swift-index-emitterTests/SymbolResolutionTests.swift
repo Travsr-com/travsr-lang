@@ -218,4 +218,93 @@ final class SymbolResolutionTests: XCTestCase {
             "a nested function must never be recorded as a member; got \(symbols)"
         )
     }
+
+    /// The three receiver shapes whose type the source states without writing a
+    /// type annotation. Only the annotated local used to resolve, so a call
+    /// through a stored property, through `let e = Engine()`, or on a fresh
+    /// `Engine()` was dropped: 1 of 4 instance calls on the commonest shapes.
+    func testReceiverTypeStatedWithoutAnAnnotationResolves() {
+        let symbols = referenceSymbols([
+            "A.swift": """
+            class Engine { func start() {} }
+            class Uses {
+                var prop: Engine = Engine()
+                func viaProp() { prop.start() }
+                func viaLocalInferred() { let e = Engine(); e.start() }
+                func viaLocalAnnotated() { let e: Engine = Engine(); e.start() }
+                func viaFresh() { Engine().start() }
+            }
+            """
+        ])
+        XCTAssertEqual(
+            symbols.filter { $0 == "swift::Engine.start" }.count, 4,
+            "a stored property, an inferred local, an annotated local and a fresh "
+                + "instance all name Engine; got \(symbols)"
+        )
+    }
+
+    /// A receiver whose type the source never states must still resolve to
+    /// nothing. A factory return type is not knowable at parse level, and a
+    /// property with no annotation says nothing about its own type either, so
+    /// neither may be read off the name of the thing that produced it.
+    func testReceiverTypeTheSourceNeverStatesStaysUnresolved() {
+        let symbols = referenceSymbols([
+            "A.swift": """
+            class Engine { func start() {} }
+            func makeEngine() -> Engine { Engine() }
+            class Uses {
+                var inferred = makeEngine()
+                func viaFactoryLocal() { let e = makeEngine(); e.start() }
+                func viaInferredProperty() { inferred.start() }
+            }
+            """
+        ])
+        XCTAssertFalse(
+            symbols.contains("swift::Engine.start"),
+            "a factory result and an unannotated property state no type; got \(symbols)"
+        )
+    }
+
+    /// `T()` inside a generic constructs whatever T is bound to, not a type
+    /// called `T`. The constructor-initializer binding must apply the same guard
+    /// every other receiver path does, or a repo type sharing the name collects
+    /// the edge.
+    func testGenericParameterConstructorDoesNotBindTheRealType() {
+        let symbols = referenceSymbols([
+            "A.swift": """
+            struct T { func run() {} }
+            func make<T>() { let t = T(); t.run() }
+            """
+        ])
+        XCTAssertFalse(
+            symbols.contains("swift::T.run"),
+            "a generic parameter constructor must not name the real T; got \(symbols)"
+        )
+    }
+
+    /// A `guard let` or `for … in` binds a local that shadows a property of the
+    /// enclosing type. Only `let`/`var` declarations and parameters were noted as
+    /// in-scope names, so once a bare receiver could resolve through the property
+    /// table these bindings resolved to the PROPERTY's type: a wrong edge, on a
+    /// receiver the source says is something else entirely.
+    func testABindingThatShadowsAPropertyDoesNotResolveToThePropertyType() {
+        let symbols = referenceSymbols([
+            "A.swift": """
+            class Engine { func start() {} }
+            class Other { func start() {} }
+            class Holder {
+                var item: Engine = Engine()
+                func viaForIn(_ others: [Other]) { for item in others { item.start() } }
+                func viaGuardLet(_ o: Other?) {
+                    guard let item = o else { return }
+                    item.start()
+                }
+            }
+            """
+        ])
+        XCTAssertFalse(
+            symbols.contains("swift::Engine.start"),
+            "a shadowing binding must not take the property's type; got \(symbols)"
+        )
+    }
 }

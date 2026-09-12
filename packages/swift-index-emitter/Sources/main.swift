@@ -11,9 +11,13 @@
 ///       let svc: PaymentService = …  →  svc.charge() resolved.
 ///       func process(svc: PaymentService)  →  svc.validate() resolved.
 ///       Closure parameters with explicit type annotations: also resolved.
+///   • Instance method calls whose receiver type the source states without an
+///     annotation: `let svc = PaymentService()` (constructor), `svc.charge()`
+///     on a stored property of the enclosing type, and `PaymentService().charge()`.
 ///   • Type inheritance / protocol conformance: class Dog: Animal, Serializable
 ///       → IsImplementation edges in Travsr graph for full blast radius.
-///   • Unresolvable instance calls (inferred-type locals, chained calls) are
+///   • Instance calls whose receiver type the source never states (a local
+///     assigned from a factory or a chain, a deeper chain of members) are
 ///     omitted, since a full IndexStore integration would be needed for those.
 ///
 /// Usage:
@@ -886,6 +890,29 @@ final class ScipVisitor: SyntaxVisitor {
         return genericConstraint(written)
     }
 
+    /// The type a `T()` constructor call yields, or nil for any other expression.
+    ///
+    /// This is the one type a parser can infer with certainty: a bare callee
+    /// that the repo declares as a type is a constructor, and a Swift
+    /// initializer yields exactly the type it names. No subclass, overload or
+    /// protocol witness can make `Engine()` produce anything but an `Engine`,
+    /// and a failable `init?` only wraps it in an Optional, whose members are
+    /// still looked up on `Engine`. Everything else an initializer expression
+    /// could be (a factory call, a chain, a literal, `Box<Int>()`) stays
+    /// unknown, because reading a type off those would be the guess this
+    /// emitter exists not to make.
+    private func constructedTypeName(_ expr: ExprSyntax?) -> String? {
+        guard let call = expr?.as(FunctionCallExprSyntax.self),
+              let callee = call.calledExpression.as(DeclReferenceExprSyntax.self)
+        else { return nil }
+        let name = callee.baseName.text
+        // Declared in this repo, so an unknown uppercase callee (a stdlib type,
+        // a free function) binds nothing; and not a generic parameter, which
+        // names no real type even when `T()` is written.
+        guard !isGenericParam(name), pathsBySimpleName[name] != nil else { return nil }
+        return name
+    }
+
     // ── Type name extraction ───────────────────────────────────────────────────
 
     /// Return the simple (unqualified, non-generic) type name from a TypeSyntax.
@@ -1276,8 +1303,33 @@ final class ScipVisitor: SyntaxVisitor {
                 if !typeName.isEmpty { bindLocal(name, type: typeName) }
                 // #830: the annotation is also a use of that type.
                 recordTypeReference(typeAnn.type)
+            } else if let constructed = constructedTypeName(binding.initializer?.value) {
+                // `let e = Engine()`: the type is not written, but a constructor
+                // call states it just as plainly as an annotation would, so the
+                // local is bound and `e.start()` resolves. Without this the
+                // commonest way to make an instance in Swift produced a receiver
+                // of unknown type and every call through it was dropped.
+                // No type reference is recorded: the constructor call emits its
+                // own `swift::Engine` when it is visited.
+                bindLocal(name, type: constructed)
             }
         }
+        return .visitChildren
+    }
+
+    /// Note every name a pattern binds as an in-scope local.
+    ///
+    /// `scopeNames` is documented to hold the names of ALL locals in scope, but
+    /// only `let`/`var` declarations and parameters ever reached it. A `guard
+    /// let`, `if let`, `for … in`, `catch let` or `case let` binds a local just
+    /// as much, and shadows a property of the enclosing type just as much:
+    /// `for item in others { item.start() }` inside a type declaring
+    /// `var item: Engine` resolved the call on Engine, which is a wrong edge.
+    /// Every one of those forms binds through an IdentifierPattern, so one rule
+    /// here covers them all. Names outlive their block, which can only cost a
+    /// later resolution, never invent one.
+    override func visit(_ node: IdentifierPatternSyntax) -> SyntaxVisitorContinueKind {
+        noteLocalName(node.identifier.text)
         return .visitChildren
     }
 
@@ -1406,8 +1458,35 @@ final class ScipVisitor: SyntaxVisitor {
                                 symbol: "swift::\(baseName)", line: ln,
                                 col: colOf(declRef.baseName), isCall: false))
                         }
+                    } else if let selfType = lookupType("self"),
+                              let property = declaredPropertyType(of: baseName, on: selfType),
+                              !isGenericParam(property.type, ofTypeAt: property.declaredBy) {
+                        // `prop.start()`: a bare receiver that is not a local and
+                        // names no type is an implicit-self property. Swift lets
+                        // `self.` be left out, and leaving it out was the whole
+                        // difference between the call resolving and being dropped:
+                        // only the spelled-out `self.prop.start()` reached the
+                        // branch below, so a call through a stored property, the
+                        // commonest instance-call shape there is, resolved to
+                        // nothing. Same table, same generic guard, same
+                        // declaring-type keying as that branch.
+                        references.append(Reference(
+                            symbol: "swift::\(owningType(of: memberName, on: property.type)).\(memberName)",
+                            line: ln,
+                            col: cl
+                        ))
                     }
                     // Unresolvable (inferred-type local, chained call): skip rather than guess.
+                } else if let constructed = constructedTypeName(base) {
+                    // `Engine().start()`: the receiver is a fresh instance whose
+                    // type the source names right there, so nothing has to be
+                    // inferred. It fell into the complex-base skip below because
+                    // the base is a call rather than a name.
+                    references.append(Reference(
+                        symbol: "swift::\(owningType(of: memberName, on: constructed)).\(memberName)",
+                        line: ln,
+                        col: cl
+                    ))
                 } else if let propertyAccess = base.as(MemberAccessExprSyntax.self),
                           let propertyBase = propertyAccess.base?
                               .as(DeclReferenceExprSyntax.self),
