@@ -1,6 +1,6 @@
 name: dart_scip_emitter
 description: Extracts semantic definitions and references from Dart source using package:analyzer and emits Travsr JSON for Phase B ingestion.
-version: 0.4.2
+version: 0.5.0
 repository: https://github.com/Travsr-com/travsr-lang
 
 environment:

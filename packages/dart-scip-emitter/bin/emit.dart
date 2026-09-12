@@ -48,7 +48,7 @@ import 'package:path/path.dart' as p;
 /// binary and a stale emitter is otherwise indistinguishable from a current
 /// one. Bump this, `version:` in pubspec.yaml, and the Cargo workspace version
 /// together at release; CI fails when they disagree.
-const emitterVersion = '0.4.2';
+const emitterVersion = '0.5.0';
 
 Future<void> main(List<String> args) async {
   if (args.isNotEmpty && args[0] == '--version') {
