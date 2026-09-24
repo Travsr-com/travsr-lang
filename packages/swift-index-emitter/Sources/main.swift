@@ -532,9 +532,8 @@ final class ScipVisitor: SyntaxVisitor {
 
     // Scope stack for instance-call resolution.
     // Each frame maps a local name to its simple (unqualified) type name.
-    // Pushed on function/init/closure entry, popped on exit.
-    // Only populated for explicitly type-annotated bindings. Inferred types
-    // are left unresolved rather than guessed.
+    // Pushed on function/init/closure entry and for a file's top-level code,
+    // popped on exit. Only populated for bindings whose type the source states.
     private var scopeStack: [[String: String]] = []
 
     // Names of ALL locals in scope (parameters and let/var bindings), whether or
@@ -750,14 +749,20 @@ final class ScipVisitor: SyntaxVisitor {
         if !scopeNames.isEmpty { scopeNames.removeLast() }
     }
 
+    // Inside a function, closure or top-level code. A type body sits in the
+    // file's frame too, but its stored properties are members, not locals.
+    private var inLocalScope: Bool {
+        scopeStack.count > 1 || (scopeStack.count == 1 && typeStack.isEmpty)
+    }
+
     private func bindLocal(_ name: String, type typeName: String) {
-        guard !scopeStack.isEmpty, !name.isEmpty, !typeName.isEmpty else { return }
+        guard inLocalScope, !name.isEmpty, !typeName.isEmpty else { return }
         scopeStack[scopeStack.count - 1][name] = typeName
     }
 
     // Record a local name whether or not its type is known.
     private func noteLocalName(_ name: String) {
-        guard !scopeNames.isEmpty, !name.isEmpty else { return }
+        guard inLocalScope, !name.isEmpty else { return }
         scopeNames[scopeNames.count - 1].insert(name)
     }
 
@@ -1216,6 +1221,13 @@ final class ScipVisitor: SyntaxVisitor {
     override func visitPost(_ node: TypeAliasDeclSyntax) { popGenerics() }
 
     // ── Member declarations ────────────────────────────────────────────────────
+
+    // Top-level code (a script `main.swift`) has locals but no enclosing function.
+    override func visit(_ node: SourceFileSyntax) -> SyntaxVisitorContinueKind {
+        pushScope()
+        return .visitChildren
+    }
+    override func visitPost(_ node: SourceFileSyntax) { popScope() }
 
     override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text

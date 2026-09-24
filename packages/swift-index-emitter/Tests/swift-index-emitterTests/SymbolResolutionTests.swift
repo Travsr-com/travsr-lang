@@ -307,4 +307,39 @@ final class SymbolResolutionTests: XCTestCase {
             "a shadowing binding must not take the property's type; got \(symbols)"
         )
     }
+
+    /// Top-level code in a script `main.swift` has no enclosing function, so
+    /// its locals had no scope frame to bind into and every call through them
+    /// was dropped. A stored property of a type declared in the same file must
+    /// still not become a top-level local.
+    func testTopLevelLocalResolvesItsMembers() {
+        let symbols = referenceSymbols([
+            "main.swift": """
+            let zoo = Zoo()
+            let dog: Dog = Dog()
+            zoo.add(dog)
+            dog.fetch()
+            """,
+            "Zoo.swift": """
+            class Dog { func fetch() {} }
+            class Zoo {
+                var Dog = 0
+                func add(_ d: Dog) {}
+            }
+            func use() { Dog.make() }
+            """,
+        ])
+        XCTAssertTrue(
+            symbols.contains("swift::Zoo.add"),
+            "an inferred top-level local resolves; got \(symbols)"
+        )
+        XCTAssertTrue(
+            symbols.contains("swift::Dog.fetch"),
+            "an annotated top-level local resolves; got \(symbols)"
+        )
+        XCTAssertTrue(
+            symbols.contains("swift::Dog.make"),
+            "a type's stored property must not shadow a type as a local; got \(symbols)"
+        )
+    }
 }
