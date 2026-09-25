@@ -749,8 +749,10 @@ final class ScipVisitor: SyntaxVisitor {
         if !scopeNames.isEmpty { scopeNames.removeLast() }
     }
 
-    // Inside a function, closure or top-level code. A type body sits in the
-    // file's frame too, but its stored properties are members, not locals.
+    // Inside a function, closure or top-level code. A file-level type's body
+    // sits in the file's frame, but its stored properties are members, not
+    // locals. A type nested in a function is not excluded: its properties still
+    // land in the function's frame.
     private var inLocalScope: Bool {
         scopeStack.count > 1 || (scopeStack.count == 1 && typeStack.isEmpty)
     }
@@ -1311,11 +1313,11 @@ final class ScipVisitor: SyntaxVisitor {
                 line: ln,
                 endLine: ln  // variables/fields are single-line declarations
             ))
-            // Note the name as an in-scope local (a no-op at type level, where
-            // there is no scope frame) so an uppercase-named local shadows a type.
+            // Note the name as an in-scope local (a no-op in a file-level type's
+            // body, see inLocalScope) so an uppercase-named local shadows a type.
             noteLocalName(name)
             // Track explicit type annotation for instance-call resolution.
-            // Only active inside a scope frame (i.e., inside a function body).
+            // Only active where inLocalScope holds.
             if let typeAnn = binding.typeAnnotation {
                 let typeName = simpleTypeName(typeAnn.type)
                 if !typeName.isEmpty { bindLocal(name, type: typeName) }
