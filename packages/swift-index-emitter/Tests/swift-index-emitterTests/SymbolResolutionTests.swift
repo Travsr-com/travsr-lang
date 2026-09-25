@@ -307,4 +307,77 @@ final class SymbolResolutionTests: XCTestCase {
             "a shadowing binding must not take the property's type; got \(symbols)"
         )
     }
+
+    /// Top-level code in a script `main.swift` has no enclosing function, so
+    /// its locals had no scope frame to bind into and every call through them
+    /// was dropped. A stored property of a type declared in the same file must
+    /// still not become a top-level local.
+    func testTopLevelLocalResolvesItsMembers() {
+        let symbols = referenceSymbols([
+            "main.swift": """
+            let zoo = Zoo()
+            let dog: Dog = Dog()
+            zoo.add(dog)
+            dog.fetch()
+            """,
+            "Zoo.swift": """
+            class Dog { func fetch() {} }
+            class Zoo {
+                var Dog = 0
+                func add(_ d: Dog) {}
+            }
+            func use() { Dog.make() }
+            """,
+        ])
+        XCTAssertTrue(
+            symbols.contains("swift::Zoo.add"),
+            "an inferred top-level local resolves; got \(symbols)"
+        )
+        XCTAssertTrue(
+            symbols.contains("swift::Dog.fetch"),
+            "an annotated top-level local resolves; got \(symbols)"
+        )
+        XCTAssertTrue(
+            symbols.contains("swift::Dog.make"),
+            "a type's stored property must not shadow a type as a local; got \(symbols)"
+        )
+    }
+
+    /// Inside a type, a stored property shadows a file-level variable of the
+    /// same name. Once the file's top-level code had a scope frame, the variable
+    /// won instead: a wrong edge when its type was known, a dropped one when not.
+    func testAPropertyShadowsAFileLevelVariable() {
+        let symbols = referenceSymbols([
+            "Garage.swift": """
+            class Car { func start() {} }
+            class Motor { func start() {} }
+            let engine = Car()
+            class Garage {
+                var engine: Motor = Motor()
+                func run() { engine.start() }
+            }
+            """,
+            "Shed.swift": """
+            class Tool { func use() {} }
+            let hammer = makeTool()
+            func makeTool() -> Tool { Tool() }
+            class Shed {
+                var hammer: Tool = Tool()
+                func work() { hammer.use() }
+            }
+            """,
+        ])
+        XCTAssertFalse(
+            symbols.contains("swift::Car.start"),
+            "a file-level variable must not take the property's place; got \(symbols)"
+        )
+        XCTAssertTrue(
+            symbols.contains("swift::Motor.start"),
+            "a typed file-level variable must not hide the property; got \(symbols)"
+        )
+        XCTAssertTrue(
+            symbols.contains("swift::Tool.use"),
+            "an untyped file-level variable must not hide the property; got \(symbols)"
+        )
+    }
 }

@@ -532,9 +532,8 @@ final class ScipVisitor: SyntaxVisitor {
 
     // Scope stack for instance-call resolution.
     // Each frame maps a local name to its simple (unqualified) type name.
-    // Pushed on function/init/closure entry, popped on exit.
-    // Only populated for explicitly type-annotated bindings. Inferred types
-    // are left unresolved rather than guessed.
+    // Pushed on function/init/closure entry and for a file's top-level code,
+    // popped on exit. Only populated for bindings whose type the source states.
     private var scopeStack: [[String: String]] = []
 
     // Names of ALL locals in scope (parameters and let/var bindings), whether or
@@ -750,25 +749,39 @@ final class ScipVisitor: SyntaxVisitor {
         if !scopeNames.isEmpty { scopeNames.removeLast() }
     }
 
+    // Inside a function, closure or top-level code. A file-level type's body
+    // sits in the file's frame, but its stored properties are members, not
+    // locals. A type nested in a function is not excluded: its properties still
+    // land in the function's frame.
+    private var inLocalScope: Bool {
+        scopeStack.count > 1 || (scopeStack.count == 1 && typeStack.isEmpty)
+    }
+
     private func bindLocal(_ name: String, type typeName: String) {
-        guard !scopeStack.isEmpty, !name.isEmpty, !typeName.isEmpty else { return }
+        guard inLocalScope, !name.isEmpty, !typeName.isEmpty else { return }
         scopeStack[scopeStack.count - 1][name] = typeName
     }
 
     // Record a local name whether or not its type is known.
     private func noteLocalName(_ name: String) {
-        guard !scopeNames.isEmpty, !name.isEmpty else { return }
+        guard inLocalScope, !name.isEmpty else { return }
         scopeNames[scopeNames.count - 1].insert(name)
     }
 
+    // Inside a type, its own members shadow a file-level variable of the same
+    // name, so the file's frame is not searched there.
+    private var fileFramesSkipped: Int { typeStack.isEmpty ? 0 : 1 }
+
     private func isLocalName(_ name: String) -> Bool {
-        for frame in scopeNames.reversed() where frame.contains(name) { return true }
+        for frame in scopeNames.dropFirst(fileFramesSkipped).reversed() where frame.contains(name) {
+            return true
+        }
         return false
     }
 
     // Innermost-scope-first lookup.
     private func lookupType(_ name: String) -> String? {
-        for frame in scopeStack.reversed() {
+        for frame in scopeStack.dropFirst(fileFramesSkipped).reversed() {
             if let t = frame[name] { return t }
         }
         return nil
@@ -1217,6 +1230,13 @@ final class ScipVisitor: SyntaxVisitor {
 
     // ── Member declarations ────────────────────────────────────────────────────
 
+    // Top-level code (a script `main.swift`) has locals but no enclosing function.
+    override func visit(_ node: SourceFileSyntax) -> SyntaxVisitorContinueKind {
+        pushScope()
+        return .visitChildren
+    }
+    override func visitPost(_ node: SourceFileSyntax) { popScope() }
+
     override func visit(_ node: FunctionDeclSyntax) -> SyntaxVisitorContinueKind {
         let name = node.name.text
         let endLine = node.body.map { endLineOf($0.rightBrace) } ?? lineOf(node.name)
@@ -1293,11 +1313,11 @@ final class ScipVisitor: SyntaxVisitor {
                 line: ln,
                 endLine: ln  // variables/fields are single-line declarations
             ))
-            // Note the name as an in-scope local (a no-op at type level, where
-            // there is no scope frame) so an uppercase-named local shadows a type.
+            // Note the name as an in-scope local (a no-op in a file-level type's
+            // body, see inLocalScope) so an uppercase-named local shadows a type.
             noteLocalName(name)
             // Track explicit type annotation for instance-call resolution.
-            // Only active inside a scope frame (i.e., inside a function body).
+            // Only active where inLocalScope holds.
             if let typeAnn = binding.typeAnnotation {
                 let typeName = simpleTypeName(typeAnn.type)
                 if !typeName.isEmpty { bindLocal(name, type: typeName) }
