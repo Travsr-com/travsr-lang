@@ -116,11 +116,20 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
 ///
 /// 2. Gives every `JavaCompile` task except the release and instrumentation
 ///    (`AndroidTest`) variants the configuration scip-java's plugin gives a
-///    java project's tasks: the javac plugin jar on `compileOnly` (and on
-///    `annotationProcessor` when processors are in use, since javac then
-///    discovers plugins from the processor path only), the `-Xplugin` argument,
-///    the JDK 17 `--add-exports` fork options, and the SemanticDB agent when
-///    the scip-java generation ships one. `scipCompileAll` is then made to
+///    java project's tasks: the javac plugin jar on `compileOnly` and
+///    `testCompileOnly` (and on `annotationProcessor` / `testAnnotationProcessor`
+///    when that scope has processors, since javac then discovers plugins from
+///    the processor path only; the two scopes are independent, so a test-only
+///    processor such as Hilt's `testAnnotationProcessor` would otherwise fail
+///    the unit-test compile with "plug-in not found" and take the whole Java
+///    index with it, measured on the AGP 8.13 fixture), the `-Xplugin`
+///    argument, the `--add-exports` fork options when the javac toolchain is
+///    JDK 17 or newer (a forked JDK 8 javac rejects them), and the SemanticDB
+///    agent when the scip-java generation ships one. The dependency adds are
+///    guarded like both scip-java generations guard their own: a build that
+///    already resolved `compileOnly` gets a warning and no `-Xplugin` argument
+///    instead of "Failed to notify project evaluation listener", and on 0.12.x
+///    the agent still injects the plugin. `scipCompileAll` is then made to
 ///    depend on those tasks, and `scipPrintDependencies` is disabled: on AGP 9
 ///    that task dies with a `ConcurrentModificationException` while resolving
 ///    AGP's lazily-registered configurations, and its output (Maven
@@ -145,6 +154,7 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
 /// and no backslash can reach a Groovy string literal.
 const AGP_INIT_SCRIPT_SHIM: &str = r#"
 // ---- travsr: Android Gradle Plugin support (see travsr-lang-java) ----
+import org.gradle.api.JavaVersion
 import org.gradle.api.initialization.resolve.RepositoriesMode
 import org.gradle.api.tasks.compile.JavaCompile
 settingsEvaluated { s ->
@@ -174,9 +184,19 @@ allprojects { p ->
     def pluginJar = p.ext["javacPluginJar"].toString()
     def agentJar = p.ext.has("javacAgentPath") ? p.ext["javacAgentPath"].toString() : null
     def sourceroot = p.rootDir.toString()
-    if (p.configurations.findByName("compileOnly") != null) { p.dependencies.add("compileOnly", p.files(pluginJar)) }
-    def apConf = p.configurations.findByName("annotationProcessor")
-    if (apConf != null && !apConf.dependencies.isEmpty()) { p.dependencies.add("annotationProcessor", p.files(pluginJar)) }
+    def pluginAttached = true
+    try {
+      ["compileOnly", "testCompileOnly"].each { conf ->
+        if (p.configurations.findByName(conf) != null) { p.dependencies.add(conf, p.files(pluginJar)) }
+      }
+      ["annotationProcessor", "testAnnotationProcessor"].each { conf ->
+        def c = p.configurations.findByName(conf)
+        if (c != null && !c.dependencies.isEmpty()) { p.dependencies.add(conf, p.files(pluginJar)) }
+      }
+    } catch (Throwable e) {
+      p.logger.warn("travsr: could not attach the SemanticDB javac plugin to project '" + p.path + "' (" + e.getClass().getSimpleName() + ": " + e.getMessage() + "); its Java sources will not be indexed unless the javac agent is in use")
+      pluginAttached = false
+    }
     def moduleOptions = ["--add-exports", "jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
                          "--add-exports", "jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
                          "--add-exports", "jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
@@ -187,11 +207,18 @@ allprojects { p ->
       t.options.fork = true
       t.options.incremental = false
       def args = t.options.compilerArgs
-      if (!args.any { it.toString().startsWith("-Xplugin:" + pluginId) }) {
+      if (pluginAttached && !args.any { it.toString().startsWith("-Xplugin:" + pluginId) }) {
         args.add("-Xplugin:" + pluginId + " -targetroot:" + targetroot + " -sourceroot:" + sourceroot + " -randomtimestamp=" + System.nanoTime())
       }
       def jvmArgs = new ArrayList<String>(t.options.forkOptions.jvmArgs ?: [])
-      jvmArgs.addAll(moduleOptions)
+      def javacVersion = null
+      try {
+        def compiler = t.javaCompiler.getOrNull()
+        if (compiler != null) { javacVersion = compiler.metadata.languageVersion.asInt() }
+      } catch (Throwable ignored) {
+      }
+      if (javacVersion == null) { javacVersion = JavaVersion.current().majorVersion.toInteger() }
+      if (javacVersion >= 17) { jvmArgs.addAll(moduleOptions) }
       if (agentJar != null) {
         jvmArgs.addAll(["-javaagent:" + agentJar, "-Dsemanticdb.pluginpath=" + pluginJar, "-Dsemanticdb.sourceroot=" + sourceroot, "-Dsemanticdb.targetroot=" + targetroot])
       }
@@ -1079,6 +1106,10 @@ mod tests {
             "settingsEvaluated",
             "RepositoriesMode.FAIL_ON_PROJECT_REPOS",
             "mode.set(RepositoriesMode.PREFER_SETTINGS)",
+            r#"["compileOnly", "testCompileOnly"]"#,
+            r#"["annotationProcessor", "testAnnotationProcessor"]"#,
+            "if (javacVersion >= 17) { jvmArgs.addAll(moduleOptions) }",
+            "pluginAttached = false",
             r#"p.tasks.named("scipPrintDependencies") { it.enabled = false }"#,
             "-javaagent:",
             "management.repositories.each",
