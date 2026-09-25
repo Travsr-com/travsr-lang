@@ -102,7 +102,11 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
 ///    and done only under `PREFER_PROJECT` (the mode that has the problem),
 ///    so a `PREFER_SETTINGS` build is not warned at once per project.
 ///
-/// Before either, from `settingsEvaluated`, a `FAIL_ON_PROJECT_REPOS` build
+/// Before either, from `settingsEvaluated` and without importing
+/// `RepositoriesMode` (the class exists only from Gradle 6.8, and an import
+/// that fails to resolve kills the whole init-script on an older Gradle, for
+/// every Gradle repo the shim is added to; the mode is compared by name and
+/// set reflectively inside the `try`), a `FAIL_ON_PROJECT_REPOS` build
 /// (the Android Studio template default) is relaxed to `PREFER_SETTINGS` for
 /// this one indexing build. In that mode scip-java's own injection above
 /// throws inside its plugin: 0.13.1 catches that, 0.12.x does not, and the
@@ -127,9 +131,14 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
 ///    JDK 17 or newer (a forked JDK 8 javac rejects them), and the SemanticDB
 ///    agent when the scip-java generation ships one. The dependency adds are
 ///    guarded like both scip-java generations guard their own: a build that
-///    already resolved `compileOnly` gets a warning and no `-Xplugin` argument
-///    instead of "Failed to notify project evaluation listener", and on 0.12.x
-///    the agent still injects the plugin. `scipCompileAll` is then made to
+///    already resolved `compileOnly` gets a warning instead of "Failed to
+///    notify project evaluation listener". `-Xplugin` itself is added at
+///    execution time and only when the jar is on the path javac will load
+///    plugins from (the processor path when Gradle passes one, the classpath
+///    otherwise), so a task the adds never reached, a KMP `jvm` target fed from
+///    `jvmCompileOnly` for instance, compiles without the plugin rather than
+///    failing with "plug-in not found" and taking the whole build with it; on
+///    0.12.x the agent still injects the plugin there. `scipCompileAll` is then made to
 ///    depend on those tasks, and `scipPrintDependencies` is disabled: on AGP 9
 ///    that task dies with a `ConcurrentModificationException` while resolving
 ///    AGP's lazily-registered configurations, and its output (Maven
@@ -155,13 +164,17 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
 const AGP_INIT_SCRIPT_SHIM: &str = r#"
 // ---- travsr: Android Gradle Plugin support (see travsr-lang-java) ----
 import org.gradle.api.JavaVersion
-import org.gradle.api.initialization.resolve.RepositoriesMode
 import org.gradle.api.tasks.compile.JavaCompile
+// RepositoriesMode is never imported: the class only exists from Gradle 6.8,
+// and an unresolvable import fails the whole init-script on an older Gradle
+// before any try/catch can run, for every Gradle repo this shim is added to.
+// The mode is compared by name and set reflectively, inside the catch.
 settingsEvaluated { s ->
   try {
     def mode = s.dependencyResolutionManagement.repositoriesMode
-    if (mode.getOrNull() == RepositoriesMode.FAIL_ON_PROJECT_REPOS) {
-      mode.set(RepositoriesMode.PREFER_SETTINGS)
+    if (String.valueOf(mode.getOrNull()) == "FAIL_ON_PROJECT_REPOS") {
+      def modes = Class.forName("org.gradle.api.initialization.resolve.RepositoriesMode")
+      mode.set(Enum.valueOf(modes, "PREFER_SETTINGS"))
     }
   } catch (Throwable ignored) {
   }
@@ -172,7 +185,7 @@ allprojects { p ->
     try {
       def management = p.gradle.settings.dependencyResolutionManagement
       def mode = management.repositoriesMode.getOrNull()
-      if (mode == null || mode == RepositoriesMode.PREFER_PROJECT) {
+      if (mode == null || String.valueOf(mode) == "PREFER_PROJECT") {
         management.repositories.each { r -> if (p.repositories.findByName(r.name) == null) { p.repositories.add(r) } }
       }
     } catch (Throwable ignored) {
@@ -184,7 +197,6 @@ allprojects { p ->
     def pluginJar = p.ext["javacPluginJar"].toString()
     def agentJar = p.ext.has("javacAgentPath") ? p.ext["javacAgentPath"].toString() : null
     def sourceroot = p.rootDir.toString()
-    def pluginAttached = true
     try {
       ["compileOnly", "testCompileOnly"].each { conf ->
         if (p.configurations.findByName(conf) != null) { p.dependencies.add(conf, p.files(pluginJar)) }
@@ -195,7 +207,6 @@ allprojects { p ->
       }
     } catch (Throwable e) {
       p.logger.warn("travsr: could not attach the SemanticDB javac plugin to project '" + p.path + "' (" + e.getClass().getSimpleName() + ": " + e.getMessage() + "); its Java sources will not be indexed unless the javac agent is in use")
-      pluginAttached = false
     }
     def moduleOptions = ["--add-exports", "jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
                          "--add-exports", "jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
@@ -206,9 +217,22 @@ allprojects { p ->
     selected.configureEach { t ->
       t.options.fork = true
       t.options.incremental = false
-      def args = t.options.compilerArgs
-      if (pluginAttached && !args.any { it.toString().startsWith("-Xplugin:" + pluginId) }) {
-        args.add("-Xplugin:" + pluginId + " -targetroot:" + targetroot + " -sourceroot:" + sourceroot + " -randomtimestamp=" + System.nanoTime())
+      // -Xplugin is decided at execution time, when the task's inputs are
+      // resolved: javac loads plugins from -processorpath when Gradle passes
+      // one (a non-empty annotation processor path) and from the classpath
+      // otherwise, and the jar only reached those through the configurations
+      // above. A task fed from other configurations (a KMP jvm target, or a
+      // project whose adds failed) gets no -Xplugin instead of a javac that
+      // dies with "plug-in not found" and takes the whole build with it.
+      t.doFirst {
+        def jarPath = new File(pluginJar).canonicalPath
+        def carries = { fc -> fc != null && fc.files.any { it.canonicalPath == jarPath } }
+        def apPath = t.options.annotationProcessorPath
+        def reachable = (apPath != null && !apPath.isEmpty()) ? carries(apPath) : carries(t.classpath)
+        def args = t.options.compilerArgs
+        if (reachable && !args.any { it.toString().startsWith("-Xplugin:" + pluginId) }) {
+          args.add("-Xplugin:" + pluginId + " -targetroot:" + targetroot + " -sourceroot:" + sourceroot + " -randomtimestamp=" + System.nanoTime())
+        }
       }
       def jvmArgs = new ArrayList<String>(t.options.forkOptions.jvmArgs ?: [])
       def javacVersion = null
@@ -1104,12 +1128,13 @@ mod tests {
             "p.tasks.withType(JavaCompile)",
             r#"p.tasks.named("scipCompileAll") { it.dependsOn(selected) }"#,
             "settingsEvaluated",
-            "RepositoriesMode.FAIL_ON_PROJECT_REPOS",
-            "mode.set(RepositoriesMode.PREFER_SETTINGS)",
+            r#"String.valueOf(mode.getOrNull()) == "FAIL_ON_PROJECT_REPOS""#,
+            r#"Enum.valueOf(modes, "PREFER_SETTINGS")"#,
             r#"["compileOnly", "testCompileOnly"]"#,
             r#"["annotationProcessor", "testAnnotationProcessor"]"#,
             "if (javacVersion >= 17) { jvmArgs.addAll(moduleOptions) }",
-            "pluginAttached = false",
+            "t.doFirst {",
+            "def reachable = ",
             r#"p.tasks.named("scipPrintDependencies") { it.enabled = false }"#,
             "-javaagent:",
             "management.repositories.each",
