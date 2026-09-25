@@ -342,4 +342,42 @@ final class SymbolResolutionTests: XCTestCase {
             "a type's stored property must not shadow a type as a local; got \(symbols)"
         )
     }
+
+    /// Inside a type, a stored property shadows a file-level variable of the
+    /// same name. Once the file's top-level code had a scope frame, the variable
+    /// won instead: a wrong edge when its type was known, a dropped one when not.
+    func testAPropertyShadowsAFileLevelVariable() {
+        let symbols = referenceSymbols([
+            "Garage.swift": """
+            class Car { func start() {} }
+            class Motor { func start() {} }
+            let engine = Car()
+            class Garage {
+                var engine: Motor = Motor()
+                func run() { engine.start() }
+            }
+            """,
+            "Shed.swift": """
+            class Tool { func use() {} }
+            let hammer = makeTool()
+            func makeTool() -> Tool { Tool() }
+            class Shed {
+                var hammer: Tool = Tool()
+                func work() { hammer.use() }
+            }
+            """,
+        ])
+        XCTAssertFalse(
+            symbols.contains("swift::Car.start"),
+            "a file-level variable must not take the property's place; got \(symbols)"
+        )
+        XCTAssertTrue(
+            symbols.contains("swift::Motor.start"),
+            "a typed file-level variable must not hide the property; got \(symbols)"
+        )
+        XCTAssertTrue(
+            symbols.contains("swift::Tool.use"),
+            "an untyped file-level variable must not hide the property; got \(symbols)"
+        )
+    }
 }

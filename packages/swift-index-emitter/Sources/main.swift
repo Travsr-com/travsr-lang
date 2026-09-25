@@ -766,14 +766,20 @@ final class ScipVisitor: SyntaxVisitor {
         scopeNames[scopeNames.count - 1].insert(name)
     }
 
+    // Inside a type, its own members shadow a file-level variable of the same
+    // name, so the file's frame is not searched there.
+    private var fileFramesSkipped: Int { typeStack.isEmpty ? 0 : 1 }
+
     private func isLocalName(_ name: String) -> Bool {
-        for frame in scopeNames.reversed() where frame.contains(name) { return true }
+        for frame in scopeNames.dropFirst(fileFramesSkipped).reversed() where frame.contains(name) {
+            return true
+        }
         return false
     }
 
     // Innermost-scope-first lookup.
     private func lookupType(_ name: String) -> String? {
-        for frame in scopeStack.reversed() {
+        for frame in scopeStack.dropFirst(fileFramesSkipped).reversed() {
             if let t = frame[name] { return t }
         }
         return nil
