@@ -1063,8 +1063,7 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
              kotlin-language-server resolved no classpath and every reference to an \
              Android or dependency type is unresolved; only calls between the \
              repository's own Kotlin sources can have landed. Point ANDROID_HOME at an \
-             installed SDK (or set sdk.dir in local.properties at the repository root), \
-             then re-run `travsr init --semantic --force`.",
+             installed SDK, then re-run `travsr init --semantic --force`.",
         ));
     }
 

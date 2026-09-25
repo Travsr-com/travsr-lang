@@ -82,22 +82,41 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
 /// Gradle init-script fragment that extends scip-java's SemanticDB plugin to
 /// Android Gradle Plugin modules (#904). See the module docs for why.
 ///
-/// It runs after scip-java's own plugin in each project's `afterEvaluate` and
-/// does two things:
+/// It runs after scip-java's own plugin in each project's `afterEvaluate`.
+/// A project that applies the `java` plugin is left entirely to scip-java's
+/// plugin; for every other project it does two things:
 ///
 /// 1. Puts the repositories declared in `settings.gradle` back onto the
-///    project. scip-java 0.12.x injects `mavenCentral()` and `mavenLocal()` as
-///    PROJECT repositories, and under Gradle's default `PREFER_PROJECT` mode a
-///    project that has any repository of its own ignores the settings ones, so
-///    `google()` disappears and AGP's own artifacts (`aapt2`, the Android
-///    Gradle API) stop resolving. Measured on an AGP 8.13 module: the build
-///    failed with "Could not find com.android.tools.build:aapt2" until the
-///    settings repositories were re-added. scip-java 0.13 already skips the
-///    injection in this case (its issue #847), so the block is a no-op there.
+///    project. Both scip-java generations inject `mavenCentral()` and
+///    `mavenLocal()` as PROJECT repositories from their own `afterEvaluate`
+///    (0.12.x unconditionally; 0.13.1 too, catching only the
+///    `InvalidUserCodeException` a `FAIL_ON_PROJECT_REPOS` build throws, and
+///    only its later main-branch fix for issue #847 skips the injection when
+///    settings declare repositories). Under Gradle's default `PREFER_PROJECT`
+///    mode a project that has any repository of its own ignores the settings
+///    ones, so `google()` disappears and AGP's own artifacts (`aapt2`, the
+///    Android Gradle API) stop resolving. Measured on an AGP 8.13 module: the
+///    build failed with "Could not find com.android.tools.build:aapt2" until
+///    the settings repositories were re-added. Kept below the `java` check so
+///    a plain Java build keeps resolving from exactly where it did before,
+///    and done only under `PREFER_PROJECT` (the mode that has the problem),
+///    so a `PREFER_SETTINGS` build is not warned at once per project.
 ///
-/// 2. For a project WITHOUT the `java` plugin, gives every non-test
-///    `JavaCompile` task the configuration scip-java's plugin gives a java
-///    project's tasks: the javac plugin jar on `compileOnly` (and on
+/// Before either, from `settingsEvaluated`, a `FAIL_ON_PROJECT_REPOS` build
+/// (the Android Studio template default) is relaxed to `PREFER_SETTINGS` for
+/// this one indexing build. In that mode scip-java's own injection above
+/// throws inside its plugin: 0.13.1 catches that, 0.12.x does not, and the
+/// build dies at configuration before any task exists ("Failed to notify
+/// project evaluation listener", measured on the AGP 8.13 module with the
+/// template's settings). `PREFER_SETTINGS` keeps resolving from exactly the
+/// repositories the settings declare and only downgrades the plugin's
+/// injection to a warning, so nothing resolves from anywhere it would not
+/// have. The user's `settings.gradle` is untouched: the property is changed
+/// in memory for this build only.
+///
+/// 2. Gives every `JavaCompile` task except the release and instrumentation
+///    (`AndroidTest`) variants the configuration scip-java's plugin gives a
+///    java project's tasks: the javac plugin jar on `compileOnly` (and on
 ///    `annotationProcessor` when processors are in use, since javac then
 ///    discovers plugins from the processor path only), the `-Xplugin` argument,
 ///    the JDK 17 `--add-exports` fork options, and the SemanticDB agent when
@@ -112,9 +131,13 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
 /// `afterEvaluate` callback is registered from the init-script, before the
 /// build script applies AGP, so it runs BEFORE AGP's own `afterEvaluate`
 /// creates the variant tasks, and an eager `withType(JavaCompile)` here is
-/// empty. Release and test variants are skipped: one build type is enough for
-/// an index, every variant compiles the same sources, and a release compile
-/// doubles the analysis time of a large app for nothing.
+/// empty. Unit-test variants ARE included: they are what compiles
+/// `src/test/java`, and leaving them out is exactly the test-blind index the
+/// `java.test-scope-dark` diagnostic exists to flag (the Maven path runs
+/// `test-compile` and scip-java wires `compileTestJava` for the same reason).
+/// Release and instrumentation variants are skipped: one build type is enough
+/// for an index, every variant compiles the same sources, and a release
+/// compile doubles the analysis time of a large app for nothing.
 ///
 /// The paths are read from the project's extra properties (`semanticdbTarget`
 /// / `scipTarget`, `javacPluginJar`, `javacAgentPath`) that scip-java's
@@ -122,15 +145,28 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
 /// and no backslash can reach a Groovy string literal.
 const AGP_INIT_SCRIPT_SHIM: &str = r#"
 // ---- travsr: Android Gradle Plugin support (see travsr-lang-java) ----
+import org.gradle.api.initialization.resolve.RepositoriesMode
 import org.gradle.api.tasks.compile.JavaCompile
+settingsEvaluated { s ->
+  try {
+    def mode = s.dependencyResolutionManagement.repositoriesMode
+    if (mode.getOrNull() == RepositoriesMode.FAIL_ON_PROJECT_REPOS) {
+      mode.set(RepositoriesMode.PREFER_SETTINGS)
+    }
+  } catch (Throwable ignored) {
+  }
+}
 allprojects { p ->
   p.afterEvaluate {
+    if (p.plugins.hasPlugin("java")) { return }
     try {
-      def settingsRepos = p.gradle.settings.dependencyResolutionManagement.repositories
-      settingsRepos.each { r -> if (p.repositories.findByName(r.name) == null) { p.repositories.add(r) } }
+      def management = p.gradle.settings.dependencyResolutionManagement
+      def mode = management.repositoriesMode.getOrNull()
+      if (mode == null || mode == RepositoriesMode.PREFER_PROJECT) {
+        management.repositories.each { r -> if (p.repositories.findByName(r.name) == null) { p.repositories.add(r) } }
+      }
     } catch (Throwable ignored) {
     }
-    if (p.plugins.hasPlugin("java")) { return }
     def targetKey = p.ext.has("semanticdbTarget") ? "semanticdbTarget" : (p.ext.has("scipTarget") ? "scipTarget" : null)
     if (targetKey == null || !p.ext.has("javacPluginJar")) { return }
     def pluginId = targetKey == "semanticdbTarget" ? "semanticdb" : "scip"
@@ -146,7 +182,7 @@ allprojects { p ->
                          "--add-exports", "jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
                          "--add-exports", "jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
                          "--add-exports", "jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED"]
-    def selected = p.tasks.withType(JavaCompile).matching { t -> !(t.name ==~ /.*(UnitTest|AndroidTest|Release).*/) }
+    def selected = p.tasks.withType(JavaCompile).matching { t -> !(t.name ==~ /.*(AndroidTest|Release).*/) }
     selected.configureEach { t ->
       t.options.fork = true
       t.options.incremental = false
@@ -161,8 +197,8 @@ allprojects { p ->
       }
       t.options.forkOptions.jvmArgs = jvmArgs
     }
-    p.tasks.named("scipCompileAll") { it.dependsOn(selected) }
-    p.tasks.named("scipPrintDependencies") { it.enabled = false }
+    if (p.tasks.findByName("scipCompileAll") != null) { p.tasks.named("scipCompileAll") { it.dependsOn(selected) } }
+    if (p.tasks.findByName("scipPrintDependencies") != null) { p.tasks.named("scipPrintDependencies") { it.enabled = false } }
   }
 }
 "#;
@@ -198,8 +234,7 @@ fn android_sdk_diagnostic(build_output: &str) -> Option<PluginDiagnostic> {
             "the Android SDK this Android Gradle Plugin build needs was not found \
              (Gradle said: \"{marker}\"), so the build could not configure and no Java \
              symbols or call edges were produced. Point ANDROID_HOME at an installed SDK \
-             that has the platform and build-tools the project asks for (or set sdk.dir \
-             in local.properties at the repository root), then re-run \
+             that has the platform and build-tools the project asks for, then re-run \
              `travsr init --semantic --force`."
         ),
     ))
@@ -1041,9 +1076,12 @@ mod tests {
             r#"if (p.plugins.hasPlugin("java")) { return }"#,
             "p.tasks.withType(JavaCompile)",
             r#"p.tasks.named("scipCompileAll") { it.dependsOn(selected) }"#,
+            "settingsEvaluated",
+            "RepositoriesMode.FAIL_ON_PROJECT_REPOS",
+            "mode.set(RepositoriesMode.PREFER_SETTINGS)",
             r#"p.tasks.named("scipPrintDependencies") { it.enabled = false }"#,
             "-javaagent:",
-            "settingsRepos",
+            "management.repositories.each",
         ] {
             assert!(
                 script.contains(needle),
@@ -1071,8 +1109,22 @@ mod tests {
         }
         assert!(AGP_INIT_SCRIPT_SHIM.contains(r#""semanticdbTarget" ? "semanticdb" : "scip""#));
         assert!(!AGP_INIT_SCRIPT_SHIM.contains('\\'));
-        // Test and release variants are left out, one build type is enough.
-        assert!(AGP_INIT_SCRIPT_SHIM.contains("UnitTest|AndroidTest|Release"));
+        // Release and instrumentation variants are left out, one build type is
+        // enough; unit-test variants stay in, since they compile src/test/java.
+        assert!(AGP_INIT_SCRIPT_SHIM.contains("AndroidTest|Release"));
+        assert!(!AGP_INIT_SCRIPT_SHIM.contains("UnitTest"));
+        // Plain Java builds are left to scip-java's plugin entirely: the
+        // settings-repository re-add sits below the java check.
+        let java_check = AGP_INIT_SCRIPT_SHIM
+            .find(r#"hasPlugin("java")"#)
+            .expect("java check");
+        let repo_readd = AGP_INIT_SCRIPT_SHIM
+            .find("management.repositories.each")
+            .expect("repo re-add");
+        assert!(
+            java_check < repo_readd,
+            "repository re-add must follow the java check"
+        );
     }
 
     #[test]
@@ -1096,7 +1148,6 @@ mod tests {
         let d = android_sdk_diagnostic(missing).expect("SDK failure must produce a diagnostic");
         assert_eq!(d.code, "java.android-sdk-missing");
         assert!(d.message.contains("ANDROID_HOME"), "{}", d.message);
-        assert!(d.message.contains("local.properties"), "{}", d.message);
         assert!(
             d.message.contains("SDK location not found"),
             "{}",
