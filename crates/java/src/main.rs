@@ -20,6 +20,20 @@
 //!      Windows).
 //!   4. Ingest the SCIP index via `travsr_lang_scip_reader::ingest`.
 //!
+//! ## Android Gradle Plugin (AGP) projects
+//!
+//! scip-java's Gradle plugin configures a project only when it applies the
+//! `java` plugin. An Android module applies `com.android.application` or
+//! `com.android.library` instead, so on an AGP repo the plugin attaches the
+//! SemanticDB javac plugin to nothing, `scipCompileAll` depends on nothing, and
+//! the build "succeeds" with an empty index (#904). Both platforms therefore
+//! add [`AGP_INIT_SCRIPT_SHIM`] to the Gradle invocation: on Windows it is
+//! appended to the init-script travsr renders, on unix it is passed to
+//! scip-java as an extra `--init-script` through the build command. The shim
+//! reads the paths scip-java's own init-script already publishes as project
+//! extra properties, so it has nothing of its own to template and works with
+//! both the 0.12.x (`semanticdb`) and 0.13.x (`scip`) plugin generations.
+//!
 //! ## Sandbox class: RequiresElevated (ADR-017 Rule 1)
 //!
 //! scip-java drives Maven/Gradle, which resolve dependencies from the network
@@ -43,6 +57,7 @@ use std::path::{Path, PathBuf};
 use travsr_core::Language;
 use travsr_plugin_sdk::{
     run_plugin, InvokeRequest, InvokeResponse, ParseRequest, ParseResponse, Plugin,
+    PluginDiagnostic,
 };
 
 /// JVM builds (Gradle/Maven) can be slow on a cold dependency cache.
@@ -63,6 +78,228 @@ const TEST_SCOPE_CAUSE_HINT: &str = "SemanticDB is a javac plugin, so a test \
      is a build that skips test compilation: `-Dmaven.test.skip=true` (on the \
      command line or in `.mvn/maven.config`), `<maven.test.skip>` or \
      `<skipTests>` in the pom, or `-x compileTestJava` for Gradle.";
+
+/// Gradle init-script fragment that extends scip-java's SemanticDB plugin to
+/// Android Gradle Plugin modules (#904). See the module docs for why.
+///
+/// It runs after scip-java's own plugin in each project's `afterEvaluate`.
+/// A project that applies the `java` plugin is left entirely to scip-java's
+/// plugin; for every other project it does two things:
+///
+/// 1. Puts the repositories declared in `settings.gradle` back onto the
+///    project. Both scip-java generations inject `mavenCentral()` and
+///    `mavenLocal()` as PROJECT repositories from their own `afterEvaluate`
+///    (0.12.x unconditionally; 0.13.1 too, catching only the
+///    `InvalidUserCodeException` a `FAIL_ON_PROJECT_REPOS` build throws, and
+///    only its later main-branch fix for issue #847 skips the injection when
+///    settings declare repositories). Under Gradle's default `PREFER_PROJECT`
+///    mode a project that has any repository of its own ignores the settings
+///    ones, so `google()` disappears and AGP's own artifacts (`aapt2`, the
+///    Android Gradle API) stop resolving. Measured on an AGP 8.13 module: the
+///    build failed with "Could not find com.android.tools.build:aapt2" until
+///    the settings repositories were re-added. Kept below the `java` check so
+///    a plain Java build keeps resolving from exactly where it did before,
+///    and done only under `PREFER_PROJECT` (the mode that has the problem),
+///    so a `PREFER_SETTINGS` build is not warned at once per project.
+///
+/// Before either, from `settingsEvaluated` and without importing
+/// `RepositoriesMode` (the class exists only from Gradle 6.8, and an import
+/// that fails to resolve kills the whole init-script on an older Gradle, for
+/// every Gradle repo the shim is added to; the mode is compared by name and
+/// set reflectively inside the `try`), a `FAIL_ON_PROJECT_REPOS` build
+/// (the Android Studio template default) is relaxed to `PREFER_SETTINGS` for
+/// this one indexing build. In that mode scip-java's own injection above
+/// throws inside its plugin: 0.13.1 catches that, 0.12.x does not, and the
+/// build dies at configuration before any task exists ("Failed to notify
+/// project evaluation listener", measured on the AGP 8.13 module with the
+/// template's settings). `PREFER_SETTINGS` keeps resolving from exactly the
+/// repositories the settings declare and only downgrades the plugin's
+/// injection to a warning, so nothing resolves from anywhere it would not
+/// have. The user's `settings.gradle` is untouched: the property is changed
+/// in memory for this build only.
+///
+/// 2. Gives every `JavaCompile` task except the release and instrumentation
+///    (`AndroidTest`) variants the configuration scip-java's plugin gives a
+///    java project's tasks: the javac plugin jar on `compileOnly` and
+///    `testCompileOnly` (and on `annotationProcessor` / `testAnnotationProcessor`
+///    when that scope has processors, since javac then discovers plugins from
+///    the processor path only; the two scopes are independent, so a test-only
+///    processor such as Hilt's `testAnnotationProcessor` would otherwise fail
+///    the unit-test compile with "plug-in not found" and take the whole Java
+///    index with it, measured on the AGP 8.13 fixture), the `-Xplugin`
+///    argument, the `--add-exports` fork options when the javac toolchain is
+///    JDK 17 or newer (a forked JDK 8 javac rejects them), and the SemanticDB
+///    agent when the scip-java generation ships one. The dependency adds are
+///    guarded like both scip-java generations guard their own: a build that
+///    already resolved `compileOnly` gets a warning instead of "Failed to
+///    notify project evaluation listener". `-Xplugin` itself is added at
+///    execution time and only when the jar is on the path javac will load
+///    plugins from (the processor path when Gradle passes one, the classpath
+///    otherwise), so a task the adds never reached, a KMP `jvm` target fed from
+///    `jvmCompileOnly` for instance, compiles without the plugin rather than
+///    failing with "plug-in not found" and taking the whole build with it; on
+///    0.12.x the agent still injects the plugin there. `scipCompileAll` is then made to
+///    depend on those tasks, and `scipPrintDependencies` is disabled: on AGP 9
+///    that task dies with a `ConcurrentModificationException` while resolving
+///    AGP's lazily-registered configurations, and its output (Maven
+///    coordinates for cross-repository navigation) is not something travsr
+///    reads.
+///
+/// Task configuration is lazy (`matching` + `configureEach`) on purpose: this
+/// `afterEvaluate` callback is registered from the init-script, before the
+/// build script applies AGP, so it runs BEFORE AGP's own `afterEvaluate`
+/// creates the variant tasks, and an eager `withType(JavaCompile)` here is
+/// empty. Unit-test variants ARE included: they are what compiles
+/// `src/test/java`, and leaving them out is exactly the test-blind index the
+/// `java.test-scope-dark` diagnostic exists to flag (the Maven path runs
+/// `test-compile` and scip-java wires `compileTestJava` for the same reason).
+/// Release and instrumentation variants are skipped: one build type is enough
+/// for an index, every variant compiles the same sources, and a release
+/// compile doubles the analysis time of a large app for nothing.
+///
+/// The paths are read from the project's extra properties (`semanticdbTarget`
+/// / `scipTarget`, `javacPluginJar`, `javacAgentPath`) that scip-java's
+/// init-script sets on every project, so this fragment needs no templating
+/// and no backslash can reach a Groovy string literal.
+const AGP_INIT_SCRIPT_SHIM: &str = r#"
+// ---- travsr: Android Gradle Plugin support (see travsr-lang-java) ----
+import org.gradle.api.JavaVersion
+import org.gradle.api.tasks.compile.JavaCompile
+// RepositoriesMode is never imported: the class only exists from Gradle 6.8,
+// and an unresolvable import fails the whole init-script on an older Gradle
+// before any try/catch can run, for every Gradle repo this shim is added to.
+// The mode is compared by name and set reflectively, inside the catch.
+settingsEvaluated { s ->
+  try {
+    def mode = s.dependencyResolutionManagement.repositoriesMode
+    if (String.valueOf(mode.getOrNull()) == "FAIL_ON_PROJECT_REPOS") {
+      def modes = Class.forName("org.gradle.api.initialization.resolve.RepositoriesMode")
+      mode.set(Enum.valueOf(modes, "PREFER_SETTINGS"))
+    }
+  } catch (Throwable ignored) {
+  }
+}
+allprojects { p ->
+  p.afterEvaluate {
+    if (p.plugins.hasPlugin("java")) { return }
+    try {
+      def management = p.gradle.settings.dependencyResolutionManagement
+      def mode = management.repositoriesMode.getOrNull()
+      if (mode == null || String.valueOf(mode) == "PREFER_PROJECT") {
+        management.repositories.each { r -> if (p.repositories.findByName(r.name) == null) { p.repositories.add(r) } }
+      }
+    } catch (Throwable ignored) {
+    }
+    def targetKey = p.ext.has("semanticdbTarget") ? "semanticdbTarget" : (p.ext.has("scipTarget") ? "scipTarget" : null)
+    if (targetKey == null || !p.ext.has("javacPluginJar")) { return }
+    def pluginId = targetKey == "semanticdbTarget" ? "semanticdb" : "scip"
+    def targetroot = p.ext[targetKey].toString()
+    def pluginJar = p.ext["javacPluginJar"].toString()
+    def agentJar = p.ext.has("javacAgentPath") ? p.ext["javacAgentPath"].toString() : null
+    def sourceroot = p.rootDir.toString()
+    try {
+      ["compileOnly", "testCompileOnly"].each { conf ->
+        if (p.configurations.findByName(conf) != null) { p.dependencies.add(conf, p.files(pluginJar)) }
+      }
+      ["annotationProcessor", "testAnnotationProcessor"].each { conf ->
+        def c = p.configurations.findByName(conf)
+        if (c != null && !c.dependencies.isEmpty()) { p.dependencies.add(conf, p.files(pluginJar)) }
+      }
+    } catch (Throwable e) {
+      p.logger.warn("travsr: could not attach the SemanticDB javac plugin to project '" + p.path + "' (" + e.getClass().getSimpleName() + ": " + e.getMessage() + "); its Java sources will not be indexed unless the javac agent is in use")
+    }
+    def moduleOptions = ["--add-exports", "jdk.compiler/com.sun.tools.javac.api=ALL-UNNAMED",
+                         "--add-exports", "jdk.compiler/com.sun.tools.javac.code=ALL-UNNAMED",
+                         "--add-exports", "jdk.compiler/com.sun.tools.javac.model=ALL-UNNAMED",
+                         "--add-exports", "jdk.compiler/com.sun.tools.javac.tree=ALL-UNNAMED",
+                         "--add-exports", "jdk.compiler/com.sun.tools.javac.util=ALL-UNNAMED"]
+    def selected = p.tasks.withType(JavaCompile).matching { t -> !(t.name ==~ /.*(AndroidTest|Release).*/) }
+    selected.configureEach { t ->
+      t.options.fork = true
+      t.options.incremental = false
+      // -Xplugin is decided at execution time, when the task's inputs are
+      // resolved: javac loads plugins from -processorpath when Gradle passes
+      // one (a non-empty annotation processor path) and from the classpath
+      // otherwise, and the jar only reached those through the configurations
+      // above. A task fed from other configurations (a KMP jvm target, or a
+      // project whose adds failed) gets no -Xplugin instead of a javac that
+      // dies with "plug-in not found" and takes the whole build with it.
+      // Because -Xplugin is added after the inputs are fingerprinted, it is
+      // outside the build-cache key, so a second index run with
+      // org.gradle.caching=true (the sandbox hands Gradle the user's real
+      // ~/.gradle) would restore the compile FROM-CACHE and write no
+      // SemanticDB; scip-java's own configuration-time -randomtimestamp is what
+      // keeps its tasks out of the cache. These tasks are taken out of it
+      // and out of the up-to-date check here, at configuration time.
+      t.outputs.cacheIf("travsr indexing always recompiles") { false }
+      t.outputs.upToDateWhen { false }
+      t.inputs.property("travsrIndexNonce", System.nanoTime())
+      t.doFirst {
+        def jarPath = new File(pluginJar).canonicalPath
+        def carries = { fc -> fc != null && fc.files.any { it.canonicalPath == jarPath } }
+        def apPath = t.options.annotationProcessorPath
+        def reachable = (apPath != null && !apPath.isEmpty()) ? carries(apPath) : carries(t.classpath)
+        def args = t.options.compilerArgs
+        if (reachable && !args.any { it.toString().startsWith("-Xplugin:" + pluginId) }) {
+          args.add("-Xplugin:" + pluginId + " -targetroot:" + targetroot + " -sourceroot:" + sourceroot + " -randomtimestamp=" + System.nanoTime())
+        }
+      }
+      def jvmArgs = new ArrayList<String>(t.options.forkOptions.jvmArgs ?: [])
+      def javacVersion = null
+      try {
+        def compiler = t.javaCompiler.getOrNull()
+        if (compiler != null) { javacVersion = compiler.metadata.languageVersion.asInt() }
+      } catch (Throwable ignored) {
+      }
+      if (javacVersion == null) { javacVersion = JavaVersion.current().majorVersion.toInteger() }
+      if (javacVersion >= 17) { jvmArgs.addAll(moduleOptions) }
+      if (agentJar != null) {
+        jvmArgs.addAll(["-javaagent:" + agentJar, "-Dsemanticdb.pluginpath=" + pluginJar, "-Dsemanticdb.sourceroot=" + sourceroot, "-Dsemanticdb.targetroot=" + targetroot])
+      }
+      t.options.forkOptions.jvmArgs = jvmArgs
+    }
+    if (p.tasks.findByName("scipCompileAll") != null) { p.tasks.named("scipCompileAll") { it.dependsOn(selected) } }
+    if (p.tasks.findByName("scipPrintDependencies") != null) { p.tasks.named("scipPrintDependencies") { it.enabled = false } }
+  }
+}
+"#;
+
+/// The Android Gradle Plugin's own words for "I cannot find the SDK", as they
+/// appear in a failed build's output. `SDK location not found` is the
+/// no-`ANDROID_HOME`/no-`local.properties` case; the others are an SDK that is
+/// there but lacks the platform or build tools the project asks for, or that
+/// AGP tried and failed to complete itself.
+const ANDROID_SDK_FAILURE_MARKERS: &[&str] = &[
+    "SDK location not found",
+    "Failed to find Platform SDK with path",
+    "Failed to find target with hash string",
+    "Failed to find Build Tools revision",
+    "Failed to install the following Android SDK packages",
+];
+
+/// A structured diagnostic naming the Android SDK when a failed Gradle build's
+/// output says the SDK is what was missing (#904).
+///
+/// Without this the failure reached the user as "produced no symbols", the
+/// same shape as every other zero-node run, and the AGP message that named the
+/// actual cause sat in a sidecar stderr line nobody sees at default verbosity.
+/// The host persists warning diagnostics into `travsr status`, so the SDK is
+/// named where the user looks.
+fn android_sdk_diagnostic(build_output: &str) -> Option<PluginDiagnostic> {
+    let marker = ANDROID_SDK_FAILURE_MARKERS
+        .iter()
+        .find(|m| build_output.contains(**m))?;
+    Some(PluginDiagnostic::warning(
+        "java.android-sdk-missing",
+        format!(
+            "the Android SDK this Android Gradle Plugin build needs was not found \
+             (Gradle said: \"{marker}\"), so the build could not configure and no Java \
+             symbols or call edges were produced. Point ANDROID_HOME at an installed SDK \
+             that has the platform and build-tools the project asks for, then re-run \
+             `travsr init --semantic --force`."
+        ),
+    ))
+}
 
 struct JavaPhaseB;
 
@@ -100,8 +337,15 @@ impl Plugin for JavaPhaseB {
                 resp
             }
             Err(e) => {
-                tracing::warn!("scip-java failed for {}: {e:#}", req.root.display());
-                InvokeResponse::default()
+                let detail = format!("{e:#}");
+                tracing::warn!("scip-java failed for {}: {detail}", req.root.display());
+                // A build that failed for want of the Android SDK says so in a
+                // structured diagnostic the host keeps, rather than only in the
+                // stderr line above (#904).
+                InvokeResponse {
+                    diagnostics: android_sdk_diagnostic(&detail).into_iter().collect(),
+                    ..InvokeResponse::default()
+                }
             }
         }
     }
@@ -197,9 +441,18 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
     // `verify` and `-DskipTests` are deliberately not restored: dropping
     // `verify` is the whole point of naming a phase here, and `test-compile`
     // runs no tests, so skipping them is moot.
-    let maven = matches!(detect_build_system(root), Some(BuildSystem::Maven));
+    let build_system = detect_build_system(root);
     let mut cmd = std::process::Command::new(bin);
     cmd.arg("index").arg("--output").arg(&output_path);
+    // Name the build tool instead of letting scip-java guess. It refuses to
+    // guess when a repo carries markers for both (a stray `gradlew` next to a
+    // `pom.xml` is enough): "Multiple build tools detected", exit 1, zero
+    // symbols (#835). `detect_build_system` already made that call, and the
+    // Gradle-specific arguments below are only right if scip-java runs Gradle.
+    if let Some(name) = build_system.as_ref().map(BuildSystem::scip_java_name) {
+        cmd.args(["--build-tool", name]);
+    }
+    let maven = matches!(build_system, Some(BuildSystem::Maven));
     if maven {
         // `-Dmaven.clean.failOnError=false` is what lets `clean` run inside the
         // sandbox. The host grants `target/` as a bind over a read-only repo
@@ -221,6 +474,18 @@ fn run_scip_java(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
             "clean",
             "test-compile",
         ]);
+    } else if matches!(build_system, Some(BuildSystem::Gradle)) {
+        // Gradle: add the AGP shim as a second init-script (#904). scip-java
+        // keeps its own `--init-script`, `-P` and `-D` arguments whatever the
+        // build command says; the command only replaces the task list, so the
+        // tasks scip-java would have run are repeated here. Gradle runs
+        // init-scripts in command-line order, so the shim's `afterEvaluate`
+        // callbacks register after the plugin's and see its extra properties.
+        let shim = scratch.path().join("travsr-agp-init.gradle");
+        std::fs::write(&shim, AGP_INIT_SCRIPT_SHIM)
+            .context("failed to write the AGP init-script")?;
+        cmd.arg("--").arg("--init-script").arg(&shim);
+        cmd.args(GRADLE_INDEX_TASKS);
     }
     cmd.current_dir(root);
     run_to_completion(cmd, "scip-java")?;
@@ -303,6 +568,23 @@ enum BuildSystem {
     Maven,
 }
 
+impl BuildSystem {
+    /// The name scip-java's `--build-tool` flag takes for this build system.
+    /// Matched case-insensitively by both the 0.12.x and 0.13.x lines.
+    fn scip_java_name(&self) -> &'static str {
+        match self {
+            BuildSystem::Gradle => "gradle",
+            BuildSystem::Maven => "maven",
+        }
+    }
+}
+
+/// The Gradle tasks scip-java runs by default (its `GradleBuildTool`), repeated
+/// wherever travsr supplies the build command itself: `clean` so every source
+/// recompiles and emits `.semanticdb` fresh, then the plugin's
+/// `scipPrintDependencies` and `scipCompileAll`.
+const GRADLE_INDEX_TASKS: [&str; 3] = ["clean", "scipPrintDependencies", "scipCompileAll"];
+
 fn detect_build_system(root: &Path) -> Option<BuildSystem> {
     let has_gradle = [
         "gradlew.bat",
@@ -373,9 +655,7 @@ fn build_gradle(
         .arg("--console=plain")
         .arg("--init-script")
         .arg(&init_script)
-        .arg("clean")
-        .arg("scipPrintDependencies")
-        .arg("scipCompileAll");
+        .args(GRADLE_INDEX_TASKS);
     run_to_completion(cmd, "gradle")?;
 
     Ok(targetroot)
@@ -385,7 +665,8 @@ fn build_gradle(
 /// and no verbatim prefix: a backslash in a Groovy string literal is an escape,
 /// which is exactly what breaks scip-java's own generated init-script on Windows.
 /// `buildDir` is redirected out of the repo so the build needs no repo-write
-/// grant (the sandbox binds the repo read-only).
+/// grant (the sandbox binds the repo read-only). The AGP shim is appended so
+/// Android modules are indexed too (#904, see [`AGP_INIT_SCRIPT_SHIM`]).
 fn render_gradle_init_script(
     jars: &GradlePluginJars,
     targetroot: &Path,
@@ -412,7 +693,7 @@ allprojects {{
   apply plugin: SemanticdbGradlePlugin
 }}
 "#
-    )
+    ) + AGP_INIT_SCRIPT_SHIM
 }
 
 /// A path as a Groovy string-literal value: verbatim prefix stripped, backslashes
@@ -819,5 +1100,133 @@ mod tests {
         // Gradle wins when both are present.
         std::fs::write(dir.path().join("build.gradle"), "").unwrap();
         assert_eq!(detect_build_system(dir.path()), Some(BuildSystem::Gradle));
+    }
+
+    // #904: the rendered Windows init-script carries the AGP shim, and the shim
+    // is what an Android module needs from it: the javac plugin attached to the
+    // module's own `JavaCompile` tasks, `scipCompileAll` made to depend on
+    // them, and `scipPrintDependencies` (which cannot survive AGP 9) disabled.
+    // Groovy-literal hygiene is asserted on the whole script, shim included.
+    #[test]
+    fn init_script_carries_the_agp_shim() {
+        let jars = GradlePluginJars {
+            gradle_plugin: PathBuf::from(r"C:\scratch\scip-java-plugins\gradle-plugin.jar"),
+            semanticdb_plugin: PathBuf::from(r"C:\scratch\scip-java-plugins\semanticdb-plugin.jar"),
+            semanticdb_agent: PathBuf::from(r"C:\scratch\scip-java-plugins\semanticdb-agent.jar"),
+        };
+        let script = render_gradle_init_script(
+            &jars,
+            Path::new(r"C:\scratch\semanticdb-targetroot"),
+            Path::new(r"C:\scratch\gradle-build"),
+        );
+        assert!(
+            !script.contains('\\'),
+            "no backslash may reach Groovy:\n{script}"
+        );
+        // The plugin is applied before the shim, so the shim's afterEvaluate
+        // runs after the plugin's and finds `scipCompileAll`.
+        let plugin_at = script
+            .find("apply plugin: SemanticdbGradlePlugin")
+            .expect("plugin");
+        let shim_at = script.find("Android Gradle Plugin support").expect("shim");
+        assert!(
+            plugin_at < shim_at,
+            "shim must follow the plugin application"
+        );
+        for needle in [
+            r#"if (p.plugins.hasPlugin("java")) { return }"#,
+            "p.tasks.withType(JavaCompile)",
+            r#"p.tasks.named("scipCompileAll") { it.dependsOn(selected) }"#,
+            "settingsEvaluated",
+            r#"String.valueOf(mode.getOrNull()) == "FAIL_ON_PROJECT_REPOS""#,
+            r#"Enum.valueOf(modes, "PREFER_SETTINGS")"#,
+            r#"["compileOnly", "testCompileOnly"]"#,
+            r#"["annotationProcessor", "testAnnotationProcessor"]"#,
+            "if (javacVersion >= 17) { jvmArgs.addAll(moduleOptions) }",
+            "t.doFirst {",
+            r#"t.outputs.cacheIf("travsr indexing always recompiles") { false }"#,
+            "t.outputs.upToDateWhen { false }",
+            "def reachable = ",
+            r#"p.tasks.named("scipPrintDependencies") { it.enabled = false }"#,
+            "-javaagent:",
+            "management.repositories.each",
+        ] {
+            assert!(
+                script.contains(needle),
+                "init-script is missing `{needle}`:\n{script}"
+            );
+        }
+    }
+
+    // The shim never templates a path of its own: everything it needs comes
+    // from the extra properties scip-java's init-script sets, for either plugin
+    // generation. That is what lets one static fragment serve both the Windows
+    // (0.12.x, `semanticdb`) and unix (0.13.x, `scip`) invocations.
+    #[test]
+    fn agp_shim_reads_both_plugin_generations_from_extra_properties() {
+        for key in [
+            "semanticdbTarget",
+            "scipTarget",
+            "javacPluginJar",
+            "javacAgentPath",
+        ] {
+            assert!(
+                AGP_INIT_SCRIPT_SHIM.contains(&format!("\"{key}\"")),
+                "shim must read `{key}`"
+            );
+        }
+        assert!(AGP_INIT_SCRIPT_SHIM.contains(r#""semanticdbTarget" ? "semanticdb" : "scip""#));
+        assert!(!AGP_INIT_SCRIPT_SHIM.contains('\\'));
+        // Release and instrumentation variants are left out, one build type is
+        // enough; unit-test variants stay in, since they compile src/test/java.
+        assert!(AGP_INIT_SCRIPT_SHIM.contains("AndroidTest|Release"));
+        assert!(!AGP_INIT_SCRIPT_SHIM.contains("UnitTest"));
+        // Plain Java builds are left to scip-java's plugin entirely: the
+        // settings-repository re-add sits below the java check.
+        let java_check = AGP_INIT_SCRIPT_SHIM
+            .find(r#"hasPlugin("java")"#)
+            .expect("java check");
+        let repo_readd = AGP_INIT_SCRIPT_SHIM
+            .find("management.repositories.each")
+            .expect("repo re-add");
+        assert!(
+            java_check < repo_readd,
+            "repository re-add must follow the java check"
+        );
+    }
+
+    #[test]
+    fn scip_java_build_tool_names_match_detection() {
+        assert_eq!(BuildSystem::Gradle.scip_java_name(), "gradle");
+        assert_eq!(BuildSystem::Maven.scip_java_name(), "maven");
+        assert_eq!(
+            GRADLE_INDEX_TASKS,
+            ["clean", "scipPrintDependencies", "scipCompileAll"]
+        );
+    }
+
+    // #904: a failed AGP build that names the SDK yields a diagnostic naming the
+    // SDK; any other failure yields none and stays a plain stderr line.
+    #[test]
+    fn android_sdk_diagnostic_fires_only_on_agp_sdk_failures() {
+        let missing = "gradle exited with exit code: 1:\nFAILURE: Build failed with an exception.\n\
+                       * What went wrong:\nSDK location not found. Define a valid SDK location with an \
+                       ANDROID_HOME environment variable or by setting the sdk.dir path in your \
+                       project's local properties file at 'C:\\repo\\local.properties'.";
+        let d = android_sdk_diagnostic(missing).expect("SDK failure must produce a diagnostic");
+        assert_eq!(d.code, "java.android-sdk-missing");
+        assert!(d.message.contains("ANDROID_HOME"), "{}", d.message);
+        assert!(
+            d.message.contains("SDK location not found"),
+            "{}",
+            d.message
+        );
+
+        let platform = "Failed to find Platform SDK with path: platforms;android-36";
+        assert!(android_sdk_diagnostic(platform).is_some());
+
+        let unrelated = "gradle exited with exit code: 1:\nerror: cannot find symbol Foo";
+        assert!(android_sdk_diagnostic(unrelated).is_none());
+        assert!(android_sdk_diagnostic("").is_none());
     }
 }

@@ -35,10 +35,12 @@
 use anyhow::Context as _;
 use serde_json::{json, Value};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::rc::Rc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use travsr_core::{Edge, Language, Node, ScipRef, VName};
@@ -176,14 +178,75 @@ impl Plugin for KotlinPhaseB {
     }
 
     fn invoke_phase_b(&self, req: &InvokeRequest) -> InvokeResponse {
-        match run_kls(&req.root, req.corpus.as_str()) {
+        // Owned here rather than by the session so it outlives a failed run:
+        // KLS logs the missing SDK during `initialize`, and on a multi-module
+        // Android repo without one (a failing Gradle run per build file) that
+        // same `initialize` then times out.
+        let android_sdk_missing = Rc::new(Cell::new(false));
+        match run_kls(&req.root, req.corpus.as_str(), android_sdk_missing.clone()) {
             Ok(resp) => resp,
             Err(e) => {
-                tracing::warn!("KLS phase B failed for {}: {e:#}", req.root.display());
-                InvokeResponse::default()
+                let detail = format!("{e:#}");
+                tracing::warn!("KLS phase B failed for {}: {detail}", req.root.display());
+                InvokeResponse {
+                    diagnostics: failure_diagnostics(android_sdk_missing.get(), &detail),
+                    ..InvokeResponse::default()
+                }
             }
         }
     }
+}
+
+/// The diagnostics for a run that failed outright (#904). The failure a user
+/// can act on gets a structured record the host keeps; everything else stays
+/// a stderr line. A missing SDK wins over an `initialize` timeout: the timeout
+/// is then a symptom, and its remedy (warm the cache, re-run) cannot help.
+fn failure_diagnostics(android_sdk_missing: bool, detail: &str) -> Vec<PluginDiagnostic> {
+    if android_sdk_missing {
+        return vec![android_sdk_missing_diagnostic()];
+    }
+    kls_failure_diagnostic(detail).into_iter().collect()
+}
+
+/// The SDK was what KLS's Gradle run lacked. Emitted with a result that
+/// still carries the repo's own Kotlin references (KLS compiles the source
+/// path with the standard library alone, so those may resolve), and on its
+/// own when the run failed outright.
+fn android_sdk_missing_diagnostic() -> PluginDiagnostic {
+    PluginDiagnostic::warning(
+        "kotlin.android-sdk-missing",
+        "the Android SDK this Android Gradle Plugin build needs was not found, so \
+         kotlin-language-server resolved no classpath and every reference to an \
+         Android or dependency type is unresolved; only calls between the \
+         repository's own Kotlin sources can have landed. Point ANDROID_HOME at an \
+         installed SDK, then re-run `travsr init --semantic --force`.",
+    )
+}
+
+/// Name the cause when KLS never finished initializing (#904).
+///
+/// KLS resolves the classpath INSIDE `initialize`, with one Gradle run per
+/// build file it finds under the workspace. A large multi-module Android build
+/// (nowinandroid: about thirty `build.gradle.kts`) does not finish that inside
+/// the host's invoke window, so the run ends with zero symbols and, without
+/// this, nothing that says the analyzer simply ran out of time rather than
+/// finding nothing. Measured: nowinandroid times out at 285s on `initialize`
+/// with a warm dependency cache.
+fn kls_failure_diagnostic(detail: &str) -> Option<PluginDiagnostic> {
+    detail
+        .contains("timeout waiting for LSP 'initialize'")
+        .then(|| {
+            PluginDiagnostic::warning(
+                "kotlin.initialize-timeout",
+                "kotlin-language-server did not finish initializing within the analysis \
+                 window, so no Kotlin symbols or call edges were produced. It resolves \
+                 the classpath by running Gradle once per build file in the repository, \
+                 which a large multi-module build does not finish in time. A warm Gradle \
+                 daemon and dependency cache shorten it, so re-running \
+                 `travsr init --semantic --force` may complete; the result is otherwise \
+                 structural analysis only for Kotlin.",
+            )
+        })
 }
 
 // ── LSP data types ────────────────────────────────────────────────────────────
@@ -301,10 +364,34 @@ struct LspSession {
     /// started. `None` until KLS asks for one, so the wait matches nothing and
     /// times out loudly rather than declaring readiness it never observed.
     progress_token: Option<Value>,
+    /// KLS reported that the Gradle classpath resolution failed for want of
+    /// the Android SDK (#904). KLS forwards its own log through
+    /// `window/logMessage`, which is the only place the Gradle failure text
+    /// reaches this wrapper: KLS's stderr is not read, and the LSP session
+    /// itself carries on with an empty classpath, so without this the run
+    /// looked like any other under-resolved Kotlin project. Shared with the
+    /// caller so the flag survives an `initialize` that then times out: the
+    /// session is dropped with the error, but the SDK is still the cause to
+    /// name, not the timeout.
+    android_sdk_missing: Rc<Cell<bool>>,
+}
+
+/// The Android Gradle Plugin's own words for "I cannot find the SDK", as KLS
+/// relays them from a failed classpath build. Mirrors travsr-lang-java's list.
+const ANDROID_SDK_FAILURE_MARKERS: &[&str] = &[
+    "SDK location not found",
+    "Failed to find Platform SDK with path",
+    "Failed to find target with hash string",
+    "Failed to find Build Tools revision",
+    "Failed to install the following Android SDK packages",
+];
+
+fn names_android_sdk_failure(text: &str) -> bool {
+    ANDROID_SDK_FAILURE_MARKERS.iter().any(|m| text.contains(m))
 }
 
 impl LspSession {
-    fn new(mut child: Child) -> anyhow::Result<Self> {
+    fn new(mut child: Child, android_sdk_missing: Rc<Cell<bool>>) -> anyhow::Result<Self> {
         let stdin = child.stdin.take().context("child stdin not piped")?;
         let stdout = child.stdout.take().context("child stdout not piped")?;
 
@@ -333,6 +420,7 @@ impl LspSession {
             inbox: VecDeque::new(),
             next_id: 1,
             progress_token: None,
+            android_sdk_missing,
         })
     }
 
@@ -407,6 +495,19 @@ impl LspSession {
             // of it for every single message it received.
             (None, Some("$/progress")) => {
                 self.inbox.push_back(msg);
+                Ok(())
+            }
+            // KLS's log. Still dropped, but read first for the one failure
+            // that has to be named (#904): a Gradle run that could not find
+            // the Android SDK. KLS logs the Gradle output as a warning and
+            // continues with no classpath, so this is the only trace of it.
+            (None, Some("window/logMessage")) => {
+                if let Some(text) = msg["params"]["message"].as_str() {
+                    if names_android_sdk_failure(text) {
+                        tracing::warn!("KLS: Gradle could not find the Android SDK: {text}");
+                        self.android_sdk_missing.set(true);
+                    }
+                }
                 Ok(())
             }
             _ => Ok(()),
@@ -839,7 +940,11 @@ fn collect_kt_recursive(root: &Path, dir: &Path, out: &mut Vec<(PathBuf, String)
 
 // ── Main orchestrator ─────────────────────────────────────────────────────────
 
-fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
+fn run_kls(
+    root: &Path,
+    corpus: &str,
+    android_sdk_missing: Rc<Cell<bool>>,
+) -> anyhow::Result<InvokeResponse> {
     // #813: one read per referenced file, shared across all symbols.
     let mut src_cache = travsr_lang_scip_reader::SourceCache::new();
     let kls = kls_binary().context(
@@ -854,7 +959,7 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
         .spawn()
         .context("failed to spawn kotlin-language-server")?;
 
-    let mut session = LspSession::new(child)?;
+    let mut session = LspSession::new(child, android_sdk_missing.clone())?;
     let started = Instant::now();
     // The host kills the whole invoke at HOST_INVOKE_TIMEOUT_SECS and keeps
     // nothing, so every request this session makes has to finish inside that
@@ -983,6 +1088,14 @@ fn run_kls(root: &Path, corpus: &str) -> anyhow::Result<InvokeResponse> {
                  results are incomplete; check that it has enough memory and reindex.",
             ));
         }
+    }
+
+    // #904: name the SDK when that is what KLS's Gradle run lacked. Kotlin
+    // references between the repo's own sources may still resolve below (KLS
+    // compiles the source path with the standard library alone), so this is a
+    // caveat on the result rather than a reason to drop it.
+    if android_sdk_missing.get() {
+        diagnostics.push(android_sdk_missing_diagnostic());
     }
 
     // 6. Build nodes + ref/call edges
@@ -1251,6 +1364,82 @@ mod tests {
         assert!(!is_runnable_file(Path::new("/no/such/kls/launcher")));
     }
 
+    // #904: when KLS reported the missing SDK before the run failed, the SDK
+    // is the diagnostic, whatever the failure text says; the timeout's remedy
+    // (warm the cache, re-run) cannot fix an absent SDK.
+    #[test]
+    fn a_missing_sdk_wins_over_the_failure_text() {
+        let timeout = "timeout waiting for LSP 'initialize' id=1";
+        let with_sdk_missing = failure_diagnostics(true, timeout);
+        assert_eq!(with_sdk_missing.len(), 1);
+        assert_eq!(with_sdk_missing[0].code, "kotlin.android-sdk-missing");
+        let without = failure_diagnostics(false, timeout);
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].code, "kotlin.initialize-timeout");
+        assert!(failure_diagnostics(false, "failed to spawn kotlin-language-server").is_empty());
+        assert_eq!(
+            failure_diagnostics(true, "failed to spawn kotlin-language-server")[0].code,
+            "kotlin.android-sdk-missing"
+        );
+    }
+
+    // #904: an `initialize` that ran out the window is named as such; any
+    // other failure stays a plain stderr line with no diagnostic.
+    #[test]
+    fn kls_initialize_timeout_is_named() {
+        let d = kls_failure_diagnostic(
+            "timeout waiting for LSP 'initialize' id=1: KLS reader thread disconnected",
+        )
+        .expect("initialize timeout yields a diagnostic");
+        assert_eq!(d.code, "kotlin.initialize-timeout");
+        assert!(d.message.contains("Gradle"), "{}", d.message);
+        assert!(kls_failure_diagnostic("failed to spawn kotlin-language-server").is_none());
+        assert!(kls_failure_diagnostic("").is_none());
+    }
+
+    // #904: the AGP "no SDK" text KLS relays in its log is recognised, and
+    // ordinary log traffic is not. The Gradle wording is what AGP prints when
+    // neither ANDROID_HOME nor local.properties names an SDK.
+    #[test]
+    fn android_sdk_failure_is_recognised_in_kls_log_text() {
+        assert!(names_android_sdk_failure(
+            "Gradle task failed: FAILURE: Build failed with an exception.\n\
+             * What went wrong:\nSDK location not found. Define a valid SDK location with an \
+             ANDROID_HOME environment variable or by setting the sdk.dir path in your \
+             project's local properties file at '/repo/local.properties'."
+        ));
+        assert!(names_android_sdk_failure(
+            "Failed to find Platform SDK with path: platforms;android-36"
+        ));
+        assert!(!names_android_sdk_failure(
+            "Resolving dependencies for 'repo' through Gradle's CLI"
+        ));
+        assert!(!names_android_sdk_failure(""));
+    }
+
+    // A `window/logMessage` naming the SDK failure flips the session flag and
+    // is still dropped (nothing reads log messages back out); one that does
+    // not name it leaves the flag alone.
+    #[cfg(unix)]
+    #[test]
+    fn park_flags_an_android_sdk_failure_in_the_kls_log() {
+        let mut session = silent_session();
+        session
+            .park(json!({ "method": "window/logMessage", "params": { "type": 2, "message": "Resolving dependencies for 'app' through Gradle's CLI" } }))
+            .expect("park a log message");
+        assert!(!session.android_sdk_missing.get());
+        session
+            .park(json!({ "method": "window/logMessage", "params": { "type": 2, "message": "Gradle task failed: SDK location not found. Define a valid SDK location with an ANDROID_HOME environment variable" } }))
+            .expect("park a log message");
+        assert!(session.android_sdk_missing.get());
+        assert!(
+            session.inbox.is_empty(),
+            "log messages are not queued: {:?}",
+            session.inbox
+        );
+        session.shutdown(Instant::now() + Duration::from_secs(5));
+    }
+
     #[cfg(unix)]
     fn progress(token: &str, kind: &str) -> Value {
         json!({
@@ -1283,7 +1472,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn the stand-in server");
-        LspSession::new(child).expect("build session")
+        LspSession::new(child, Rc::new(Cell::new(false))).expect("build session")
     }
 
     // The indexing wait now runs after the `didOpen`/`documentSymbol` pass, and
@@ -1415,7 +1604,7 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn the stand-in server");
-        let mut session = LspSession::new(child).expect("build session");
+        let mut session = LspSession::new(child, Rc::new(Cell::new(false))).expect("build session");
 
         let outcome = session.wait_for_progress_end(Duration::from_secs(60));
 
