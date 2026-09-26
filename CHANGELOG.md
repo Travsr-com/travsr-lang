@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-26
+
+Java and Kotlin now index Android Gradle Plugin modules, plus two Swift resolution fixes for calls made from top-level script code. The AGP support needs travsr v1.2.0 or newer, which is what grants the Java and Kotlin sidecars read access to the Android SDK; on an older travsr the sidecar reports `java.android-sdk-missing` or `kotlin.android-sdk-missing` instead of indexing the module.
+
+### Added
+
+- **Java, Kotlin: index Android Gradle Plugin modules (#904).** scip-java's own Gradle plugin only configures a project that applies the `java` plugin, so an `com.android.application` or `com.android.library` module got no SemanticDB output at all (AGP 8 emitted an empty index, AGP 9 crashed with a `ConcurrentModificationException` over AGP's lazily registered configurations). An init-script shim now gives every non-test `JavaCompile` task the same treatment scip-java gives a plain Java project's tasks, so app-to-library call edges are produced on both AGP 8 and AGP 9, on Windows and Unix, with a plain Gradle build unaffected. A build that fails for want of the SDK now reports `java.android-sdk-missing` or `kotlin.android-sdk-missing`, naming `ANDROID_HOME` and `local.properties`, instead of a stderr line nothing surfaces.
+- **Java: unit-test variants are indexed.** They used to be skipped along with the release and instrumentation variants, which produced a test-blind index and a misleading warning that blamed Maven flags that were never involved.
+
+### Fixed
+
+- **Swift: calls made from top-level script code are no longer dropped.** `let zoo = Zoo(); zoo.add(dog)` at file level had no scope frame for `zoo` to bind into, so only the constructor reference was ever recorded. On the live-lane fixture, committed Swift recall goes from 3 of 8 to 8 of 8 with no wrong edge introduced.
+- **Swift: a property no longer loses to a file-level variable of the same name inside a type's own methods.** `let engine = Car()` at file level and `var engine: Motor` on a type made `engine.start()` inside a method resolve to `Car.start` instead of the property.
+- **Java: the SemanticDB compile tasks are kept out of Gradle's build cache.** Moving plugin attachment to `doFirst` had put its cache-busting nonce outside the fingerprinted task inputs, so a second index run on a repository with Gradle caching enabled restored the compile tasks from cache, javac never ran, and no SemanticDB was written at all.
+- **Java: the javac plugin jar is now attached to the test compile scope as well as main**, and only when the jar is actually reachable on the path javac loads plugins from, so a module with a test-only annotation processor (or one fed from a Kotlin Multiplatform JVM target) no longer takes the whole build down with "plug-in not found".
+
 ## [0.5.0] - 2026-09-12
 
 Phase B recall and correctness across the JVM, Swift, Objective-C, PHP and .NET wrappers, plus two new signals the host can act on: every sidecar can now report a `PluginDiagnostic` on `InvokeResponse.diagnostics`, and the Swift and Dart emitters answer `--version` so a stale emitter is visible instead of silently producing results that do not reflect the source. Several wrappers changed which build phase they drive (Maven `test-compile`, sbt `Test/compile`, SemanticDB in every sbt scope), so test-scope references enter the graph for the first time on those languages.
