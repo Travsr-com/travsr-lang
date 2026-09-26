@@ -224,6 +224,16 @@ allprojects { p ->
       // above. A task fed from other configurations (a KMP jvm target, or a
       // project whose adds failed) gets no -Xplugin instead of a javac that
       // dies with "plug-in not found" and takes the whole build with it.
+      // Because -Xplugin is added after the inputs are fingerprinted, it is
+      // outside the build-cache key, so a second index run with
+      // org.gradle.caching=true (the sandbox hands Gradle the user's real
+      // ~/.gradle) would restore the compile FROM-CACHE and write no
+      // SemanticDB; scip-java's own configuration-time -randomtimestamp is what
+      // keeps its tasks out of the cache. These tasks are taken out of it
+      // and out of the up-to-date check here, at configuration time.
+      t.outputs.cacheIf("travsr indexing always recompiles") { false }
+      t.outputs.upToDateWhen { false }
+      t.inputs.property("travsrIndexNonce", System.nanoTime())
       t.doFirst {
         def jarPath = new File(pluginJar).canonicalPath
         def carries = { fc -> fc != null && fc.files.any { it.canonicalPath == jarPath } }
@@ -1134,6 +1144,8 @@ mod tests {
             r#"["annotationProcessor", "testAnnotationProcessor"]"#,
             "if (javacVersion >= 17) { jvmArgs.addAll(moduleOptions) }",
             "t.doFirst {",
+            r#"t.outputs.cacheIf("travsr indexing always recompiles") { false }"#,
+            "t.outputs.upToDateWhen { false }",
             "def reachable = ",
             r#"p.tasks.named("scipPrintDependencies") { it.enabled = false }"#,
             "-javaagent:",
